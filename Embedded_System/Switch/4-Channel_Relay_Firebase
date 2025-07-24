@@ -1,0 +1,229 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+/*
+ * ============================================================================
+ * CIRCUIT CONNECTION TABLE
+ * ============================================================================
+ * 
+ * ESP8266 NodeMCU Pin Connections:
+ * 
+ * ┌─────────────────┬─────────────────┬─────────────────────────────────────┐
+ * │ ESP8266 Pin     │ NodeMCU Pin     │ Connection                          │
+ * ├─────────────────┼─────────────────┼─────────────────────────────────────┤
+ * │ GPIO5           │ D1              │ 4-Channel Relay Module - IN1        │
+ * │ GPIO4           │ D2              │ 4-Channel Relay Module - IN2        │
+ * │ GPIO0           │ D3              │ 4-Channel Relay Module - IN3        │
+ * │ GPIO2           │ D4              │ 4-Channel Relay Module - IN4        │
+ * │ 3.3V            │ 3V3             │ 4-Channel Relay Module - VCC        │
+ * │ GND             │ GND             │ 4-Channel Relay Module - GND        │
+ * └─────────────────┴─────────────────┴─────────────────────────────────────┘
+ * 
+ * 4-Channel Relay Module Connections:
+ * 
+ * ┌─────────────────┬─────────────────────────────────────────────────────────┐
+ * │ Relay Terminal  │ Connection (Example - Connect your devices here)        │
+ * ├─────────────────┼─────────────────────────────────────────────────────────┤
+ * │ Relay 1 NO/COM  │ Device 1 (e.g., Water Pump, LED Strip, Fan, etc.)      │
+ * │ Relay 2 NO/COM  │ Device 2 (e.g., Lights, Motor, Heater, etc.)           │
+ * │ Relay 3 NO/COM  │ Device 3 (e.g., Solenoid Valve, Buzzer, etc.)          │
+ * │ Relay 4 NO/COM  │ Device 4 (e.g., Another Pump, Exhaust Fan, etc.)       │
+ * └─────────────────┴─────────────────────────────────────────────────────────┘
+ * 
+ * Power Supply:
+ * - ESP8266: 3.3V (via USB or external 3.3V/5V adapter)
+ * - Relay Module: 3.3V (from ESP8266) or 5V (external supply)
+ * - Connected Devices: Use appropriate voltage/current for each device
+ * 
+ * Notes:
+ * - Relay module is ACTIVE LOW (LOW = ON, HIGH = OFF)
+ * - Use NO (Normally Open) and COM (Common) terminals for switching
+ * - For AC devices, ensure proper electrical safety and isolation
+ * - For high current devices, use appropriate wire gauge and fuses
+ * 
+ * ============================================================================
+ */
+
+// WiFi credentials
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// Firebase credentials
+#define API_KEY "YOUR_ACTUAL_API_KEY"
+#define DATABASE_URL "https://YOUR_PROJECT_ID-default-rtdb.firebaseio.com"
+#define USER_EMAIL "your_email@gmail.com"
+#define USER_PASSWORD "your_password"
+
+// Firebase path for relays
+#define FIREBASE_RELAY_PATH "/RelayController"
+
+// 4-Channel Relay pins (ESP8266 NodeMCU)
+#define RELAY_1_PIN D1  // GPIO5  - Relay 1 Input
+#define RELAY_2_PIN D2  // GPIO4  - Relay 2 Input  
+#define RELAY_3_PIN D3  // GPIO0  - Relay 3 Input
+#define RELAY_4_PIN D4  // GPIO2  - Relay 4 Input
+
+// Define Firebase Data object
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Variables to store relay states
+bool relay1State = false;
+bool relay2State = false;
+bool relay3State = false;
+bool relay4State = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n4-Channel Relay Firebase Controller Starting...");
+  
+  // Initialize relay pins as outputs
+  pinMode(RELAY_1_PIN, OUTPUT);
+  pinMode(RELAY_2_PIN, OUTPUT);
+  pinMode(RELAY_3_PIN, OUTPUT);
+  pinMode(RELAY_4_PIN, OUTPUT);
+  
+  // Turn off all relays initially (relays are typically active LOW)
+  digitalWrite(RELAY_1_PIN, HIGH);  // OFF
+  digitalWrite(RELAY_2_PIN, HIGH);  // OFF
+  digitalWrite(RELAY_3_PIN, HIGH);  // OFF
+  digitalWrite(RELAY_4_PIN, HIGH);  // OFF
+  
+  Serial.println("All relays initialized to OFF state");
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Initialize Firebase
+  initFirebase();
+  
+  // Create initial relay structure in Firebase
+  setupFirebaseRelays();
+  
+  Serial.println("System Ready! Monitoring Firebase for relay commands...");
+}
+
+void loop() {
+  if (Firebase.ready()) {
+    // Check and update all relay states
+    updateRelayState("Relay1", RELAY_1_PIN, relay1State);
+    updateRelayState("Relay2", RELAY_2_PIN, relay2State);
+    updateRelayState("Relay3", RELAY_3_PIN, relay3State);
+    updateRelayState("Relay4", RELAY_4_PIN, relay4State);
+    
+    // Print current states every 5 seconds
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 5000) {
+      lastPrint = millis();
+      printRelayStates();
+    }
+    
+    delay(500); // Check every 500ms
+  } else {
+    Serial.println("Firebase not ready, reconnecting...");
+    delay(1000);
+  }
+}
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void initFirebase() {
+  Serial.println("Connecting to Firebase...");
+  
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  Serial.println("Firebase Connected!");
+}
+
+void setupFirebaseRelays() {
+  Serial.println("Setting up Firebase relay structure...");
+  
+  String relayPath = String(FIREBASE_RELAY_PATH);
+  
+  // Create relay paths with initial OFF state
+  if (Firebase.setString(fbdo, relayPath + "/Relay1", "0")) {
+    Serial.println("Relay1 path created/updated");
+  }
+  
+  if (Firebase.setString(fbdo, relayPath + "/Relay2", "0")) {
+    Serial.println("Relay2 path created/updated");
+  }
+  
+  if (Firebase.setString(fbdo, relayPath + "/Relay3", "0")) {
+    Serial.println("Relay3 path created/updated");
+  }
+  
+  if (Firebase.setString(fbdo, relayPath + "/Relay4", "0")) {
+    Serial.println("Relay4 path created/updated");
+  }
+  
+  Serial.println("Firebase relay structure setup complete!");
+  Serial.println("Firebase paths:");
+  Serial.println("  " + relayPath + "/Relay1 (0=OFF, 1=ON)");
+  Serial.println("  " + relayPath + "/Relay2 (0=OFF, 1=ON)");
+  Serial.println("  " + relayPath + "/Relay3 (0=OFF, 1=ON)");
+  Serial.println("  " + relayPath + "/Relay4 (0=OFF, 1=ON)");
+}
+
+void updateRelayState(String relayName, int relayPin, bool &relayState) {
+  // Read relay state from Firebase
+  String fullPath = String(FIREBASE_RELAY_PATH) + "/" + relayName;
+  
+  if (Firebase.getString(fbdo, fullPath)) {
+    String state = fbdo.stringData();
+    
+    // Update physical relay based on Firebase value
+    if (state == "1") {
+      if (!relayState) { // Only print if state changed
+        digitalWrite(relayPin, LOW);  // Turn ON (active LOW)
+        relayState = true;
+        Serial.println("[" + relayName + "] Turned ON");
+      }
+    } else {
+      if (relayState) { // Only print if state changed
+        digitalWrite(relayPin, HIGH); // Turn OFF
+        relayState = false;
+        Serial.println("[" + relayName + "] Turned OFF");
+      }
+    }
+  } else {
+    Serial.println("Failed to read " + relayName + " state from Firebase");
+    Serial.println("Error: " + fbdo.errorReason());
+    
+    // If failed to read, try to create the path with OFF state
+    Firebase.setString(fbdo, fullPath, "0");
+  }
+}
+
+void printRelayStates() {
+  Serial.println("=== Current Relay States ===");
+  Serial.println("Relay 1 (D1): " + String(relay1State ? "ON" : "OFF"));
+  Serial.println("Relay 2 (D2): " + String(relay2State ? "ON" : "OFF"));
+  Serial.println("Relay 3 (D3): " + String(relay3State ? "ON" : "OFF"));
+  Serial.println("Relay 4 (D4): " + String(relay4State ? "ON" : "OFF"));
+  Serial.println("============================");
+}
