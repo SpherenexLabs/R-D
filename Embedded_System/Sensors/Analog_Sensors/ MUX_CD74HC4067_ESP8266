@@ -1,25 +1,32 @@
 /*
-  2-Water-Sensor Multiplexing with ESP8266 + CD74HC4067
+  2-Water-Sensor Multiplexing with ESP8266 + CD74HC4067 + OLED
 
   === Connection Table ===
 
-  CD74HC4067 Multiplexer    ESP8266 (NodeMCU/Wemos D1 mini)
-  -----------------------------------------------------------
-  S0                      D5  (GPIO14)
-  S1                      D6  (GPIO12)
-  S2                      D7  (GPIO13)
-  S3                      D8  (GPIO15)
-  COM (SIG/Z)             A0
-  VCC                     3.3V
-  GND                     GND
-  Y0 (Channel 0)          Water Sensor 1 Signal
-  Y1 (Channel 1)          Water Sensor 2 Signal
-  (Other Yx)              (Unused or more sensors)
-  
-  Water Sensor 1 VCC      3.3V
-  Water Sensor 1 GND      GND
-  Water Sensor 2 VCC      3.3V
-  Water Sensor 2 GND      GND
+  CD74HC4067 Multiplexer    | ESP8266 (NodeMCU/Wemos D1 mini)
+  ------------------------------------------------------------
+  S0                       | D5  (GPIO14)
+  S1                       | D6  (GPIO12)
+  S2                       | D7  (GPIO13)
+  S3                       | D8  (GPIO15)
+  COM (SIG/Z)              | A0
+  VCC                      | 3.3V
+  GND                      | GND
+  Y0 (Channel 0)           | Water Sensor 1 Signal
+  Y1 (Channel 1)           | Water Sensor 2 Signal
+  (Other Yx)               | (Unused or more sensors)
+
+  Water Sensor 1 VCC       | 3.3V
+  Water Sensor 1 GND       | GND
+  Water Sensor 2 VCC       | 3.3V
+  Water Sensor 2 GND       | GND
+
+  OLED Display             | ESP8266 (NodeMCU/Wemos D1 mini)
+  ------------------------------------------------------------
+  VCC                      | 3.3V
+  GND                      | GND
+  SCL                      | D1 (GPIO5)
+  SDA                      | D2 (GPIO4)
 
   Note: If using NodeMCU or Wemos D1 mini, A0 range is 0–3.3V (internally divided).
 */
