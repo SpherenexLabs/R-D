@@ -1,0 +1,79 @@
+/*
+  2-Water-Sensor Multiplexing with ESP8266 + CD74HC4067
+
+  === Connection Table ===
+
+  CD74HC4067 Multiplexer    ESP8266 (NodeMCU/Wemos D1 mini)
+  -----------------------------------------------------------
+  S0                      D5  (GPIO14)
+  S1                      D6  (GPIO12)
+  S2                      D7  (GPIO13)
+  S3                      D8  (GPIO15)
+  COM (SIG/Z)             A0
+  VCC                     3.3V
+  GND                     GND
+  Y0 (Channel 0)          Water Sensor 1 Signal
+  Y1 (Channel 1)          Water Sensor 2 Signal
+  (Other Yx)              (Unused or more sensors)
+  
+  Water Sensor 1 VCC      3.3V
+  Water Sensor 1 GND      GND
+  Water Sensor 2 VCC      3.3V
+  Water Sensor 2 GND      GND
+
+  Note: If using NodeMCU or Wemos D1 mini, A0 range is 0–3.3V (internally divided).
+*/
+
+#define MUX_S0 D5
+#define MUX_S1 D6
+#define MUX_S2 D7
+#define MUX_S3 D8
+
+#define WATER_SENSOR1_CHANNEL 0   // Y0 on MUX
+#define WATER_SENSOR2_CHANNEL 1   // Y1 on MUX
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set MUX control pins as OUTPUT
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  Serial.println("2 Water Sensors with MUX on ESP8266");
+}
+
+// Helper: Select a MUX channel and read analog value
+int readMux(uint8_t channel) {
+  digitalWrite(MUX_S0, channel & 0x01);
+  digitalWrite(MUX_S1, (channel >> 1) & 0x01);
+  digitalWrite(MUX_S2, (channel >> 2) & 0x01);
+  digitalWrite(MUX_S3, (channel >> 3) & 0x01);
+  delayMicroseconds(50);  // Allow settling
+  return analogRead(A0);
+}
+
+void loop() {
+  // Read both sensors
+  int raw1 = readMux(WATER_SENSOR1_CHANNEL);
+  int raw2 = readMux(WATER_SENSOR2_CHANNEL);
+
+  // Convert to percentage (0-100%)
+  int percent1 = map(raw1, 0, 1023, 0, 100);
+  int percent2 = map(raw2, 0, 1023, 0, 100);
+
+  Serial.print("Water Sensor 1: Raw=");
+  Serial.print(raw1);
+  Serial.print(", ");
+  Serial.print(percent1);
+  Serial.print("% | ");
+
+  Serial.print("Water Sensor 2: Raw=");
+  Serial.print(raw2);
+  Serial.print(", ");
+  Serial.print(percent2);
+  Serial.println("%");
+
+  delay(1000);
+}
