@@ -1,10 +1,19 @@
-// Water Sensor --- VCC	  -- 3.3V
-// Water Sensor --- GND	  -- GND
-// Water Sensor --- S	    -- A0
-// OLED         --- VCC	  -- 3.3V
-// OLED         --- GND	  -- GND
-// OLED         --- SCL	  -- D1 (GPIO5)
-// OLED         --- SDA	  -- D2 (GPIO4)
+/*
+  Water Level Sensor with OLED Display on ESP8266
+
+  === Connection Table ===
+
+  Device        | Pin         | ESP8266 (NodeMCU/Wemos D1 mini)
+  --------------------------------------------------------------
+  Water Sensor  | VCC         | 3.3V
+  Water Sensor  | GND         | GND
+  Water Sensor  | S (Signal)  | A0
+
+  OLED Display  | VCC         | 3.3V
+  OLED Display  | GND         | GND
+  OLED Display  | SCL         | D1 (GPIO5)
+  OLED Display  | SDA         | D2 (GPIO4)
+*/
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
