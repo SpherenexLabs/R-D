@@ -1,3 +1,32 @@
+/*
+  Dual-OLED Display with ESP8266 and PCA9548A I2C Multiplexer
+
+  === Connection Table ===
+
+  Device         | Pin/Signal       | ESP8266 (NodeMCU/Wemos D1 mini)
+  -------------------------------------------------------------------
+  PCA9548A MUX   | VCC              | 3.3V
+  PCA9548A MUX   | GND              | GND
+  PCA9548A MUX   | SDA              | D2 (GPIO4)
+  PCA9548A MUX   | SCL              | D1 (GPIO5)
+  PCA9548A MUX   | A0, A1, A2       | GND (Default address 0x70)
+
+  OLED Display 1 | VCC              | MUX Channel 0 VCC
+  OLED Display 1 | GND              | MUX Channel 0 GND
+  OLED Display 1 | SDA              | MUX Channel 0 SDA
+  OLED Display 1 | SCL              | MUX Channel 0 SCL
+
+  OLED Display 2 | VCC              | MUX Channel 1 VCC
+  OLED Display 2 | GND              | MUX Channel 1 GND
+  OLED Display 2 | SDA              | MUX Channel 1 SDA
+  OLED Display 2 | SCL              | MUX Channel 1 SCL
+
+  Note:
+  - All VCC and GND of OLEDs and MUX are tied together to 3.3V and GND.
+  - Each OLED’s SDA/SCL lines are routed to their assigned PCA9548A channel.
+  - Wire.begin(4, 5) means: SDA = GPIO4 (D2), SCL = GPIO5 (D1) on ESP8266.
+*/
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
