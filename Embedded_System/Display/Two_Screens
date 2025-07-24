@@ -1,12 +1,21 @@
-// Two Screens - Switch Between Them
+/*
+  Two-Screen Health & MPU6050 Data Display
+  with ESP8266 (NodeMCU/Wemos D1 mini), OLED, and Button
 
-//  All data is dummy:
-//  Heart Rate
-//  SpO2
-//  Temperature
-//  Humidity
-//  MPU6050 Angle
-//  MPU6050 Acceleration
+  === Connection Table ===
+
+  Device        | Pin          | ESP8266 (NodeMCU/Wemos D1 mini)
+  --------------------------------------------------------------
+  OLED Display  | VCC          | 3.3V
+  OLED Display  | GND          | GND
+  OLED Display  | SCL          | D1 (GPIO5)
+  OLED Display  | SDA          | D2 (GPIO4)
+
+  Button        | 1 Pin        | D4 (GPIO2)
+  Button        | 1 Pin        | GND
+
+  (Pull-up is enabled in code with INPUT_PULLUP)
+*/
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -17,7 +26,7 @@
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-#define BUTTON_PIN 2
+#define BUTTON_PIN D4  // Use D4 for NodeMCU/Wemos, corresponds to GPIO2
 
 int currentScreen = 0;
 
