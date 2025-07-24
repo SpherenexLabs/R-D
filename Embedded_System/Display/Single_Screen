@@ -17,34 +17,56 @@
 #define OLED_RESET    -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-void setup() {
+#define BUTTON_PIN 2
+int currentScreen = 0;
+
+void setup() 
+{
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 }
 
-void loop() {
+void loop() 
+{
+  static int lastButtonState = HIGH;
+  int buttonState = digitalRead(BUTTON_PIN);
+  if (lastButtonState == HIGH && buttonState == LOW) 
+  {
+    currentScreen = !currentScreen; // Toggle screen
+    delay(200); // Debounce
+  }
+  lastButtonState = buttonState;
+
   display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("All Data Summary");
-  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
-
-  display.setCursor(0, 13);
-  display.print("HR: "); display.print(75); display.print("  ");
-  display.print("SpO2: "); display.println(98);
-
-  display.print("Temp: "); display.print(36.5); display.print("  ");
-  display.print("Hum: "); display.println(45);
-
-  display.print("AX: "); display.print(0.12);
-  display.print(" AY: "); display.print(-0.04);
-  display.print(" AZ: "); display.println(9.81);
-
-  display.print("GX: "); display.print(20.4);
-  display.print(" GY: "); display.print(-5.7);
-  display.print(" GZ: "); display.println(180.0);
-
-  display.display();
-  delay(1000);
+  if (currentScreen == 0) 
+  {
+    // --- Screen 1: Health Data ---
+    display.setCursor(0, 0);
+    display.println("Health Monitor");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+    display.setCursor(0, 15);
+    display.print("HR:    "); display.println(75);   // Dummy HR
+    display.print("SpO2:  "); display.println(98);   // Dummy SpO2
+    display.print("Temp:  "); display.println(36.5); // Dummy Temp
+    display.print("Hum:   "); display.println(45);   // Dummy Hum
+    display.display();
+  } 
+  else 
+  {
+    // --- Screen 2: MPU6050 Data ---
+    display.setCursor(0, 0);
+    display.println("MPU6050 Data");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+    display.setCursor(0, 15);
+    display.print("Angle X: "); display.println(20.4);
+    display.print("Angle Y: "); display.println(-5.7);
+    display.print("Angle Z: "); display.println(180.0);
+    display.print("Accel X: "); display.println(0.12);
+    display.print("Accel Y: "); display.println(-0.04);
+    display.print("Accel Z: "); display.println(9.81);
+    display.display();
+  }
 }
