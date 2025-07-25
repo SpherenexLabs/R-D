@@ -1,0 +1,204 @@
+/*
+ * MPU6050 Knee Angle Measurement & Impact Detection System
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │                        WIRING CONNECTION TABLES                             │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ * TABLE 1: NodeMCU/ESP8266 Connections
+ * ┌─────────────┬─────────────┬─────────────┬──────────────────────────────────┐
+ * │ MPU6050 Pin │ NodeMCU Pin │ GPIO Number │           Description            │
+ * ├─────────────┼─────────────┼─────────────┼──────────────────────────────────┤
+ * │     VCC     │    3.3V     │      -      │ Power Supply (3.3V or 5V)       │
+ * │     GND     │    GND      │      -      │ Ground Connection                │
+ * │     SCL     │     D1      │   GPIO5     │ I2C Clock Line                   │
+ * │     SDA     │     D2      │   GPIO4     │ I2C Data Line                    │
+ * │     XDA     │     NC      │      -      │ Not Connected                    │
+ * │     XCL     │     NC      │      -      │ Not Connected                    │
+ * │     AD0     │    GND      │      -      │ I2C Address Select (0x68)        │
+ * │     INT     │     NC      │      -      │ Interrupt (Optional - D8/GPIO15) │
+ * └─────────────┴─────────────┴─────────────┴──────────────────────────────────┘
+ * 
+ * TABLE 2: Reset Button Connections
+ * ┌─────────────┬─────────────┬─────────────┬──────────────────────────────────┐
+ * │ Button Pin  │ NodeMCU Pin │ GPIO Number │           Description            │
+ * ├─────────────┼─────────────┼─────────────┼──────────────────────────────────┤
+ * │   Pin 1     │     D3      │   GPIO0     │ Reset/Calibration Button         │
+ * │   Pin 2     │    GND      │      -      │ Ground Connection                │
+ * └─────────────┴─────────────┴─────────────┴──────────────────────────────────┘
+ * 
+ * TABLE 3: Arduino Uno Alternative Connections
+ * ┌─────────────┬─────────────┬─────────────┬──────────────────────────────────┐
+ * │ MPU6050 Pin │ Arduino Pin │ Pin Number  │           Description            │
+ * ├─────────────┼─────────────┼─────────────┼──────────────────────────────────┤
+ * │     VCC     │     5V      │      -      │ Power Supply                     │
+ * │     GND     │    GND      │      -      │ Ground Connection                │
+ * │     SCL     │     A5      │  Analog 5   │ I2C Clock Line                   │
+ * │     SDA     │     A4      │  Analog 4   │ I2C Data Line                    │
+ * │     AD0     │    GND      │      -      │ I2C Address Select (0x68)        │
+ * │ Reset Btn   │  Pin 2      │ Digital 2   │ Reset/Calibration Button         │
+ * └─────────────┴─────────────┴─────────────┴──────────────────────────────────┘
+ * 
+ * TABLE 4: Power Requirements
+ * ┌─────────────┬─────────────┬─────────────┬──────────────────────────────────┐
+ * │  Component  │   Voltage   │   Current   │           Notes                  │
+ * ├─────────────┼─────────────┼─────────────┼──────────────────────────────────┤
+ * │   MPU6050   │ 3.3V - 5V   │   3.9mA     │ Typical operating current        │
+ * │   NodeMCU   │     5V      │   80mA      │ ESP8266 module consumption       │
+ * │    Total    │     5V      │  ~85mA      │ Total system consumption         │
+ * └─────────────┴─────────────┴─────────────┴──────────────────────────────────┘
+ * 
+ * IMPORTANT NOTES:
+ * ================
+ * • Use 4.7kΩ pull-up resistors on SDA/SCL if not built into MPU6050 module
+ * • Keep I2C wires as short as possible for stable communication
+ * • Mount MPU6050 securely on the leg/knee joint for accurate readings
+ * • Ensure proper sensor orientation during calibration phase
+ * • Button uses internal pull-up resistor (INPUT_PULLUP mode)
+ * • AD0 pin to GND sets I2C address to 0x68 (default)
+ * • INT pin can be connected to D8 for interrupt-based reading (optional)
+ */
+
+#include <Wire.h>
+#include <math.h>
+#include "I2Cdev.h"
+#include "MPU6050.h"
+
+// Reset-button pin (connect one side to D3, the other to GND)
+#define RESET_BUTTON_PIN D3
+
+// MPU6050 instance
+MPU6050 mpu;
+
+// Calibration parameters
+const int   CALIBRATION_SAMPLES = 50;
+float       restPositionX      = 0;
+int         calibrationCount   = 0;
+bool        isCalibrated       = false;
+
+// Angle smoothing
+float lastValidAngle = 0;
+
+// Impact detection threshold (in g)
+const float ACC_THRESHOLD = 2.5;
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  Serial.println("=================================");
+  Serial.println("MPU6050 Knee Angle Monitor v1.0");
+  Serial.println("=================================");
+  
+  // Button with internal pull-up
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  
+  // I²C + MPU init
+  Wire.begin();
+  mpu.initialize();
+  
+  if (!mpu.testConnection()) {
+    Serial.println("   MPU6050 not found! Check wiring:");
+    Serial.println("   VCC -> 3.3V, GND -> GND");
+    Serial.println("   SCL -> D1, SDA -> D2");
+    Serial.println("   Halting program...");
+    while (1) { delay(1000); }
+  }
+  
+  Serial.println("   MPU6050 detected and connected!");
+  Serial.println("   Keep leg straight for calibration...");
+  Serial.println();
+}
+
+void loop() {
+  // --- Handle reset button: re-start calibration ---
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      Serial.println("\n RESET! Re-calibrating system...");
+      restPositionX    = 0;
+      calibrationCount = 0;
+      isCalibrated     = false;
+      lastValidAngle   = 0;
+      
+      while (digitalRead(RESET_BUTTON_PIN) == LOW) {
+        delay(50);
+      }
+      
+      Serial.println(" Keep leg straight for calibration...");
+      Serial.println();
+    }
+  }
+  
+  // --- Read MPU6050 raw data ---
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // --- 1) Convert raw accel to g ---
+  float ax_g = float(ax) / 16384.0;
+  float ay_g = float(ay) / 16384.0;
+  float az_g = float(az) / 16384.0;
+  
+  // --- 2) Compute total acceleration magnitude ---
+  float a_mag = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+  
+  // --- 3) Print acceleration data ---
+  Serial.print(" Acc (g): ");
+  Serial.print(ax_g, 2); Serial.print(", ");
+  Serial.print(ay_g, 2); Serial.print(", ");
+  Serial.print(az_g, 2);
+  Serial.print("  | |A| = ");
+  Serial.print(a_mag, 2);
+  Serial.print(" g");
+  
+  // --- 4) Impact detection ---
+  if (a_mag > ACC_THRESHOLD) {
+    Serial.print("  - IMPACT DETECTED! - ");
+  }
+  Serial.println();
+  
+  // --- Calibration phase ---
+  if (!isCalibrated) {
+    restPositionX += ax;
+    calibrationCount++;
+    
+    if (calibrationCount % 10 == 0) {
+      Serial.print("Calibrating: ");
+      Serial.print((calibrationCount * 100) / CALIBRATION_SAMPLES);
+      Serial.println("%");
+    }
+    
+    if (calibrationCount >= CALIBRATION_SAMPLES) {
+      restPositionX /= CALIBRATION_SAMPLES;
+      isCalibrated = true;
+      Serial.println("Calibration complete!");
+      Serial.print("Rest position X = ");
+      Serial.println(restPositionX);
+      Serial.println("Starting angle measurements...");
+      Serial.println("---------------------------");
+    }
+  }
+  // --- Angle calculation & printing ---
+  else {
+    // Compute X-axis offset and angle
+    float accelX = float(ax) - restPositionX;
+    float angle  = atan2(accelX, 16384.0) * 180.0 / PI;
+    
+    // Reject impossible readings, then low-pass filter
+    if (fabs(angle) > 90) {
+      angle = lastValidAngle;
+    } else {
+      angle = 0.2 * angle + 0.8 * lastValidAngle;
+      lastValidAngle = angle;
+    }
+    
+    // Print only the knee angle
+    Serial.print("Knee Angle: ");
+    if (angle > 0) Serial.print("+");
+    Serial.print(angle, 1);
+    Serial.println("°");
+  }
+  
+  // Adjust this delay to tune your sample rate
+  delay(100);
+}
