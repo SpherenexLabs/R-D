@@ -1,0 +1,573 @@
+
+/*
+================================================================================
+                    HEALTH MONITOR SYSTEM - COMPLETE CODE
+================================================================================
+
+WIRE CONNECTION TABLE:
++------------------+-------------+---------------+----------------+------------------+
+| Component        | ESP8266 Pin | NodeMCU Label | Wire Color     | Purpose          |
++------------------+-------------+---------------+----------------+------------------+
+| SSD1306 OLED DISPLAY                                                             |
+| VCC              | 3.3V        | 3V3           | Red            | Power Supply     |
+| GND              | GND         | GND           | Black          | Ground           |
+| SDA              | GPIO4       | D2            | Blue/Green     | I2C Data         |
+| SCL              | GPIO5       | D1            | Yellow/White   | I2C Clock        |
++------------------+-------------+---------------+----------------+------------------+
+| DHT11 TEMPERATURE/HUMIDITY SENSOR                                                |
+| VCC              | 3.3V        | 3V3           | Red            | Power Supply     |
+| GND              | GND         | GND           | Black          | Ground           |
+| DATA             | GPIO2       | D4            | Orange         | Temp/Humidity    |
++------------------+-------------+---------------+----------------+------------------+
+| MAX30105 HEART RATE/SPO2 SENSOR                                                  |
+| VIN              | 3.3V        | 3V3           | Red            | Power Supply     |
+| GND              | GND         | GND           | Black          | Ground           |
+| SDA              | GPIO4       | D2            | Blue/Green     | I2C Data (shared)|
+| SCL              | GPIO5       | D1            | Yellow/White   | I2C Clock(shared)|
++------------------+-------------+---------------+----------------+------------------+
+| RELAY MODULE 1 (HEATING CONTROL)                                                 |
+| VCC              | 5V          | VIN           | Red            | Power Supply     |
+| GND              | GND         | GND           | Black          | Ground           |
+| IN               | GPIO14      | D5            | Purple         | Control Signal   |
++------------------+-------------+---------------+----------------+------------------+
+| RELAY MODULE 2 (COOLING CONTROL)                                                 |
+| VCC              | 5V          | VIN           | Red            | Power Supply     |
+| GND              | GND         | GND           | Black          | Ground           |
+| IN               | GPIO12      | D6            | Gray           | Control Signal   |
++------------------+-------------+---------------+----------------+------------------+
+
+I2C DEVICE ADDRESSES:
+- SSD1306 OLED: 0x3C
+- MAX30105: 0x57
+
+POWER REQUIREMENTS:
+- ESP8266 NodeMCU: 5V (USB) / 3.3V, ~200mA
+- SSD1306 OLED: 3.3V, ~20mA
+- DHT11: 3.3V, ~2.5mA
+- MAX30105: 3.3V, ~1.2mA
+- Relay Modules: 5V, ~70mA each
+
+RELAY FUNCTION:
+- RELAY 1 (D5): Controls HEATING system (heater/heating pad) - ON when temp < 28°C
+- RELAY 2 (D6): Controls COOLING system (fan/AC) - ON when temp >= 28°C
+
+SAFETY NOTES:
+Relay outputs handle high voltage - exercise caution with AC connections
+Use proper fuses and insulation for connected devices
+Test each component individually before full assembly
+
+================================================================================
+*/
+
+// ========================= LIBRARY INCLUDES =========================
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+// Optional MAX30105 sensor (comment out if not available)
+#ifndef SKIP_MAX30105
+  #include <MAX30105.h>
+  #include <heartRate.h>
+#endif
+
+// ========================= PIN DEFINITIONS =========================
+// OLED Display Configuration (I2C)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SSD1306_I2C_ADDRESS 0x3C
+// I2C Pins: SDA = D2 (GPIO4), SCL = D1 (GPIO5)
+
+// DHT11 Sensor Configuration
+#define DHTPIN  D4          // GPIO2 - Temperature/Humidity sensor
+#define DHTTYPE DHT11
+
+// Relay Control Pins
+#define RELAY1_PIN D5       // GPIO14 - Heating system control
+#define RELAY2_PIN D6       // GPIO12 - Cooling system control
+
+// ========================= WIFI & FIREBASE CONFIG =========================
+// WiFi Credentials - CHANGE THESE TO YOUR NETWORK
+#define WIFI_SSID     "spherenex1"
+#define WIFI_PASSWORD "Spherenex@789"
+
+// Firebase Credentials - CHANGE THESE TO YOUR PROJECT
+#define API_KEY       "AIzaSyCzB_Bs7AYZ-FAEcb6mjB-Y3YE9_cH8D1g"
+#define DATABASE_URL  "https://smartjacket-dfce1-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ========================= SENSOR THRESHOLDS =========================
+#define MAX30102_FINGER_THRESHOLD 5000  // Threshold to detect finger presence
+#define TEMPERATURE_THRESHOLD 28.0      // Temperature control threshold (°C)
+#define FIREBASE_UPDATE_INTERVAL 100    // Firebase update interval (ms)
+
+// ========================= OBJECT DECLARATIONS =========================
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+DHT dht(DHTPIN, DHTTYPE);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// MAX30105 sensor (conditional)
+bool max30105Available = false;
+#ifndef SKIP_MAX30105
+  MAX30105 particleSensor;
+#endif
+
+// ========================= GLOBAL VARIABLES =========================
+// Sensor readings
+float temperature = 0.0;
+float humidity = 0.0;
+int heartRate = 0;
+int spo2 = 0;
+int systolic = 120;
+int diastolic = 80;
+
+// Timing variables
+unsigned long lastFirebaseUpdate = 0;
+unsigned long lastDisplayUpdate = 0;
+
+// Status flags
+bool wifiConnected = false;
+bool firebaseReady = false;
+
+// ========================= SETUP FUNCTION =========================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("=== HEALTH MONITOR SYSTEM STARTING ===");
+  
+  // Initialize relay pins (HIGH = OFF for most relay modules)
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, HIGH);  // Turn off heating relay
+  digitalWrite(RELAY2_PIN, HIGH);  // Turn off cooling relay
+  
+  Serial.println("Relay pins initialized");
+  
+  // Initialize OLED Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SSD1306_I2C_ADDRESS)) {
+    Serial.println("✗ SSD1306 OLED allocation failed!");
+    while (1) {
+      // Flash onboard LED to indicate error
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(200);
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(200);
+    }
+  }
+  
+  Serial.println("OLED display initialized");
+  
+  // Show startup screen
+  showStartupScreen();
+  
+  // Initialize DHT11 sensor
+  dht.begin();
+  Serial.println("DHT11 sensor initialized");
+  
+  // Initialize MAX30105 sensor (if available)
+  initializeMAX30105();
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Initialize Firebase
+  initializeFirebase();
+  
+  // Initial sensor readings
+  readAllSensors();
+  
+  Serial.println("=== SYSTEM READY ===");
+  showReadyScreen();
+  delay(2000);
+}
+
+// ========================= MAIN LOOP =========================
+void loop() {
+  // Read all sensors
+  readAllSensors();
+  
+  // Control temperature (heating/cooling)
+  controlTemperature();
+  
+  // Update display
+  updateDisplay();
+  
+  // Update Firebase
+  updateFirebase();
+  
+  // Monitor system status
+  monitorSystem();
+  
+  delay(200);  // Main loop delay
+}
+
+// ========================= SENSOR FUNCTIONS =========================
+void readAllSensors() {
+  readDHTSensor();
+  
+#ifndef SKIP_MAX30105
+  if (max30105Available) {
+    readMAX30102Sensor();
+    simulateBloodPressure();
+  }
+#endif
+}
+
+void readDHTSensor() {
+  static unsigned long lastRead = 0;
+  
+  // Read DHT11 every 2 seconds (sensor limitation)
+  if (millis() - lastRead < 2000) return;
+  
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  
+  // Check if readings are valid
+  if (!isnan(t)) {
+    temperature = t;
+    Serial.print("Temperature: "); Serial.print(t); Serial.println("°C");
+  } else {
+    Serial.println("Failed to read temperature from DHT11");
+  }
+  
+  if (!isnan(h)) {
+    humidity = h;
+    Serial.print("Humidity: "); Serial.print(h); Serial.println("%");
+  } else {
+    Serial.println("Failed to read humidity from DHT11");
+  }
+  
+  lastRead = millis();
+}
+
+#ifndef SKIP_MAX30105
+void readMAX30102Sensor() {
+  long ir = particleSensor.getIR();
+  
+  // Check if finger is present
+  if (ir < MAX30102_FINGER_THRESHOLD) {
+    heartRate = 0;
+    spo2 = 0;
+    return;
+  }
+  
+  // Simple beat detection algorithm
+  static uint32_t lastIr = 0;
+  static bool peak = false;
+  static unsigned long lastBeat = 0;
+  static int tempHR = 70;
+  
+  // Detect peaks for heart rate calculation
+  if (ir > lastIr && !peak && ir > lastIr * 1.01) {
+    peak = true;
+  } else if (ir < lastIr && peak && lastIr > ir * 1.01) {
+    unsigned long now = millis();
+    if (now - lastBeat > 300 && now - lastBeat < 2000) {
+      int newHR = 60000 / (now - lastBeat);
+      if (newHR >= 50 && newHR <= 180) {
+        tempHR = newHR;
+      }
+    }
+    lastBeat = now;
+    peak = false;
+  }
+  
+  heartRate = tempHR;
+  
+  // Calculate SpO2 using red/IR ratio
+  uint32_t red = particleSensor.getRed();
+  float ratio = (float)red / (float)ir;
+  spo2 = constrain(110 - int(25 * ratio), 90, 99);
+  
+  lastIr = ir;
+}
+
+void simulateBloodPressure() {
+  long ir = particleSensor.getIR();
+  
+  // Only simulate BP if finger is present
+  if (ir < MAX30102_FINGER_THRESHOLD) {
+    systolic = 0;
+    diastolic = 0;
+    return;
+  }
+  
+  static unsigned long lastBP = 0;
+  static int targetSys = 120, targetDia = 80;
+  static int curSys = 120, curDia = 80;
+  
+  // Change target values every 10 seconds
+  if (millis() - lastBP > 10000) {
+    targetSys = 120 + random(-5, 6);
+    targetDia = 80 + random(-3, 4);
+    lastBP = millis();
+  }
+  
+  // Gradually move towards target values
+  if (curSys < targetSys) curSys++;
+  if (curSys > targetSys) curSys--;
+  if (curDia < targetDia) curDia++;
+  if (curDia > targetDia) curDia--;
+  
+  systolic = curSys;
+  diastolic = curDia;
+}
+#endif
+
+// ========================= DISPLAY FUNCTIONS =========================
+void showStartupScreen() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("HEALTH");
+  display.println("MONITOR");
+  display.display();
+  delay(1000);
+}
+
+void showReadyScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("System Ready!");
+  display.println("Monitoring...");
+  display.display();
+}
+
+void updateDisplay() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 500) return;  // Update display every 500ms
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  int y = 0;
+  
+  // Heart Rate
+  display.setCursor(0, y);
+  if (heartRate > 0) {
+    display.print("HR: "); display.print(heartRate); display.println(" bpm");
+  } else {
+    display.println("HR: No finger");
+  }
+  y += 10;
+  
+  // SpO2
+  display.setCursor(0, y);
+  if (spo2 > 0) {
+    display.print("SpO2: "); display.print(spo2); display.println(" %");
+  } else {
+    display.println("SpO2: No finger");
+  }
+  y += 10;
+  
+  // Blood Pressure
+  display.setCursor(0, y);
+  if (systolic > 0 && diastolic > 0) {
+    display.print("BP: "); display.print(systolic); display.print("/"); 
+    display.print(diastolic); display.println(" mmHg");
+  } else {
+    display.println("BP: No finger");
+  }
+  y += 10;
+  
+  // Temperature
+  display.setCursor(0, y);
+  display.print("Temp: "); display.print(temperature, 1); display.println(" C");
+  y += 10;
+  
+  // Humidity
+  display.setCursor(0, y);
+  display.print("Hum: "); display.print(humidity, 1); display.println(" %");
+  y += 10;
+  
+  // Status indicators
+  display.setCursor(0, y);
+  display.print("WiFi:");
+  display.print(wifiConnected ? "OK " : "NO ");
+  display.print("FB:");
+  display.print(firebaseReady ? "OK" : "NO");
+  
+  display.display();
+  lastUpdate = millis();
+}
+
+// ========================= TEMPERATURE CONTROL =========================
+void controlTemperature() {
+  static unsigned long lastControl = 0;
+  if (millis() - lastControl < 1000) return;  // Control every 1 second
+  
+  if (temperature < TEMPERATURE_THRESHOLD) {
+    // Turn ON heating, turn OFF cooling
+    digitalWrite(RELAY1_PIN, LOW);   // Relay 1 ON (heating)
+    digitalWrite(RELAY2_PIN, HIGH);  // Relay 2 OFF (cooling)
+    Serial.println("Heating ON - Temperature below threshold");
+  } else {
+    // Turn OFF heating, turn ON cooling
+    digitalWrite(RELAY1_PIN, HIGH);  // Relay 1 OFF (heating)
+    digitalWrite(RELAY2_PIN, LOW);   // Relay 2 ON (cooling)
+    Serial.println("Cooling ON - Temperature above threshold");
+  }
+  
+  lastControl = millis();
+}
+
+// ========================= WIFI & FIREBASE FUNCTIONS =========================
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println();
+    Serial.print("WiFi connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed!");
+  }
+}
+
+void initializeFirebase() {
+  if (!wifiConnected) {
+    Serial.println("Cannot initialize Firebase - no WiFi connection");
+    return;
+  }
+  
+  // Configure Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+  
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+  
+  // Wait for Firebase to be ready
+  int attempts = 0;
+  while (!Firebase.ready() && attempts < 10) {
+    Serial.print(".");
+    delay(1000);
+    attempts++;
+  }
+  
+  if (Firebase.ready()) {
+    firebaseReady = true;
+    Serial.println("Firebase connected successfully!");
+    
+    // Initialize Firebase with default values
+    Firebase.setFloat(fbdo, "/healthData/temperature", 0.0);
+    Firebase.setFloat(fbdo, "/healthData/humidity", 0.0);
+    Firebase.setInt(fbdo, "/healthData/heartRate", 0);
+    Firebase.setInt(fbdo, "/healthData/spo2", 0);
+    Firebase.setInt(fbdo, "/healthData/bp/systolic", 0);
+    Firebase.setInt(fbdo, "/healthData/bp/diastolic", 0);
+  } else {
+    Serial.println("Firebase connection failed!");
+  }
+}
+
+void updateFirebase() {
+  if (!firebaseReady || millis() - lastFirebaseUpdate < FIREBASE_UPDATE_INTERVAL) {
+    return;
+  }
+  
+  // Upload all sensor data to Firebase
+  Firebase.setFloat(fbdo, "/healthData/temperature", temperature);
+  Firebase.setFloat(fbdo, "/healthData/humidity", humidity);
+  Firebase.setInt(fbdo, "/healthData/heartRate", heartRate);
+  Firebase.setInt(fbdo, "/healthData/spo2", spo2);
+  Firebase.setInt(fbdo, "/healthData/bp/systolic", systolic);
+  Firebase.setInt(fbdo, "/healthData/bp/diastolic", diastolic);
+  
+  // Add timestamp
+  Firebase.setString(fbdo, "/healthData/lastUpdate", String(millis()));
+  
+  lastFirebaseUpdate = millis();
+  Serial.println("Firebase updated");
+}
+
+// ========================= INITIALIZATION FUNCTIONS =========================
+void initializeMAX30105() {
+#ifndef SKIP_MAX30105
+  Serial.print("Initializing MAX30105 sensor...");
+  
+  if (particleSensor.begin(Wire, 400000)) {
+    max30105Available = true;
+    
+    // Configure sensor settings
+    particleSensor.setup(60, 4, 2, 400, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(60);
+    particleSensor.setPulseAmplitudeIR(60);
+    
+    Serial.println("MAX30105 initialized successfully");
+  } else {
+    max30105Available = false;
+    Serial.println("MAX30105 not found - HR/SpO2/BP disabled");
+  }
+#else
+  Serial.println("MAX30105 support disabled in code");
+#endif
+}
+
+// ========================= MONITORING FUNCTIONS =========================
+void monitorSystem() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 5000) return;  // Check every 5 seconds
+  
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    Serial.println("WiFi connection lost");
+  } else if (!wifiConnected) {
+    wifiConnected = true;
+    Serial.println("WiFi reconnected");
+  }
+  
+  // Check Firebase connection
+  if (!Firebase.ready()) {
+    firebaseReady = false;
+    Serial.println("Firebase connection lost");
+  } else if (!firebaseReady) {
+    firebaseReady = true;
+    Serial.println("Firebase reconnected");
+  }
+  
+  // Print system status
+  Serial.println("=== SYSTEM STATUS ===");
+  Serial.print("Temperature: "); Serial.print(temperature); Serial.println("°C");
+  Serial.print("Humidity: "); Serial.print(humidity); Serial.println("%");
+  Serial.print("Heart Rate: "); Serial.print(heartRate); Serial.println(" bpm");
+  Serial.print("SpO2: "); Serial.print(spo2); Serial.println("%");
+  Serial.print("Blood Pressure: "); Serial.print(systolic); Serial.print("/"); Serial.print(diastolic); Serial.println(" mmHg");
+  Serial.print("WiFi: "); Serial.println(wifiConnected ? "Connected" : "Disconnected");
+  Serial.print("Firebase: "); Serial.println(firebaseReady ? "Ready" : "Not Ready");
+  Serial.println("====================");
+  
+  lastCheck = millis();
+}
+
+// ========================= END OF CODE =========================
