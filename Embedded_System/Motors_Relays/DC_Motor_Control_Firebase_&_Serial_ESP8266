@@ -47,8 +47,8 @@
 #define USER_PASSWORD "Spherenex@123"
 
 // Firebase paths
-#define FIREBASE_PATH "/3_KS5029_College_Introduction_Robot_1/Motor"
-#define FIREBASE_COMMAND_PATH "/3_KS5029_College_Introduction_Robot_1/Motor/command"
+#define FIREBASE_PATH "/XYZ/Motor"
+#define FIREBASE_COMMAND_PATH "/XYZ/Motor/command"
 
 // Define Firebase Data objects
 FirebaseData fbdo;
