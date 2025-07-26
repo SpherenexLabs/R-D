@@ -1,0 +1,379 @@
+/*
+===============================================================================
+  MOTOR CONTROL VIA FIREBASE & SERIAL (ESP8266)
+===============================================================================
+
+  WIRING CONNECTIONS TABLE (ESP8266 + L298N + MOTORS)
+  ---------------------------------------------------
+  | ESP8266 Pin (NodeMCU) | L298N Pin | Function                   |
+  |-----------------------|-----------|----------------------------|
+  | D8                    | IN1       | Motor A Forward (Left)     |
+  | D7                    | IN2       | Motor A Backward (Left)    |
+  | D6                    | IN3       | Motor B Forward (Right)    |
+  | D5                    | IN4       | Motor B Backward (Right)   |
+  | GND                   | GND       | Ground (Common)            |
+  | 5V (VIN)              | 5V        | L298N Logic Power          |
+
+  - Connect OUT1 and OUT2 of L298N to Left Motor.
+  - Connect OUT3 and OUT4 of L298N to Right Motor.
+  - Connect Battery (+) to L298N 12V (motor power), Battery (-) to GND.
+  - ENA/ENB jumpers ON for full speed (no PWM).
+
+  COMMANDS (send via Serial or update in Firebase):
+  ------------------------------------------------
+  'F' or 'f' : Move Forward
+  'B' or 'b' : Move Backward
+  'R' or 'r' : Turn Right
+  'L' or 'l' : Turn Left
+  'S' or 's' : Stop Motors
+
+===============================================================================
+*/
+
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+#include <time.h>
+
+// WiFi credentials
+#define WIFI_SSID "college"
+#define WIFI_PASSWORD "123456789"
+
+// Firebase credentials 
+#define API_KEY "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL "https://waterdtection-default-rtdb.firebaseio.com"
+#define USER_EMAIL "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase paths
+#define FIREBASE_PATH "/3_KS5029_College_Introduction_Robot_1/Motor"
+#define FIREBASE_COMMAND_PATH "/3_KS5029_College_Introduction_Robot_1/Motor/command"
+
+// Define Firebase Data objects
+FirebaseData fbdo;
+FirebaseData stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Motor A control pins (Left Motor)
+const int motorAPin1 = D8;  // IN1 on L298N
+const int motorAPin2 = D7;  // IN2 on L298N
+// Motor B control pins (Right Motor)
+const int motorBPin1 = D6;  // IN3 on L298N
+const int motorBPin2 = D5;  // IN4 on L298N
+
+bool firebasePathCreated = false;
+
+void setup() 
+{
+  Serial.begin(9600);
+  Serial.println("\n\n");
+  Serial.println("Starting College Introduction Robot...");
+
+  // Set motor control pins as outputs
+  pinMode(motorAPin1, OUTPUT);
+  pinMode(motorAPin2, OUTPUT);
+  pinMode(motorBPin1, OUTPUT);
+  pinMode(motorBPin2, OUTPUT);
+
+  // Initialize with motors stopped
+  digitalWrite(motorAPin1, LOW);
+  digitalWrite(motorAPin2, LOW);
+  digitalWrite(motorBPin1, LOW);
+  digitalWrite(motorBPin2, LOW);
+
+  // Connect to WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) 
+  {
+    Serial.print(".");
+    delay(500);
+    wifiAttempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected with IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi. Please check credentials or try another network.");
+    // Continue anyway, will retry in loop
+  }
+
+  // Set time via NTP, required for SSL/TLS connection
+  Serial.println("Setting time using NTP");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  time_t now = time(nullptr);
+  int timeAttempts = 0;
+  while (now < 8 * 3600 * 2 && timeAttempts < 10) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    timeAttempts++;
+  }
+  Serial.println();
+
+  if (now > 8 * 3600 * 2) {
+    Serial.println("Time synchronized");
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    Serial.print("Current time: ");
+    Serial.print(timeinfo.tm_hour);
+    Serial.print(":");
+    Serial.print(timeinfo.tm_min);
+    Serial.print(":");
+    Serial.println(timeinfo.tm_sec);
+  } else {
+    Serial.println("Time sync failed, continuing anyway");
+  }
+
+  // Configure Firebase
+  Serial.println("Configuring Firebase connection...");
+  config.api_key = API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  // Enhanced SSL buffer size
+  fbdo.setBSSLBufferSize(4096, 1024);
+  stream.setBSSLBufferSize(4096, 1024);
+
+  // Enable auto reconnect to WiFi
+  Firebase.reconnectNetwork(true);
+  Firebase.reconnectWiFi(true);
+
+  // Set timeout for operations
+  fbdo.setResponseSize(4096);
+
+  // Initialize Firebase
+  Serial.println("Initializing Firebase...");
+  Firebase.begin(&config, &auth);
+
+  // Set longer timeouts to help with connection issues
+  Firebase.setReadTimeout(stream, 1000 * 60); // 1 minute timeout
+  Firebase.setwriteSizeLimit(fbdo, "tiny");
+  Firebase.setMaxRetry(fbdo, 3);
+  Firebase.enableClassicRequest(fbdo, true);
+
+  // Allow more time for the connection to establish
+  delay(2000);
+
+  // Wait for Firebase to be ready before continuing
+  Serial.println("Waiting for Firebase connection...");
+  int connectionAttempts = 0;
+  while (!Firebase.ready() && connectionAttempts < 15) {
+    Serial.print(".");
+    delay(1000);
+    connectionAttempts++;
+  }
+  Serial.println();
+
+  if (Firebase.ready()) {
+    Serial.println("Firebase connected!");
+  } else {
+    Serial.println("Failed to connect to Firebase after multiple attempts");
+    Serial.println("Continuing anyway - will retry in loop");
+  }
+
+  Serial.println("College Introduction Robot Control Ready!");
+  Serial.println("Firebase Path: " + String(FIREBASE_PATH));
+  Serial.println("Commands (via Firebase or Serial):");
+  Serial.println("  F: Move Forward");
+  Serial.println("  B: Move Backward");
+  Serial.println("  R: Turn Right");
+  Serial.println("  L: Turn Left");
+  Serial.println("  S: Stop");
+}
+
+// Function to stop both motors
+void stopMotors()
+{
+  digitalWrite(motorAPin1, LOW);
+  digitalWrite(motorAPin2, LOW);
+  digitalWrite(motorBPin1, LOW);
+  digitalWrite(motorBPin2, LOW);
+  Serial.println("Motors Stopped");
+}
+
+// Function to move forward
+void moveForward() 
+{
+  digitalWrite(motorAPin1, HIGH);
+  digitalWrite(motorAPin2, LOW);
+  digitalWrite(motorBPin1, HIGH);
+  digitalWrite(motorBPin2, LOW);
+  Serial.println("Moving Forward");
+}
+
+// Function to move backward
+void moveBack() 
+{
+  digitalWrite(motorAPin1, LOW);
+  digitalWrite(motorAPin2, HIGH);
+  digitalWrite(motorBPin1, LOW);
+  digitalWrite(motorBPin2, HIGH);
+  Serial.println("Moving Backward");
+}
+
+// Function to turn right
+void turnRight() 
+{
+  digitalWrite(motorAPin1, HIGH);
+  digitalWrite(motorAPin2, LOW);
+  digitalWrite(motorBPin1, LOW);
+  digitalWrite(motorBPin2, HIGH);
+  Serial.println("Turning Right");
+}
+
+// Function to turn left
+void turnLeft() 
+{
+  digitalWrite(motorAPin1, LOW);
+  digitalWrite(motorAPin2, HIGH);
+  digitalWrite(motorBPin1, HIGH);
+  digitalWrite(motorBPin2, LOW);
+  Serial.println("Turning Left");
+}
+
+// Function to process commands (from both Serial and Firebase)
+void processCommand(char input)
+{
+  switch (input)
+  {
+    case 'f':
+    case 'F':
+      moveForward(); break;
+    case 'b':
+    case 'B':
+      moveBack(); break;
+    case 'r':
+    case 'R':
+      turnRight(); break;
+    case 'l':
+    case 'L':
+      turnLeft(); break;
+    case 's':
+    case 'S':
+      stopMotors(); break;
+    default:
+      Serial.print("Unknown command: ");
+      Serial.println(input); break;
+  }
+}
+
+// Function to create the Firebase path if it doesn't exist
+bool createFirebasePath() {
+  Serial.print("Creating Firebase path if it doesn't exist... ");
+  FirebaseJson json;
+  json.set("command", "S");              // Initial command is Stop
+  json.set("status", "Robot online");    // Status node
+  if (Firebase.setJSON(fbdo, FIREBASE_PATH, json)) {
+    Serial.println("Success!");
+    return true;
+  } else {
+    Serial.println("Failed");
+    Serial.println("Error: " + fbdo.errorReason());
+    return false;
+  }
+}
+
+// Function to begin the Firebase stream
+bool beginFirebaseStream() {
+  Serial.print("Setting up Firebase command stream... ");
+  if (!Firebase.beginStream(stream, FIREBASE_COMMAND_PATH)) {
+    Serial.printf("Command stream begin error, %s\n\n", stream.errorReason().c_str());
+    return false;
+  }
+  Serial.println("Success!");
+  return true;
+}
+
+void loop()
+{
+  // Make sure WiFi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection lost. Reconnecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int reconnectAttempt = 0;
+    while (WiFi.status() != WL_CONNECTED && reconnectAttempt < 10) {
+      delay(500);
+      Serial.print(".");
+      reconnectAttempt++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+    } else {
+      Serial.println("\nFailed to reconnect to WiFi.");
+      delay(5000);
+      return;
+    }
+  }
+
+  // Check for Serial Commands
+  if(Serial.available() > 0)
+  {
+    char input = Serial.read();
+    processCommand(input);
+    // Clear any remaining characters
+    while(Serial.available() > 0)
+    {
+      Serial.read();
+    }
+  }
+
+  // Try to create Firebase path if not already done
+  if (Firebase.ready() && !firebasePathCreated) {
+    firebasePathCreated = createFirebasePath();
+    if (firebasePathCreated) {
+      beginFirebaseStream();
+    }
+  }
+
+  // Check for Firebase movement commands
+  if (Firebase.ready())
+  {
+    // Process the movement stream
+    if(!Firebase.readStream(stream))
+    {
+      Serial.printf("Stream read error, %s\n\n", stream.errorReason().c_str());
+      delay(1000);
+      beginFirebaseStream();
+    }
+
+    if(stream.streamTimeout())
+    {
+      Serial.print("Stream timeout, resuming.... \n");
+    }
+
+    if(stream.streamAvailable())
+    {
+      if(stream.dataType() == "string")
+      {
+        String command = stream.stringData();
+        if(command.length() > 0)
+        {
+          Serial.print("Received command from Firebase: ");
+          Serial.println(command);
+          processCommand(command.charAt(0));
+        }
+      }
+    }
+  }
+  else {
+    static unsigned long lastReconnectAttempt = 0;
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastReconnectAttempt > 30000) {
+      lastReconnectAttempt = currentMillis;
+      Serial.println("Firebase not ready. Attempting to reconnect...");
+      Firebase.begin(&config, &auth);
+      delay(1000);
+    }
+  }
+
+  delay(10);
+}
