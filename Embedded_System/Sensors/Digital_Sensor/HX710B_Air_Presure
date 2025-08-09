@@ -1,0 +1,248 @@
+/**************************************************************
+ * Overview
+ * --------
+ * - Reads a differential bridge sensor via HX710 (HX711-compatible timing).
+ * - Applies simple moving-average filtering and linear calibration.
+ * - Publishes the *front tire* pressure to Firebase Realtime Database:
+ *      15_Tire_Pressure/0_Current_Tire_Pressure/Frount_Presure
+ *   and appends history under:
+ *      15_Tire_Pressure/1_Frount_Data/00001, 00002, ...
+ *   with an internal counter:
+ *      15_Tire_Pressure/1_Frount_Data/_seq
+ *
+ * Electrical & Wiring (ESP8266 NodeMCU)
+ * -------------------------------------
+ * | HX710/HX711 Pin | ESP8266 NodeMCU Pin | GPIO  | Notes                                  |
+ * |-----------------|--------------------|-------|-----------------------------------------|
+ * | VCC (2.7–5V)    | 3V3                |  —    | Stable 3.3V; avoid noisy USB rails      |
+ * | GND             | GND                |  —    | Common ground for ESP8266 & HX710 board |
+ * | DT / DOUT       | D2                 | GPIO4 | Data line from ADC                      |
+ * | SCK / PD_SCK    | D3                 | GPIO0 | Clock line; keep LOW when idle          |
+ *
+ *
+ *  Notes:
+ *   - Keep sensor/bridge excitation stable; noise on supply injects drift.
+ *   - Use short, twisted-pair leads for DT and SCK where possible.
+ *   - Share GND among ESP8266, HX710 board, and the bridge sensor.
+ *
+ * Sensor & Calibration
+ * --------------------
+ * - `rawMin` & `rawMax` are the ADC raw counts measured at two known pressures
+ *   (e.g., 0 kPa and a known reference). Adjust `pressureMin`/`pressureMax`
+ *   to match those points. The code scales linearly between them.
+ * - If your displayed pressure is off by a constant factor, adjust
+ *   `OUTPUT_SCALE_DIV` (e.g., 1.0 for kPa, 10.0 for deci-kPa → kPa).
+ * - Filtering: a simple average over N samples (configurable).
+ *
+ * Database Schema (kept exactly as requested)
+ * -------------------------------------------
+ *  15_Tire_Pressure/
+ *    ├─ 0_Current_Tire_Pressure/
+ *    │    └─ Frount_Presure : <float kPa>
+ *    └─ 1_Frount_Data/
+ *         ├─ _seq           : <int>      // monotonically increasing
+ *         ├─ 00001          : <float>
+ *         ├─ 00002          : <float>
+ *         └─ ...
+ *
+ * Publish Rate & Behavior
+ * -----------------------
+ * - Sends once every `SEND_INTERVAL_MS`. Skips if Firebase not ready.
+ * - On each successful history push, updates `_seq`.
+ *
+ * Security
+ * --------
+ * - This example embeds credentials for convenience. For public GitHub:
+ *     • Move Wi-Fi, API key, DB URL, and user creds to a separate
+ *       "secrets.h" that’s .gitignored; or use environment injection.
+ *
+ * Rear Tire Controller
+ * --------------------
+ * - This file is **front tire only**. Put the *rear* controller in a
+ *   separate sketch/repo folder to keep systems isolated, as requested.
+ **************************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+// Optional helpers (come with the Firebase library)
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+
+/************* WiFi *************/
+#define WIFI_SSID      "air"
+#define WIFI_PASSWORD  "123456789"
+
+/*********** Firebase ***********/
+#define API_KEY        "AIzaSyBzXzocbdytn4N8vLrT-V2JYZ8pgqWrbC0"
+#define DATABASE_URL   "https://self-balancing-7a9fe-default-rtdb.firebaseio.com"
+#define USER_EMAIL     "spherenexgpt@gmail.com"
+#define USER_PASSWORD  "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/************* HX710 (ESP8266) *************/
+#define HX_DOUT  4   // D2 (GPIO4)
+#define HX_SCK   0   // D3 (GPIO0)
+
+// ---- Calibration (tune for your sensor) ----
+// Raw counts measured at two known pressure points:
+const float rawMin      = 9950000.0f;   // raw at pressureMin
+const float rawMax      = 10500000.0f;  // raw at pressureMax
+const float pressureMin = 0.0f;         // kPa at rawMin
+const float pressureMax = 50.0f;        // kPa at rawMax
+
+// Additional output scaling (1.0 = kPa direct).
+// If your earlier math expected a "/10", set this to 10.0.
+const float OUTPUT_SCALE_DIV = 1.0f;
+
+/************* App Config *************/
+const unsigned long SEND_INTERVAL_MS = 2000; // push period to Firebase
+const int FILTER_SAMPLES = 10;               // simple moving average
+
+// DB paths (spelling as per your tree)
+const String BASE        = "15_Tire_Pressure/";
+const String CURR_FRONT  = BASE + "0_Current_Tire_Pressure/Frount_Presure";
+const String HIST_FRONT  = BASE + "1_Frount_Data";
+const String HIST_SEQ    = HIST_FRONT + "/_seq";   // int counter
+
+unsigned long lastSend = 0;
+uint32_t seq = 0; // history index
+
+/**************** Utils ****************/
+String pad5(uint32_t n) {
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%05u", (unsigned)n);
+  return String(buf);
+}
+
+// Read one 24-bit sample from HX710/HX711 timing.
+// Gain assumed 128 (channel A); 3 extra clocks post-read.
+long readRawPressure() {
+  // Wait until DOUT goes LOW (data ready)
+  while (digitalRead(HX_DOUT)) { /* busy wait */ }
+
+  long result = 0;
+  for (int i = 0; i < 24; i++) {
+    digitalWrite(HX_SCK, HIGH);
+    digitalWrite(HX_SCK, LOW);
+    result <<= 1;
+    if (digitalRead(HX_DOUT)) result++;
+  }
+
+  // Convert from 24-bit two's complement to signed long
+  // Standard trick: flip MSB (bit 23)
+  result ^= 0x800000;
+
+  // 3 extra clocks to set next gain (128)
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(HX_SCK, HIGH);
+    digitalWrite(HX_SCK, LOW);
+  }
+  return result;
+}
+
+long getFilteredPressure(int samples = FILTER_SAMPLES) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += readRawPressure();
+    delay(50);
+  }
+  return sum / samples;
+}
+
+// Linear map raw -> kPa (then optional OUTPUT_SCALE_DIV)
+float convertToKpa(long raw) {
+  const float spanRaw = (rawMax - rawMin);
+  if (spanRaw == 0.0f) return NAN;
+  const float kpa = ((raw - rawMin) * (pressureMax - pressureMin)) / spanRaw + pressureMin;
+  return kpa / OUTPUT_SCALE_DIV;
+}
+
+/**************** Setup ****************/
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+
+  pinMode(HX_DOUT, INPUT);
+  pinMode(HX_SCK, OUTPUT);
+  digitalWrite(HX_SCK, LOW);
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.print("\nWiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // token progress on Serial (optional)
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);  // v4.x returns void
+  Firebase.reconnectWiFi(true);
+
+  // Give token a moment (non-blocking overall)
+  unsigned long t0 = millis();
+  while (!Firebase.ready() && millis() - t0 < 8000) {
+    delay(100);
+  }
+  Serial.println(Firebase.ready() ? "Firebase ready." : "Firebase not ready yet (continuing).");
+
+  // Load or initialize sequence counter
+  if (Firebase.RTDB.getInt(&fbdo, HIST_SEQ) && fbdo.dataType() == "int") {
+    seq = fbdo.intData();
+  } else {
+    Firebase.RTDB.setInt(&fbdo, HIST_SEQ, (int)0);
+    seq = 0;
+  }
+
+  Serial.println("HX710 + Firebase logger ready (Front Tire).");
+}
+
+/**************** Loop ****************/
+void loop() {
+  // Read sensor
+  long raw = getFilteredPressure();
+  float kpa = convertToKpa(raw);
+
+  // Serial
+  Serial.print("Raw: "); Serial.print(raw);
+  Serial.print(" -> Front: "); Serial.print(kpa, 2);
+  Serial.println(" kPa");
+
+  // Timed push to Firebase
+  if (millis() - lastSend >= SEND_INTERVAL_MS && Firebase.ready()) {
+    lastSend = millis();
+
+    // 1) Current value
+    if (!Firebase.RTDB.setFloat(&fbdo, CURR_FRONT, kpa)) {
+      Serial.print("Set current failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    // 2) Append to history
+    seq += 1;
+    String key = HIST_FRONT + "/" + pad5(seq);
+    if (!Firebase.RTDB.setFloat(&fbdo, key, kpa)) {
+      Serial.print("History write failed: ");
+      Serial.println(fbdo.errorReason());
+      seq -= 1; // rollback
+    } else {
+      if (!Firebase.RTDB.setInt(&fbdo, HIST_SEQ, (int)seq)) {
+        Serial.print("Update _seq failed: ");
+        Serial.println(fbdo.errorReason());
+      }
+    }
+  }
+}
