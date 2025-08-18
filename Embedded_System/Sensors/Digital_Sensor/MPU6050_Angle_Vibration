@@ -1,0 +1,200 @@
+
+// ===== File: esp8266_mpu6050_serial_only.ino =====
+#include <Wire.h>
+#include <math.h>
+#include "I2Cdev.h"
+#include "MPU6050.h"
+// Reset-button pin (connect one side to D3, the other to GND)
+#define RESET_BUTTON_PIN D3
+// MPU6050 instance
+MPU6050 mpu;
+// Calibration parameters
+const int CALIBRATION_SAMPLES = 50;
+float restPositionX = 0;
+int calibrationCount = 0;
+bool isCalibrated = false;
+// Angle smoothing
+float lastValidAngle = 0;
+// Vibration detection thresholds
+const float VIBRATION_ACCEL_THRESHOLD = 1.5;  // Accelerometer threshold in g
+const float VIBRATION_GYRO_THRESHOLD = 7.0;   // Gyroscope threshold in deg/s (kept for parity, not used directly)
+const int VIBRATION_SAMPLES = 5;              // Number of samples to average for vibration detection
+// Angle sensitivity
+float ANGLE_SENSITIVITY = 0.8;
+// Error tracking
+int errorCount = 0;
+unsigned long lastSuccessfulRead = 0;
+// Vibration detection variables
+float vibrationLevel = 0;
+float vibrationHistory[VIBRATION_SAMPLES] = {0};
+int vibrationIndex = 0;
+// Function to safely read MPU6050 data
+bool readMPU6050(int16_t &ax, int16_t &ay, int16_t &az, 
+                 int16_t &gx, int16_t &gy, int16_t &gz) {
+  // Try to read data
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  // Basic sanity check on values
+  if (abs(ax) > 32000 || abs(ay) > 32000 || abs(az) > 32000) {
+    return false;
+  }
+  return true;
+}
+// Function to calculate vibration level
+float calculateVibrationLevel(float ax_g, float ay_g, float az_g, float gx_dps, float gy_dps, float gz_dps) {
+  // Calculate RMS of acceleration (excluding gravity)
+  float accel_rms = sqrt((ax_g * ax_g) + (ay_g * ay_g) + ((az_g - 1.0) * (az_g - 1.0)));
+  // Calculate RMS of gyroscope
+  float gyro_rms = sqrt((gx_dps * gx_dps) + (gy_dps * gy_dps) + (gz_dps * gz_dps));
+  // Combined vibration level (weighted combination)
+  float vibration_level = (accel_rms * 0.7) + (gyro_rms * 0.3 / 100.0); // Scale gyro to similar range
+  return vibration_level;
+}
+// Function to detect vibration using moving average
+bool detectVibration(float current_vibration, float* history) {
+  // Update history
+  history[vibrationIndex] = current_vibration;
+  // Calculate moving average
+  float average = 0;
+  for (int i = 0; i < VIBRATION_SAMPLES; i++) {
+    average += history[i];
+  }
+  average /= VIBRATION_SAMPLES;
+  // Check if current vibration exceeds threshold
+  return (average > VIBRATION_ACCEL_THRESHOLD);
+}
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  while (Serial.available()) { Serial.read(); }
+  Serial.println();
+  Serial.println(F("=== Single MPU6050 Vibration Detection (Serial Only) ==="));
+  Serial.println(F("Starting initialization..."));
+  // Button with internal pull-up
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  // I²C initialization
+  Wire.begin(4, 5); // SDA=4 (D2), SCL=5 (D1) for ESP8266
+  Wire.setClock(100000); // Reduce I2C speed to 100kHz for stability
+  Serial.println(F("I2C initialized at 100kHz"));
+  // Initialize MPU6050
+  Serial.println(F("Initializing MPU6050..."));
+  mpu.initialize();
+  delay(100);
+  if (!mpu.testConnection()) {
+    Serial.println(F("ERROR: MPU6050 not responding!"));
+    Serial.println(F("Check sensor connections and power."));
+    while (1) { delay(1000); }
+  }
+  Serial.println(F("MPU6050 initialized successfully"));
+  Serial.println();
+  Serial.println(F("=== Initialization Complete ==="));
+  Serial.println(F("Keep sensor in rest position for calibration..."));
+  Serial.println(F("Press reset button to recalibrate anytime."));
+  Serial.println();
+  delay(1000);
+}
+void loop() {
+  // --- Handle reset button: re-start calibration ---
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      Serial.println();
+      Serial.println(F("=== RESET! Re-calibrating ==="));
+      restPositionX = 0;
+      calibrationCount = 0;
+      isCalibrated = false;
+      lastValidAngle = 0;
+      errorCount = 0;
+      // Reset vibration history
+      for (int i = 0; i < VIBRATION_SAMPLES; i++) {
+        vibrationHistory[i] = 0;
+      }
+      Serial.println(F("Keep sensor in rest position for calibration..."));
+      Serial.println();
+      while (digitalRead(RESET_BUTTON_PIN) == LOW) { delay(50); }
+      delay(1000);
+    }
+  }
+  // --- Variables for sensor ---
+  int16_t ax, ay, az, gx, gy, gz;
+  bool sensor_ok = false;
+  // --- Read from MPU6050 ---
+  if (readMPU6050(ax, ay, az, gx, gy, gz)) {
+    sensor_ok = true;
+    errorCount = 0;
+    lastSuccessfulRead = millis();
+  } else {
+    errorCount++;
+    if (errorCount > 10) {
+      Serial.println(F("WARNING: Multiple read errors on Sensor"));
+      errorCount = 0;
+    }
+  }
+  // Only proceed if sensor is working
+  if (!sensor_ok) {
+    Serial.println(F("ERROR: Sensor failed to read!"));
+    delay(500);
+    return;
+  }
+  // --- Convert raw data to meaningful units ---
+  float ax_g = float(ax) / 16384.0;
+  float ay_g = float(ay) / 16384.0;
+  float az_g = float(az) / 16384.0;
+  float gx_dps = float(gx) / 131.0;
+  float gy_dps = float(gy) / 131.0;
+  float gz_dps = float(gz) / 131.0;
+  // Calculate vibration level
+  vibrationLevel = calculateVibrationLevel(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps);
+  // --- Calibration phase ---
+  if (!isCalibrated) {
+    restPositionX += ax;
+    calibrationCount++;
+    int progress = (calibrationCount * 100) / CALIBRATION_SAMPLES;
+    if (calibrationCount % 10 == 0) {
+      Serial.print(F("Calibrating: "));
+      Serial.print(progress);
+      Serial.println(F("%"));
+    }
+    if (calibrationCount >= CALIBRATION_SAMPLES) {
+      restPositionX /= CALIBRATION_SAMPLES;
+      isCalibrated = true;
+      Serial.println(F("Calibration complete!"));
+      Serial.print(F("Sensor Rest X = "));
+      Serial.println(restPositionX);
+      Serial.println(F("---------------------------"));
+      delay(2000);
+    }
+  }
+  // --- Angle calculation & vibration detection ---
+  else {
+    // --- Vibration detection ---
+    bool vibration = detectVibration(vibrationLevel, vibrationHistory);
+    // Update vibration index for moving average
+    vibrationIndex = (vibrationIndex + 1) % VIBRATION_SAMPLES;
+    if (vibration) {
+      Serial.println(F("!!! VIBRATION DETECTED !!!"));
+    }
+    // Compute angle
+    float angle = 0;
+    float accelX = float(ax) - restPositionX;
+    angle = atan2(accelX, 16384.0) * 180.0 / PI;
+    // Reject impossible readings, then apply low-pass filter
+    if (fabs(angle) > 90) {
+      angle = lastValidAngle;
+    } else {
+      angle = (1.0 - ANGLE_SENSITIVITY) * angle + ANGLE_SENSITIVITY * lastValidAngle;
+      lastValidAngle = angle;
+    }
+    // Prepare output string for serial monitor (UNCHANGED FORMAT)
+    String output = "Angle: ";
+    if (angle > 0) output += "+";
+    output += String(angle, 1) + "° | Vibration: " + String(vibrationLevel, 1);
+    // Print to serial
+    Serial.println(output);
+    // Flush serial buffer periodically
+    if (millis() % 1000 < 100) {
+      Serial.flush();
+    }
+  }
+  // Adjust this delay to tune your sample rate
+  delay(100);
+}
