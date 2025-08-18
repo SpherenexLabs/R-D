@@ -1,0 +1,125 @@
+// ===== File: esp8266_a0_voltage_soc_current_clamped.ino =====
+// ESP8266 reads 4S pack voltage on A0 and prints:
+// Vpack (V), I_est (mA, 0..2000), SoC (%).
+// If Vpack < 1.0 V -> SoC=0, I=0. No Wi-Fi, no displays.
+
+// ---------- USER SETTINGS ----------
+const float ADC_A0_VMAX = 3.20f;     // NodeMCU/D1 mini A0 full-scale (~3.2 V). Use 1.00f for bare ESP-12.
+const float R1_TOP_OHMS = 32200.0f;  // Top resistor (e.g., 30k + 2.2k in series to be safe for 16.8V)
+const float R2_BOT_OHMS =  7500.0f;  // Bottom resistor to GND
+
+// Optional voltage calibration: V_true ≈ V_meas * GAIN + OFFSET
+const float VOLT_GAIN   = 1.000f;
+const float VOLT_OFFSET = 0.000f;
+
+// Battery model
+const int   N_CELLS       = 4;       // 4S
+const float R_CELL_OHMS   = 0.050f;  // ~50 mΩ per cell (tune for your pack)
+const float R_PACK_OHMS   = R_CELL_OHMS * N_CELLS;
+
+// Display / estimate constraints
+const float OFF_THRESHOLD_V = 1.0f;  // below this, show SoC=0 and I=0
+const float I_MIN_mA        = 0.0f;  // do not show negative (charging) current here
+const float I_MAX_mA        = 2000.0f; // clamp to 2 A
+
+// Sampling / smoothing
+const uint32_t PRINT_MS       = 500;
+const int      ADC_AVG_SAMPLES = 10;  // simple averaging
+const float    VOC_ALPHA_UP    = 0.20f;  // faster rise (possible charging)
+const float    VOC_ALPHA_DN    = 0.005f; // slow fall (approx OCV under load)
+
+// ---------- INTERNAL ----------
+float dividerRatio = 0.0f;     // V_A0 = V_pack * dividerRatio
+float invDivider   = 0.0f;     // V_pack = V_A0 * invDivider
+float voc_est_V    = NAN;      // estimated open-circuit voltage
+
+struct OcvPoint { float v_cell; float soc; };
+// 4S Li-ion/LiPo OCV→SoC table (resting per-cell voltage)
+const OcvPoint OCV_TABLE[] = {
+  {3.50f,   0.0f}, {3.60f,   5.0f}, {3.65f,  10.0f}, {3.70f,  20.0f},
+  {3.75f,  30.0f}, {3.80f,  40.0f}, {3.85f,  50.0f}, {3.90f,  60.0f},
+  {3.95f,  70.0f}, {4.00f,  80.0f}, {4.10f,  90.0f}, {4.20f, 100.0f}
+};
+const int OCV_N = sizeof(OCV_TABLE)/sizeof(OCV_TABLE[0]);
+
+float estimate_soc_from_pack(float v_pack) {
+  float v_cell = v_pack / N_CELLS;
+  if (v_cell <= OCV_TABLE[0].v_cell) return 0.0f;
+  if (v_cell >= OCV_TABLE[OCV_N-1].v_cell) return 100.0f;
+  for (int i = 0; i < OCV_N - 1; ++i) {
+    if (v_cell >= OCV_TABLE[i].v_cell && v_cell <= OCV_TABLE[i+1].v_cell) {
+      float dv = OCV_TABLE[i+1].v_cell - OCV_TABLE[i].v_cell;
+      float ds = OCV_TABLE[i+1].soc    - OCV_TABLE[i].soc;
+      float t  = (v_cell - OCV_TABLE[i].v_cell) / dv;
+      return OCV_TABLE[i].soc + t * ds;
+    }
+  }
+  return 0.0f;
+}
+
+int read_adc_avg(int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; ++i) {
+    sum += analogRead(A0);
+    delay(2);
+  }
+  return (int)(sum / samples);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println(F("ESP8266 A0 → Voltage, Current(0..2A), SoC(%)"));
+
+  dividerRatio = R2_BOT_OHMS / (R1_TOP_OHMS + R2_BOT_OHMS);
+  invDivider   = 1.0f / dividerRatio;
+
+  // Headroom check (16.8V)
+  float vA0_full = 16.8f * dividerRatio;
+  Serial.print(F("A0 at 16.8V ≈ ")); Serial.print(vA0_full, 3);
+  Serial.print(F(" V (A0 max ~")); Serial.print(ADC_A0_VMAX, 2); Serial.println(F(" V)."));
+}
+
+void loop() {
+  static uint32_t t_last = millis();
+  uint32_t now = millis();
+  if (now - t_last < PRINT_MS) return;
+  t_last = now;
+
+  // --- Read and convert voltage ---
+  int raw = read_adc_avg(ADC_AVG_SAMPLES);            // 0..1023
+  float v_a0   = (raw / 1023.0f) * ADC_A0_VMAX;       // volts at A0
+  float v_pack = v_a0 * invDivider;                   // undo divider
+  v_pack = v_pack * VOLT_GAIN + VOLT_OFFSET;          // optional calibration
+
+  // OFF condition: show zeros
+  if (v_pack < OFF_THRESHOLD_V) {
+    Serial.print(F("V=")); Serial.print(v_pack, 2); Serial.print(F(" V, "));
+    Serial.print(F("I=")); Serial.print(0); Serial.print(F(" mA, "));
+    Serial.print(F("SoC=")); Serial.print(0); Serial.println(F(" %"));
+    // Reset OCV tracker so next power-up SoC is fresh
+    voc_est_V = NAN;
+    return;
+  }
+
+  // --- Track an approximate open-circuit voltage (reduces load-sag effects) ---
+  if (isnan(voc_est_V)) voc_est_V = v_pack;
+  if (v_pack > voc_est_V) voc_est_V += VOC_ALPHA_UP * (v_pack - voc_est_V);
+  else                    voc_est_V += VOC_ALPHA_DN * (v_pack - voc_est_V);
+
+  // --- Estimate current from internal resistance model ---
+  // I_est ≈ max(0, (Voc_est - Vload) / Rpack), clamped to 0..2000 mA
+  float I_est_A  = (voc_est_V - v_pack) / R_PACK_OHMS;
+  float I_mA     = I_est_A * 1000.0f;
+  if (I_mA < I_MIN_mA)   I_mA = I_MIN_mA;
+  if (I_mA > I_MAX_mA)   I_mA = I_MAX_mA;
+
+  // --- SoC from OCV curve (use voc_est for better stability) ---
+  float soc_pct = estimate_soc_from_pack(voc_est_V);
+
+  // --- Print ---
+  Serial.print(F("V="));   Serial.print(v_pack, 2);  Serial.print(F(" V, "));
+  Serial.print(F("I="));   Serial.print(I_mA, 0);    Serial.print(F(" mA, "));
+  Serial.print(F("SoC=")); Serial.print(soc_pct, 0); Serial.println(F(" %"));
+}
