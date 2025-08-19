@@ -27,7 +27,7 @@
 #define FB_SOUND_DETECTED       FB_ROOT "/Sound_Detected"
 
 // ---- Hardware ----
-#define MIC_PIN        A0          // ensure ≤1.0 V into A0 (use divider if needed)
+#define MIC_PIN        A0          
 #define RADAR_PIN      D5          // RCWL-0516 OUT (HIGH on motion)
 
 // OLED (NodeMCU: SDA=D2/GPIO4, SCL=D1/GPIO5)
