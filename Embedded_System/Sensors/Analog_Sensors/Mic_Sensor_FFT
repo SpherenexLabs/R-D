@@ -1,0 +1,118 @@
+/*
+  ===========================================================
+  🚑 Smart Traffic Management & Ambulance Siren Detection
+  ===========================================================
+
+  🔌 Hardware Connections:
+  ------------------------
+  🎤 Microphone Sound Sensor (Analog OUT pin):
+     - VCC → 5V (Arduino UNO)
+     - GND → GND (Arduino UNO)
+     - OUT (Analog) → A0 (Arduino UNO)   <-- MIC_PIN in code
+
+  🟢 Traffic Lights (optional expansion for signals):
+     - Use digital pins for Red/Yellow/Green LEDs per lane
+     - Example TL-1 → Pins (2,3,4), TL-2 → (5,6,7), etc.
+
+  ⚙️ Servo Motor (if barrier gate is included):
+     - Signal → A1 (Arduino UNO)
+     - VCC → 5V (external power if required, >500mA)
+     - GND → Common Ground with Arduino
+
+  💻 Serial Monitor:
+     - Baud Rate: 115200
+     - Displays detected frequencies and detection status
+
+  ===========================================================
+  📡 Code Functionality:
+  ----------------------
+  - Continuously samples microphone audio via analog input A0
+  - Applies FFT (Fast Fourier Transform) to extract frequency content
+  - Checks if the dominant frequency falls in the siren band (850–1500 Hz)
+  - Uses a sliding window of 2 seconds:
+       * Counts how many times a siren-like frequency is detected
+       * If >=3 hits occur → "**** AMBULANCE DETECTED! ****"
+  - Automatically resets if siren disappears
+  ===========================================================
+*/
+
+#include <arduinoFFT.h>
+
+#define MIC_PIN        A0
+#define SAMPLES        64
+#define SAMPLING_FREQ  9000
+
+#define SIREN_MIN_FREQ 850   // Hz
+#define SIREN_MAX_FREQ 1500  // Hz
+#define DETECTION_WINDOW 2000 // ms (2 seconds)
+#define TRIGGER_THRESHOLD 3   // Number of times to detect within window
+
+ArduinoFFT<double> FFT;
+
+unsigned int sampling_period_us;
+unsigned long microseconds;
+
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+unsigned long windowStart = 0;
+int triggerCount = 0;
+bool ambulanceDetected = false;
+
+void setup() {
+  Serial.begin(115200);
+  sampling_period_us = round(1000000 * (1.0 / SAMPLING_FREQ));
+  windowStart = millis();
+}
+
+void loop() {
+  // 1. Collect Samples
+  for (int i = 0; i < SAMPLES; i++) {
+    microseconds = micros();
+    vReal[i] = analogRead(MIC_PIN);
+    vImag[i] = 0;
+    while (micros() < (microseconds + sampling_period_us)) {
+      // wait until next sample
+    }
+  }
+
+  // 2. FFT processing
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  double peak = FFT.majorPeak(vReal, SAMPLES, SAMPLING_FREQ);
+
+  // 3. Check for siren frequency in current window
+  if (peak > SIREN_MIN_FREQ && peak < SIREN_MAX_FREQ) {
+    triggerCount++;
+    Serial.print("Siren-like freq detected: ");
+    Serial.print(peak, 1);
+    Serial.print(" Hz [Count in window: ");
+    Serial.print(triggerCount);
+    Serial.println("]");
+  } else {
+    Serial.print("No siren, Peak Freq: ");
+    Serial.print(peak, 1);
+    Serial.println(" Hz");
+  }
+
+  // 4. Check if window is over
+  if (millis() - windowStart > DETECTION_WINDOW) {
+    if (triggerCount >= TRIGGER_THRESHOLD && !ambulanceDetected) {
+      Serial.println("**** AMBULANCE DETECTED! ****");
+      ambulanceDetected = true;
+    }
+    // Reset window and trigger count
+    windowStart = millis();
+    triggerCount = 0;
+    if (ambulanceDetected) {
+      // Wait until no siren for at least one window before resetting
+      if (peak < SIREN_MIN_FREQ || peak > SIREN_MAX_FREQ) {
+        ambulanceDetected = false;
+      }
+    }
+  }
+
+  delay(100); // For serial readability
+}
