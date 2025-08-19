@@ -3,25 +3,14 @@
   🚑 Smart Traffic Management & Ambulance Siren Detection
   ===========================================================
 
-  🔌 Hardware Connections:
-  ------------------------
-  🎤 Microphone Sound Sensor (Analog OUT pin):
-     - VCC → 5V (Arduino UNO)
-     - GND → GND (Arduino UNO)
-     - OUT (Analog) → A0 (Arduino UNO)   <-- MIC_PIN in code
+  🔌 Microphone Sensor Wiring (KY-037 / KY-038 or similar):
+  ---------------------------------------------------------
 
-  🟢 Traffic Lights (optional expansion for signals):
-     - Use digital pins for Red/Yellow/Green LEDs per lane
-     - Example TL-1 → Pins (2,3,4), TL-2 → (5,6,7), etc.
-
-  ⚙️ Servo Motor (if barrier gate is included):
-     - Signal → A1 (Arduino UNO)
-     - VCC → 5V (external power if required, >500mA)
-     - GND → Common Ground with Arduino
-
-  💻 Serial Monitor:
-     - Baud Rate: 115200
-     - Displays detected frequencies and detection status
+  | Mic Sensor Pin | Arduino UNO Pin | Notes                        |
+  |----------------|-----------------|------------------------------|
+  | VCC            | 5V              | Power supply                 |
+  | GND            | GND             | Common ground                |
+  | OUT (Analog)   | A0              | Connected as MIC_PIN in code |
 
   ===========================================================
   📡 Code Functionality:
