@@ -166,6 +166,6 @@ void loop() {
   if (motion != lastMotion) { fbSetMovement(motion); lastMotion = motion; }
   if (sound  != lastSound)  { fbSetSound(sound);     lastSound  = sound;  }
 
-  delay(35); // readability
+  //delay(35); // readability
 }
 
