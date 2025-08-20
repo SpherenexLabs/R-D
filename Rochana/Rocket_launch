@@ -1,4 +1,6 @@
 //YOUTUBE LINK FOR SOUND TESTING:https://youtu.be/dw6AvjAyFKs?feature=shared
+
+//ERROR: 3SECOND HOLD FOR SOUND
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP8266WiFi.h>
