@@ -1,5 +1,4 @@
 //YOUTUBE LINK FOR SOUND TESTING:https://youtu.be/dw6AvjAyFKs?feature=shared
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP8266WiFi.h>
@@ -35,11 +34,12 @@
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
+unsigned long soundTimerStart = 0;
+const unsigned long SOUND_HOLD_TIME_MS = 3000;  
 // ---- FFT ----
 #define SAMPLES        128         // power of 2
 #define SAMPLING_FREQ  9600        // Hz  (bin ≈ 75 Hz)
-#define SOUND_THRESH_HZ 1500.0      // >=1500 Hz => Sound_Detected = "1"
+#define SOUND_THRESH_HZ 1800.0      // >=1500 Hz => Sound_Detected = "1"
 ArduinoFFT<double> FFT;
 double vReal[SAMPLES];
 double vImag[SAMPLES];
@@ -101,7 +101,6 @@ void drawOLED(int motion, bool sound, double peakHz) {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
   display.setCursor(0, 0);   display.println("Rocket Monitor");
   display.setCursor(0, 12);  display.print("RADAR: ");
   display.println(motion ? "1" : "0");
@@ -111,10 +110,8 @@ void drawOLED(int motion, bool sound, double peakHz) {
   display.print(peakHz, 1);  display.println(" Hz");
   display.setCursor(0, 50);  display.print("SSID: ");
   display.println(WiFi.SSID());
-
   display.display();
 }
-
 // ---- Setup ----
 void setup() {
   Serial.begin(115200);
@@ -140,9 +137,9 @@ void loop() {
   // 2) Acquire samples at fixed Fs
   for (int i = 0; i < SAMPLES; i++) {
     unsigned long t0 = micros();
-    vReal[i] = analogRead(MIC_PIN);  // 0..1023
+    vReal[i] = analogRead(MIC_PIN);
     vImag[i] = 0.0;
-    while ((micros() - t0) < sampPeriod_us) { } // keep Fs constant
+    while ((micros() - t0) < sampPeriod_us) { }
   }
 
   // 3) FFT → peak frequency
@@ -152,8 +149,12 @@ void loop() {
   FFT.complexToMagnitude(vReal, vImag, SAMPLES);
   double peakHz = FFT.majorPeak(vReal, SAMPLES, SAMPLING_FREQ);
 
-  // 4) Sound decision
-  bool sound = (peakHz >= SOUND_THRESH_HZ);
+  // 4) Sound decision with 3s hold
+  bool soundNow = (peakHz >= SOUND_THRESH_HZ);
+  if (soundNow) {
+    soundTimerStart = millis();  // reset timer
+  }
+  bool sound = (millis() - soundTimerStart <= SOUND_HOLD_TIME_MS);
 
   // 5) Update OLED + Serial
   drawOLED(motion, sound, peakHz);
@@ -162,10 +163,10 @@ void loop() {
                 sound  ? "1" : "0",
                 peakHz);
 
-  // 6) Update Firebase only on change (exact strings "1"/"0")
+  // 6) Update Firebase only on change
   if (motion != lastMotion) { fbSetMovement(motion); lastMotion = motion; }
   if (sound  != lastSound)  { fbSetSound(sound);     lastSound  = sound;  }
-
-  //delay(35); // readability
 }
+  //delay(35); // readability
 
+  
