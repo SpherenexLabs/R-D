@@ -1,11 +1,13 @@
 //i,v,soc of battery+ultrasonic triggers < 15cm
+// I READING NOT STABLE/CORRECT
+// ===== File: smart_vehicle_monitoring.ino =====
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP8266WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Firebase_ESP_Client.h>
-#include "addons/TokenHelper.h"   
+#include "addons/TokenHelper.h"    // provides tokenStatusCallback
 #include "addons/RTDBHelper.h"
 #include <math.h>
 
@@ -23,7 +25,7 @@
 // ===== Firebase Paths (with vehicle node) =====
 // File: smart_vehicle_monitoring.ino  (replace the old path block)
 #define FB_ROOT                 "/2_KS5165_Smart_Vechile_monitoring"
-#define FB_VEHICLE_NODE         FB_ROOT "/vechicle_1"      // <- subfolder
+#define FB_VEHICLE_NODE         FB_ROOT "/vechicle_2"      // <- subfolder
 
 #define FB_PATH_VOLTAGE         FB_VEHICLE_NODE "/V_in_V"
 #define FB_PATH_CURRENT         FB_VEHICLE_NODE "/I_in_mA"
@@ -183,13 +185,11 @@ void setup() {
   if (Firebase.ready()) {
     fb_set_number(FB_PATH_STATUS, "online");
   }
-
   display.clearDisplay();
   display.setCursor(0,0);
   display.println("Init OK");
   display.display();
 }
-
 void loop() {
   static uint32_t last = millis();
   if (millis() - last < PRINT_MS) return;
@@ -211,17 +211,14 @@ void loop() {
     voc_est_V += VOC_ALPHA_UP * (v_pack - voc_est_V);
   else
     voc_est_V += VOC_ALPHA_DN * (v_pack - voc_est_V);
-
   // Current estimate via internal resistance
   float I_mA = ((voc_est_V - v_pack) / R_PACK_OHMS) * 1000.0f;   // FIX(5): divide by R, convert to mA
   if (I_mA < I_MIN_mA) I_mA = I_MIN_mA;
   if (I_mA > I_MAX_mA) I_mA = I_MAX_mA;
   if (fabsf(I_mA) < 1.0f) I_mA = 0.0f;                           // small values → 0
-
   float soc = estimate_soc_from_pack(voc_est_V);
   long dist = measure_distance_cm();
   int alert = (dist >= 0 && dist <= CRITICAL_CM) ? 1 : 0;
-
   // ===== OLED Display =====
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -232,7 +229,6 @@ void loop() {
     display.println("TOO CLOSE!");
   }
   display.display();
-
   // ===== Firebase Send (only if ready) =====           // FIX(6): gate on ready
   if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
     fb_set_number(FB_PATH_VOLTAGE, v_pack);
@@ -242,7 +238,7 @@ void loop() {
   } else {
     Serial.println("Skip send: Wi-Fi or Firebase not ready");
   }
-
   // ===== Debug Print =====
   Serial.printf("V=%.2fV I=%.0fmA SoC=%.0f%% Dist=%ldcm Alert=%d\n", v_pack, I_mA, soc, dist, alert);
 }
+
