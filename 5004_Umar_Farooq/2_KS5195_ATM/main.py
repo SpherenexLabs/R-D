@@ -1,19 +1,43 @@
 # ===== File: atm_welcome_menu.py =====
 # Board: Raspberry Pi Pico W (MicroPython)
-# Boot: set Welcome flag "1" -> show menu on Serial -> on selection:
-#   1 Facial  : no action
-#   2 Finger  : require 2 s touch hold, then set Verification/2_Finger = "1"
-#   3 PIN     : collect 4 digits, set Verification/3_PIN = "<4digits>"
-#   4 Pattern : collect 4 digits, set Verification/4_Pattern = "<4digits>"
-# Also: after first valid selection write, set Welcome flag back to "0".
-# After writing verification, poll /6_ATM/2_Menu/3_Authentication_Verified:
-#   '1' -> print 'Verified' and prompt for Account Type menu;
-#   '2' -> print 'Wrong verification';
-#   '0' or '' -> do nothing; keep waiting.
-# Then, after Account Type, show Bank Selection (1..4) and write to /6_ATM/2_Menu/5_Bank_Selection.
-# After Bank Selection, prompt for Withdrawal Amount, update /6_ATM/2_Menu/6_Withdrawal_Amount
-# as digits are entered, and on '#' confirm: run dispenser (servo+buzzer) and set
-# /6_ATM/2_Menu/7_Transaction_Completed = "1".
+#
+# SUMMARY (flow)
+# 1) On boot: write "1" to /6_ATM/1_Welcome_Screen and print menu.
+# 2) Keypad selection -> /6_ATM/2_Menu/1_Authentication_Selection ("1"=Facial, "2"=Finger, "3"=PIN, "4"=Pattern)
+#    After first selection, set /6_ATM/1_Welcome_Screen = "0".
+# 3) Verification:
+#    - 1: Facial → no action (placeholder).
+#    - 2: Finger → hold touch 2 s → /6_ATM/2_Menu/2_Authentication_Verification/2_Finger = "1".
+#    - 3: PIN    → collect 4 digits → /…/3_PIN = "####".
+#    - 4: Pattern→ collect 4 digits → /…/4_Pattern = "####".
+# 4) Wait for /6_ATM/2_Menu/3_Authentication_Verified:
+#    - "1" → print "Verified", then ask Account Type, write /6_ATM/2_Menu/4_Account_Type ("1" or "2"),
+#             then ask Bank Selection, write /6_ATM/2_Menu/5_Bank_Selection ("1".."4"),
+#             then prompt "Enter amount", stream digits to /6_ATM/2_Menu/6_Withdrawal_Amount,
+#             on '#' → run dispense (servo 0→180, buzzer toggle 5 s, servo back to 0), then
+#             set /6_ATM/2_Menu/7_Transaction_Completed = "1".
+#    - "2" → print "Wrong verification".
+#    - "0" or "" → do nothing.
+#
+# WIRING TABLE (Pico W)
+# | Module         | Signal | Pico GPIO | Mode / Voltage        | Notes                         |
+# |----------------|--------|-----------|------------------------|-------------------------------|
+# | Keypad 3x4     | R1..R4 | GP6..GP9  | INPUT_PULLUP          | Rows                          |
+# |                | C1..C3 | GP10..12  | OUTPUT (idle HIGH)    | Scan by pulling one LOW       |
+# | Touch TTP223   | OUT    | GP14      | INPUT                 | TOUCH_ACTIVE_HIGH=True (def)  |
+# |                | VCC    | 3V3       | 3.3 V                 |                               |
+# |                | GND    | GND       | —                      |                               |
+# | Servo          | SIG    | GP15      | PWM @ 50 Hz           | External 5 V; common ground   |
+# |                | V+     | 5V ext    | —                      | **Do NOT** use Pico 3V3       |
+# |                | GND    | GND       | —                      |                               |
+# | Buzzer active  | SIG    | GP16      | OUTPUT (ACTIVE-HIGH)  |                               |
+# |                | V+     | 3.3/5 V   | —                      | Per module                    |
+# |                | GND    | GND       | —                      |                               |
+#
+# Notes:
+# - Rows use internal pull-ups; columns are outputs (idle HIGH).
+# - Ensure servo supply can source ≥2 A for MG995; add 470–1000 µF near servo.
+# - Share GND between Pico, servo supply, and buzzer.
 
 import time, network, ujson
 try:
@@ -276,7 +300,6 @@ def withdrawal_amount_flow(id_token):
             time.sleep_ms(5)
             continue
         if k.isdigit():
-            # Limit length to, say, 6 digits (optional)
             if len(buf) < 6:
                 buf += k
                 print(buf)
@@ -309,13 +332,9 @@ def beep_for_ms(total_ms=5000, toggle_ms=200):
 
 def dispense_action(id_token=None):
     print('Dispensing... (servo 0->180, buzzer beeps 5s, back to 0)')
-    # Move to 180
-    servo_angle(180)
-    # Beep for 5s
-    beep_for_ms(5000, 200)
-    # Back to 0
-    servo_angle(0)
-    # Mark transaction completion
+    servo_angle(180)             # move out
+    beep_for_ms(5000, 200)       # 5 s audible feedback
+    servo_angle(0)               # retract
     if id_token is not None:
         rtdb_put_string(TX_COMPLETED_PATH, '1', id_token=id_token)
     print('Transaction completed -> {} = "1"'.format(TX_COMPLETED_PATH))
@@ -340,7 +359,6 @@ def wait_and_handle_verification_status(id_token):
                 print('Wrong verification.')
                 return 'wrong'
             elif s in ('0', ''):
-                # do nothing
                 pass
             else:
                 print('Unhandled status:', s)
@@ -390,7 +408,6 @@ def main():
                         {'1':'Facial','2':'Finger','3':'PIN','4':'Pattern'}[k], k, SELECT_PATH))
                     last_written = k
 
-                    # After selection, set Welcome flag back to '0' once
                     if welcome_is_one:
                         if rtdb_put_string(WELCOME_PATH, '0', id_token=id_token):
                             print('Set {} = "0" (after selection)'.format(WELCOME_PATH))
@@ -421,7 +438,6 @@ def main():
                     if result == 'verified':
                         withdrawal_amount_flow(id_token)
 
-                    # Re-print menu for convenience (allow new session)
                     print_menu()
                 else:
                     print('Write failed; will retry on next key.')
@@ -430,4 +446,3 @@ def main():
 # Auto-run
 if __name__ == '__main__':
     main()
-
