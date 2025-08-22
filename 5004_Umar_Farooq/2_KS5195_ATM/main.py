@@ -1,3 +1,25 @@
+# ============================================================================
+#  Wiring Table — Raspberry Pi Pico W + 3x4 Keypad + Touch (TTP223)
+#  (Keypad is passive: only row/column lines; no VCC/GND pins)
+# ----------------------------------------------------------------------------
+# | Module     | Signal | Connect To (Module) | Pico W GPIO | Mode                | Notes                         |
+# |------------|--------|---------------------|-------------|---------------------|-------------------------------|
+# | Keypad 3x4 | R1     | Row 1               | GP6         | INPUT_PULLUP        | Top row                       |
+# |            | R2     | Row 2               | GP7         | INPUT_PULLUP        |                               |
+# |            | R3     | Row 3               | GP8         | INPUT_PULLUP        |                               |
+# |            | R4     | Row 4               | GP9         | INPUT_PULLUP        | Bottom row                    |
+# |            | C1     | Column 1            | GP10        | OUTPUT (idle HIGH)  | Scanned LOW one at a time     |
+# |            | C2     | Column 2            | GP11        | OUTPUT (idle HIGH)  |                               |
+# |            | C3     | Column 3            | GP12        | OUTPUT (idle HIGH)  |                               |
+# | TTP223     | OUT    | Touch output        | GP14        | INPUT (pull depends)| Active-HIGH by default        |
+# |            | VCC    | +3.3 V              | 3V3         | —                   | Power for touch sensor        |
+# |            | GND    | Ground              | GND         | —                   | Common ground                 |
+# ----------------------------------------------------------------------------
+# Touch logic level:
+#   - If your TTP223 board is ACTIVE-HIGH (default), set TOUCH_ACTIVE_HIGH = True (and we use Pin.PULL_DOWN).
+#   - If ACTIVE-LOW, set TOUCH_ACTIVE_HIGH = False (and we use Pin.PULL_UP).
+# ============================================================================
+
 # ---------- Wi-Fi + Firebase + Keypad + Touch (Pico W / MicroPython) ----------
 import network, time, ujson
 try:
@@ -18,7 +40,7 @@ USER_PASSWORD = "Spherenex@123"
 
 # RTDB paths
 PIN_PATH = "/6_ATM/1_Authentication/3_PIN"                  # "1234" (string)
-FP_PATH  = "/6_ATM/1_Authentication/2_Fingerprint"          # "1" pulse on 3s hold
+FP_PATH  = "/6_ATM/1_Authentication/2_Fingerprint"          # pulse "1" then back to "0"
 
 # ===== Keypad (3x4) =====
 ROWS, COLS = 4, 3
@@ -35,8 +57,8 @@ DEBOUNCE_MS = 25
 # ===== Touch sensor =====
 TOUCH_PIN = 14                 # GP14 → TTP223 OUT
 TOUCH_ACTIVE_HIGH = True       # set False if your board is active-LOW
-HOLD_MS = 3000                 # 3 seconds
-PULSE_MS = 1000                   # << set 0 for immediate reset to "0" after writing "1"
+HOLD_MS = 3000                 # must hold touch for 3 seconds to trigger
+PULSE_MS = 1000                # keep "1" in Firebase for 1000 ms, then write "0"
 touch = Pin(TOUCH_PIN, Pin.IN, Pin.PULL_DOWN if TOUCH_ACTIVE_HIGH else Pin.PULL_UP)
 
 def touch_active():
@@ -98,7 +120,7 @@ def main():
         print("Continuing without auth (works only if DB rules are public).")
 
     # [Init] ensure fingerprint path is 0 at boot
-    rtdb_put_string(FP_PATH, "0", id_token=id_token)      # << init reset
+    rtdb_put_string(FP_PATH, "0", id_token=id_token)      # start cleared
 
     buf = ""
     print("Ready. Keypad: enter 4-digit PIN. '*'=backspace, '#'=clear.")
@@ -124,7 +146,7 @@ def main():
             elif k == '#':  # clear
                 buf = ""; print("Cleared.")
 
-        # --- Touch sensor (3s hold -> pulse "1" then immediate "0") ---
+        # --- Touch sensor (3s hold -> pulse "1" then back to "0" after PULSE_MS) ---
         if touch_active():
             if not touch_down:
                 touch_down = True
@@ -135,7 +157,7 @@ def main():
                     if rtdb_put_string(FP_PATH, "1", id_token=id_token):
                         if PULSE_MS > 0:
                             time.sleep_ms(PULSE_MS)
-                        rtdb_put_string(FP_PATH, "0", id_token=id_token)   # << immediate reset
+                        rtdb_put_string(FP_PATH, "0", id_token=id_token)
                         print('Fingerprint pulse: 1→0')
                     else:
                         print("Fingerprint write FAILED")
@@ -149,4 +171,3 @@ def main():
 # Auto-run
 if __name__ == "__main__":
     main()
-
