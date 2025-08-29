@@ -9,7 +9,7 @@
 #include "addons/RTDBHelper.h"
 #include <math.h>
 
-// ===== Wi-Fi Config =====
+// ===== Wi-Fi =====
 #define WIFI_SSID       "spherenex1"
 #define WIFI_PASSWORD   "Spherenex@789"
 
@@ -25,70 +25,121 @@
 #define FB_PATH_VOLTAGE         FB_VEHICLE_NODE "/channel_0/V_in_V"
 #define FB_PATH_CURRENT         FB_VEHICLE_NODE "/channel_0/I_in_mA"
 #define FB_PATH_SOC             FB_VEHICLE_NODE "/channel_0/SOC_percent"
+#define FB_PATH_COIL_V          FB_VEHICLE_NODE "/channel_1/coil_V"
+#define FB_PATH_COIL_RX         FB_VEHICLE_NODE "/channel_1/coil_rx"
+#define FB_PATH_CHG_STATE       FB_VEHICLE_NODE "/charging/state"
 #define FB_PATH_ALERT           FB_VEHICLE_NODE "/alert"
 #define FB_PATH_STATUS          FB_VEHICLE_NODE "/__status"
 
-// ===== OLED Config =====
-#define SCREEN_WIDTH 128
+// ===== OLED =====
+#define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ===== MUX Control Pins (MUX74HC4067) =====
+// ===== MUX (74HC4067) =====
 #define MUX_S0 D5
 #define MUX_S1 D6
 #define MUX_S2 D7
 #define MUX_S3 D8
+#define MUX_CH_BATTERY   0
+#define MUX_CH_COIL      1
 
-// ===== Ultrasonic Sensor Pins =====
-#define TRIG_PIN D4  // GPIO2
-#define ECHO_PIN D3  // GPIO0
+// ===== Ultrasonic (alert only; not printed) =====
+#define TRIG_PIN D4
+#define ECHO_PIN D3
 #define SOUND_SPEED 0.034f
 #define CRITICAL_CM 15
 
-// ===== Voltage Divider and Battery Settings =====
+// ===== ADC / Voltage Divider =====
 #define ADC_PIN A0
+// A0 full-scale: 3.20 for NodeMCU/D1 mini; 1.00 for bare ESP-12
 const float ADC_A0_VMAX = 3.20f;
+
+// Battery divider (CH0):
 const float R1_TOP_OHMS = 32200.0f;
 const float R2_BOT_OHMS = 7500.0f;
-const float VOLT_GAIN = 1.0f;
-const float VOLT_OFFSET = 0.0f;
-const float OFF_THRESHOLD_V = 1.0f;
 
+// ---- DMM calibration ----
+// You measured ~7.7 V while raw math gave ~8.45 V → gain ≈ 7.70/8.45 = 0.912
+const float CAL_V_GAIN   = 0.912f;   // tweak ±1–2% if needed
+const float CAL_V_OFFSET = 0.000f;   // volts offset (usually 0)
+
+// Coil: publish A0-side volts (stable presence detection)
+const bool  COIL_EXPAND_TO_LINE = false;
+const float COIL_TOP_OHMS = 0.0f;
+const float COIL_BOT_OHMS = 0.0f;
+
+// ===== Battery model / smoothing =====
 const int   N_CELLS = 2;
 const float R_CELL_OHMS = 0.050f;
 const float R_PACK_OHMS = R_CELL_OHMS * N_CELLS;
 
 const int   ADC_AVG_SAMPLES = 10;
-const float VOC_ALPHA_UP = 0.20f, VOC_ALPHA_DN = 0.005f;
-const float I_MIN_mA = 0.0f;
-const float I_MAX_mA = 2000.0f;
 
-// ===== Timing =====
-const uint32_t PRINT_MS = 1000;
-float dividerRatio, invDivider, voc_est_V = NAN;
+// EMA smoothing (we publish these EMA’d values everywhere)
+const float EMA_ALPHA_V    = 0.25f;   // V smoothing
+const float EMA_ALPHA_I    = 0.30f;   // I smoothing
+const float EMA_ALPHA_COIL = 0.25f;   // coil smoothing
 
-// ===== Firebase Setup =====
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
+// OCV estimator for load compensation
+const float VOC_ALPHA_UP   = 0.20f;
+const float VOC_ALPHA_DN   = 0.005f;
 
-// ===== OCV Table for SoC =====
+// Signed current (neg=charging, pos=discharging)
+const float I_MAX_mA       = 2000.0f;
+const float I_DEADBAND_mA  = 25.0f;
+
+// ===== SoC Curve =====
+// If you want textbook OCV SoC, set USE_CUSTOM_SOC=false.
+// You asked ~7.6–7.7 V (~3.8–3.85 V/cell) to show in the 90s → custom curve below.
+const bool  USE_CUSTOM_SOC = true;
 struct OcvPoint { float v_cell, soc; };
-const OcvPoint OCV_TABLE[] = {
+
+// Custom: make 3.70→90%, 3.80→94%, 3.90→97%, 4.10→99%, 4.20→100
+const OcvPoint OCV_TABLE_CUSTOM[] = {
+  {3.50f,  60}, {3.60f,  85}, {3.70f,  90}, {3.80f, 94},
+  {3.90f,  97}, {4.00f,  98.5f}, {4.10f, 99.0f}, {4.20f, 100}
+};
+
+// Standard Li-ion-ish OCV (more conservative; ~3.8 V/cell ≈ 50–60%)
+const OcvPoint OCV_TABLE_STD[] = {
   {3.50f, 0}, {3.60f, 5}, {3.65f, 10}, {3.70f, 20},
   {3.75f, 30}, {3.80f, 40}, {3.85f, 50}, {3.90f, 60},
   {3.95f, 70}, {4.00f, 80}, {4.10f, 90}, {4.20f, 100}
 };
-const int OCV_N = sizeof(OCV_TABLE) / sizeof(OCV_TABLE[0]);
+
+const OcvPoint* OCV_TABLE = USE_CUSTOM_SOC ? OCV_TABLE_CUSTOM : OCV_TABLE_STD;
+const int OCV_N = USE_CUSTOM_SOC
+                  ? (sizeof(OCV_TABLE_CUSTOM)/sizeof(OCV_TABLE_CUSTOM[0]))
+                  : (sizeof(OCV_TABLE_STD)/sizeof(OCV_TABLE_STD[0]));
+
+// ===== Timing =====
+const uint32_t PRINT_MS = 1000;
+
+// ===== Globals =====
+float voc_est_V   = NAN;     // OCV estimate (virtual open-circuit V)
+float v_pack_ema  = NAN;     // EMA for pack voltage
+float i_pack_ema  = NAN;     // EMA for current
+float coil_ema    = NAN;     // EMA for coil A0 volts
+
+// ===== Firebase =====
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== Helpers =====
+static inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+static inline float clamp(float x, float lo, float hi){ return x < lo ? lo : (x > hi ? hi : x); }
 
 float estimate_soc_from_pack(float v_pack) {
   float v_cell = v_pack / N_CELLS;
-  if (v_cell <= OCV_TABLE[0].v_cell) return 0;
-  if (v_cell >= OCV_TABLE[OCV_N - 1].v_cell) return 100;
+  if (v_cell <= OCV_TABLE[0].v_cell) return OCV_TABLE[0].soc;
+  if (v_cell >= OCV_TABLE[OCV_N - 1].v_cell) return OCV_TABLE[OCV_N - 1].soc;
   for (int i = 0; i < OCV_N - 1; ++i) {
     if (v_cell >= OCV_TABLE[i].v_cell && v_cell <= OCV_TABLE[i + 1].v_cell) {
-      float t = (v_cell - OCV_TABLE[i].v_cell) / (OCV_TABLE[i + 1].v_cell - OCV_TABLE[i].v_cell);
-      return OCV_TABLE[i].soc + t * (OCV_TABLE[i + 1].soc - OCV_TABLE[i].soc);
+      float t = (v_cell - OCV_TABLE[i].v_cell) /
+                (OCV_TABLE[i + 1].v_cell - OCV_TABLE[i].v_cell);
+      return lerp(OCV_TABLE[i].soc, OCV_TABLE[i + 1].soc, t);
     }
   }
   return 0;
@@ -103,11 +154,36 @@ int read_adc_avg(int samples) {
   return sum / samples;
 }
 
-float measure_voltage() {
-  int raw = read_adc_avg(ADC_AVG_SAMPLES);
+void selectMuxChannel(uint8_t channel) {
+  digitalWrite(MUX_S0, bitRead(channel, 0));
+  digitalWrite(MUX_S1, bitRead(channel, 1));
+  digitalWrite(MUX_S2, bitRead(channel, 2));
+  digitalWrite(MUX_S3, bitRead(channel, 3));
+}
+
+// Battery pack voltage (CH0) with divider + calibration → volts
+float measure_battery_voltage_raw() {
+  selectMuxChannel(MUX_CH_BATTERY);
+  delay(5);
+  int   raw  = read_adc_avg(ADC_AVG_SAMPLES);
+  float v_a0 = (raw / 1023.0f) * ADC_A0_VMAX;  // A0 volts
+  float gain_inv = (R1_TOP_OHMS + R2_BOT_OHMS) / R2_BOT_OHMS;
+  float v_pk = v_a0 * gain_inv;
+  v_pk = v_pk * CAL_V_GAIN + CAL_V_OFFSET;
+  return v_pk;
+}
+
+// Coil A0-side volts (CH1)
+float measure_coil_voltage_raw() {
+  selectMuxChannel(MUX_CH_COIL);
+  delay(5);
+  int   raw  = read_adc_avg(ADC_AVG_SAMPLES);
   float v_a0 = (raw / 1023.0f) * ADC_A0_VMAX;
-  float v_pack = v_a0 * invDivider * VOLT_GAIN + VOLT_OFFSET;
-  return v_pack;
+  if (!COIL_EXPAND_TO_LINE || COIL_TOP_OHMS <= 0 || COIL_BOT_OHMS <= 0) {
+    return v_a0;
+  }
+  float coil_inv = (COIL_TOP_OHMS + COIL_BOT_OHMS) / COIL_BOT_OHMS;
+  return v_a0 * coil_inv;
 }
 
 long measure_distance_cm() {
@@ -118,18 +194,20 @@ long measure_distance_cm() {
   return (dur > 0) ? (long)(dur * SOUND_SPEED / 2.0f) : -1;
 }
 
-void select_mux_channel(uint8_t ch) {
-  digitalWrite(MUX_S0, ch & 0x01);
-  digitalWrite(MUX_S1, ch & 0x02);
-  digitalWrite(MUX_S2, ch & 0x04);
-  digitalWrite(MUX_S3, ch & 0x08);
-}
-
-// Firebase write helper
+// Firebase write helpers
 template<typename T>
-bool fb_set_number(const char* path, T value) {
+bool fb_set_num(const char* path, T value) {
   for (int i = 0; i < 3; ++i) {
     if (Firebase.ready() && Firebase.RTDB.set(&fbdo, path, value)) return true;
+    delay(150);
+  }
+  Serial.printf("Firebase write failed (%s): %s\n", path, fbdo.errorReason().c_str());
+  return false;
+}
+
+bool fb_set_str(const char* path, const String& value) {
+  for (int i = 0; i < 3; ++i) {
+    if (Firebase.ready() && Firebase.RTDB.setString(&fbdo, path, value)) return true;
     delay(150);
   }
   Serial.printf("Firebase write failed (%s): %s\n", path, fbdo.errorReason().c_str());
@@ -139,20 +217,18 @@ bool fb_set_number(const char* path, T value) {
 void setup() {
   Serial.begin(115200);
 
-  // MUX Pins
   pinMode(MUX_S0, OUTPUT);
   pinMode(MUX_S1, OUTPUT);
   pinMode(MUX_S2, OUTPUT);
   pinMode(MUX_S3, OUTPUT);
 
-  // Ultrasonic Pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // OLED Init
-  Wire.begin(D2, D1); // SDA, SCL
+  Wire.begin(D2, D1);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("OLED init failed")); while (1);
+    Serial.println(F("OLED init failed"));
+    while (1) {}
   }
   display.clearDisplay();
   display.setTextSize(1);
@@ -161,43 +237,27 @@ void setup() {
   display.println("Booting...");
   display.display();
 
-  // Voltage divider math
-  dividerRatio = R2_BOT_OHMS / (R1_TOP_OHMS + R2_BOT_OHMS);
-  invDivider = 1.0f / dividerRatio;
-
-  // Wi-Fi connect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("."); delay(400);
-  }
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(400); }
   Serial.println("\nWi-Fi connected, IP: " + WiFi.localIP().toString());
 
-  // Firebase config
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
   config.token_status_callback = tokenStatusCallback;
-
   auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASSWORD;
-
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
   Serial.print("Waiting for Firebase");
   uint32_t t0 = millis();
   while (!Firebase.ready()) {
-    if (millis() - t0 > 30000) {
-      Serial.println("\nFirebase not ready. Check credentials.");
-      break;
-    }
+    if (millis() - t0 > 30000) { Serial.println("\nFirebase not ready."); break; }
     Serial.print("."); delay(300);
   }
-  Serial.println("\nFirebase ready: " + String(Firebase.ready() ? "yes" : "no"));
-
-  if (Firebase.ready()) {
-    fb_set_number(FB_PATH_STATUS, "online");
-  }
+  Serial.println(String("\nFirebase ready: ") + (Firebase.ready() ? "yes" : "no"));
+  if (Firebase.ready()) fb_set_str(FB_PATH_STATUS, "online");
 
   display.clearDisplay();
   display.setCursor(0, 0);
@@ -210,60 +270,71 @@ void loop() {
   if (millis() - last < PRINT_MS) return;
   last = millis();
 
-  // Select MUX channel 0 (only one channel used here)
-  select_mux_channel(0);
-  delay(5);  // small delay to settle
+  // --- Read sensors (raw) ---
+  float coil_v_raw  = measure_coil_voltage_raw();
+  float v_pack_raw  = measure_battery_voltage_raw();
 
-  float v_pack = measure_voltage();
-  if (v_pack < OFF_THRESHOLD_V) {
-    voc_est_V = NAN;
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Battery too low");
-    display.display();
-    return;
-  }
+  // --- EMA smoothing (we use these EMA values EVERYWHERE) ---
+  coil_ema   = isnan(coil_ema)   ? coil_v_raw  : lerp(coil_ema,   coil_v_raw,  EMA_ALPHA_COIL);
+  v_pack_ema = isnan(v_pack_ema) ? v_pack_raw  : lerp(v_pack_ema, v_pack_raw,  EMA_ALPHA_V);
 
-  // OCV estimator smoothing
-  if (isnan(voc_est_V)) voc_est_V = v_pack;
-  if (v_pack > voc_est_V)
-    voc_est_V += VOC_ALPHA_UP * (v_pack - voc_est_V);
-  else
-    voc_est_V += VOC_ALPHA_DN * (v_pack - voc_est_V);
+  // --- OCV estimator uses EMA voltage for coherence ---
+  if (isnan(voc_est_V)) voc_est_V = v_pack_ema;
+  if (v_pack_ema > voc_est_V) voc_est_V += VOC_ALPHA_UP * (v_pack_ema - voc_est_V);
+  else                        voc_est_V += VOC_ALPHA_DN * (v_pack_ema - voc_est_V);
 
-  // Current estimate via internal resistance
-  float I_mA = ((voc_est_V - v_pack) / R_PACK_OHMS) * 1000.0f;
-  if (I_mA < I_MIN_mA) I_mA = I_MIN_mA;
-  if (I_mA > I_MAX_mA) I_mA = I_MAX_mA;
-  if (fabsf(I_mA) < 1.0f) I_mA = 0.0f;
+  // --- Signed current (neg=charging, pos=discharging) ---
+  float I_mA_raw = ((voc_est_V - v_pack_ema) / R_PACK_OHMS) * 1000.0f;
+  I_mA_raw = clamp(I_mA_raw, -I_MAX_mA, +I_MAX_mA);
+  if (fabsf(I_mA_raw) < I_DEADBAND_mA) I_mA_raw = 0.0f;
+  i_pack_ema = isnan(i_pack_ema) ? I_mA_raw : lerp(i_pack_ema, I_mA_raw, EMA_ALPHA_I);
 
-  float soc = estimate_soc_from_pack(voc_est_V);
+  // --- SoC from OCV (custom or standard curve) ---
+  float soc = clamp(estimate_soc_from_pack(voc_est_V), 0.0f, 100.0f);
 
+  // --- Ultrasonic → alert only (no distance shown) ---
   long dist = measure_distance_cm();
-  int alert = (dist >= 0 && dist <= CRITICAL_CM) ? 1 : 0;
+  int  alert = (dist >= 0 && dist <= CRITICAL_CM) ? 1 : 0;
 
-  // OLED Display
+  // --- Coil RX present (V2V) ---
+  const float COIL_PRESENT_TH = 1.20f;                 // tune if needed
+  bool coil_rx = (coil_ema >= COIL_PRESENT_TH);
+
+  // --- Charging state ---
+  const char* chg_state = "IDLE";
+  if (coil_rx || (i_pack_ema < -I_DEADBAND_mA)) chg_state = "CHARGING";
+  if (i_pack_ema >  +I_DEADBAND_mA)             chg_state = "DISCHARGING";
+
+  // ===== OLED (EMA values) =====
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.printf("V=%.2fV I=%.0fmA\nSoC=%.0f%%\nDist=%ldcm\n", v_pack, I_mA, soc, dist);
+  display.printf("V=%.2fV  I=%.0fmA\nSoC=%.0f%%  %s\n",
+                 v_pack_ema, i_pack_ema, soc, coil_rx ? "RX" : "noRX");
   if (alert) {
-    display.setCursor(0, 40);
-    display.setTextSize(1);
+    display.setCursor(0, 32);
     display.println("TOO CLOSE!");
   }
+  display.setCursor(0, 48);
+  display.print("CoilA0=");
+  display.print(coil_ema, 3);
+  display.print("V  ");
+  display.print(chg_state);
   display.display();
 
-  // Firebase Send (only if ready)
+  // ===== Serial (EMA values) =====
+  Serial.printf("V=%.3f V  I=%.0f mA  SoC=%.0f %%  CoilA0=%.3f V  RX=%d  %s  Alert=%d\n",
+                v_pack_ema, i_pack_ema, soc, coil_ema, coil_rx ? 1 : 0, chg_state, alert);
+
+  // ===== Firebase (EMA values) =====
   if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-    fb_set_number(FB_PATH_VOLTAGE, v_pack);
-    fb_set_number(FB_PATH_CURRENT, I_mA);
-    fb_set_number(FB_PATH_SOC, soc);
-    fb_set_number(FB_PATH_ALERT, alert);
+    fb_set_num(FB_PATH_VOLTAGE, v_pack_ema);
+    fb_set_num(FB_PATH_CURRENT, i_pack_ema);
+    fb_set_num(FB_PATH_SOC, soc);
+    fb_set_num(FB_PATH_ALERT, alert);
+    fb_set_num(FB_PATH_COIL_V, coil_ema);
+    fb_set_num(FB_PATH_COIL_RX, coil_rx ? 1 : 0);
+    fb_set_str(FB_PATH_CHG_STATE, chg_state);
   } else {
     Serial.println("Skip send: Wi-Fi or Firebase not ready");
   }
-
-  // Debug Print
-  Serial.printf("V=%.2fV I=%.0fmA SoC=%.0f%% Dist=%ldcm Alert=%d\n", v_pack, I_mA, soc, dist, alert);
 }
-
