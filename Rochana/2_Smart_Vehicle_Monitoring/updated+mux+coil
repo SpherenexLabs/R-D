@@ -267,4 +267,3 @@ void loop() {
   Serial.printf("V=%.2fV I=%.0fmA SoC=%.0f%% Dist=%ldcm Alert=%d\n", v_pack, I_mA, soc, dist, alert);
 }
 
-
