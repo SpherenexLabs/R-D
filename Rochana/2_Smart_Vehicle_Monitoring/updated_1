@@ -60,7 +60,6 @@ const float R1_TOP_OHMS = 32200.0f;
 const float R2_BOT_OHMS = 7500.0f;
 
 // ---- DMM calibration ----
-// You measured ~7.7 V while raw math gave ~8.45 V → gain ≈ 7.70/8.45 = 0.912
 const float CAL_V_GAIN   = 0.912f;   // tweak ±1–2% if needed
 const float CAL_V_OFFSET = 0.000f;   // volts offset (usually 0)
 
@@ -90,18 +89,14 @@ const float I_MAX_mA       = 2000.0f;
 const float I_DEADBAND_mA  = 25.0f;
 
 // ===== SoC Curve =====
-// If you want textbook OCV SoC, set USE_CUSTOM_SOC=false.
-// You asked ~7.6–7.7 V (~3.8–3.85 V/cell) to show in the 90s → custom curve below.
 const bool  USE_CUSTOM_SOC = true;
 struct OcvPoint { float v_cell, soc; };
 
-// Custom: make 3.70→90%, 3.80→94%, 3.90→97%, 4.10→99%, 4.20→100
 const OcvPoint OCV_TABLE_CUSTOM[] = {
   {3.50f,  60}, {3.60f,  85}, {3.70f,  90}, {3.80f, 94},
   {3.90f,  97}, {4.00f,  98.5f}, {4.10f, 99.0f}, {4.20f, 100}
 };
 
-// Standard Li-ion-ish OCV (more conservative; ~3.8 V/cell ≈ 50–60%)
 const OcvPoint OCV_TABLE_STD[] = {
   {3.50f, 0}, {3.60f, 5}, {3.65f, 10}, {3.70f, 20},
   {3.75f, 30}, {3.80f, 40}, {3.85f, 50}, {3.90f, 60},
