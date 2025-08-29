@@ -1,0 +1,244 @@
+//motion and sound sensor logs well = https://www.youtube.com/watch?v=-4DKgnBQpYk&list=LL&index=1
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <math.h>
+
+// ---------- Wi-Fi ----------
+#define WIFI_SSID       "spherenex1"
+#define WIFI_PASSWORD   "Spherenex@789"
+
+// ---------- Firebase ----------
+#define USE_FIREBASE        1
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+#define FB_ROOT                 "/1_KS5169_Rocket_Detection"
+#define FB_MOVEMENT_DETECTED    FB_ROOT "/Movement_Detected"
+#define FB_SOUND_DETECTED       FB_ROOT "/Sound_Detected"
+#define FB_ROCKET_DETECTION     FB_ROOT "/Rocket_Detection"
+
+// ---------- Pins ----------
+#define MIC_PIN         A0
+#define RADAR_PIN       D5   // RCWL-0516 OUT
+
+// If your RCWL output floats or polarity is inverted, tweak:
+#define RADAR_USE_PULLUP        0   // 1 => INPUT_PULLUP
+#define RADAR_ACTIVE_HIGH       1   // 0 => active LOW module
+#define RADAR_STABLE_SAMPLES    5
+#define RADAR_SAMPLE_SPACING_MS 2
+
+// ---------- OLED (I2C: SDA=D2, SCL=D1) ----------
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- Sampling ----------
+#define FS_HZ           9600.0
+#define N_SAMPLES       128                 // 75 Hz/bin time step
+static const unsigned sampPeriod_us = (unsigned)round(1000000.0 / FS_HZ);
+
+// ---------- Goertzel targets (Hz) ----------
+static const int NUM_TONES = 5;
+static const float TONES_HZ[NUM_TONES] = {1200.0, 1350.0, 1500.0, 1650.0, 1800.0};
+
+// ---------- Detection thresholds ----------
+#define ENERGY_MULT_THRESHOLD   6.0    // band energy must be ≥ baseline * this
+#define MIN_RMS_COUNTS          12.0   // require some loudness (ADC counts)
+#define CONSEC_ON_FRAMES        2
+#define CONSEC_OFF_FRAMES       2
+#define SOUND_HOLD_MS           3000   // keep true after detection
+#define RADAR_RECENT_MS         1500   // rocket can trigger if radar was HIGH in this window
+
+// ---------- State ----------
+static unsigned long soundHoldStart = 0;
+static unsigned long radarLastHighMs = 0;
+
+static int consecOn = 0, consecOff = 0;
+static double baselineEnergy = 1.0;   // start >0 to avoid div0
+static double baselineRMS    = 1.0;
+static const double BASE_ALPHA = 0.02; // EMA update when not triggered
+
+// ---------- Firebase objects ----------
+#if USE_FIREBASE
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig fbCfg;
+int  lastMotion = -1;
+int  lastSound  = -1;
+int  lastRocket = -1;
+#endif
+
+// ---------- Helpers ----------
+inline void oledShow(int motion, int sound, int rocket) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);   display.println("Rocket Monitor");
+  display.setCursor(0, 12);  display.print("RADAR: ");   display.println(motion ? "1" : "0");
+  display.setCursor(0, 24);  display.print("SOUND: ");   display.println(sound  ? "1" : "0");
+  display.setCursor(0, 36);  display.print("Rocket_Detection: "); display.println(rocket ? "1" : "0");
+  display.setCursor(0, 50);  display.print("SSID: "); display.println(WiFi.SSID());
+  display.display();
+}
+
+static bool readRadarStable() {
+  int ones=0, zeros=0;
+  for (int i=0;i<RADAR_STABLE_SAMPLES;i++) {
+    int r = digitalRead(RADAR_PIN);
+    if (r) ones++; else zeros++;
+    delay(RADAR_SAMPLE_SPACING_MS);
+  }
+  bool rawHigh = (ones > zeros);
+  return RADAR_ACTIVE_HIGH ? rawHigh : !rawHigh;
+}
+
+// Compute Goertzel power for one tone
+static double goertzelPower(const int16_t *x, int N, double Fs, double Fk) {
+  // coefficients
+  double k = 0.5 + (N * Fk / Fs);
+  double w = (2.0 * M_PI * k) / N;
+  double coeff = 2.0 * cos(w);
+  double s0, s1 = 0.0, s2 = 0.0;
+  for (int i=0;i<N;i++) {
+    s0 = x[i] + coeff * s1 - s2;
+    s2 = s1; s1 = s0;
+  }
+  return s1*s1 + s2*s2 - coeff*s1*s2; // power
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  Wire.begin(D2, D1);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 not found"); while (1) { delay(1); }
+  }
+  display.clearDisplay(); display.display();
+
+#if RADAR_USE_PULLUP
+  pinMode(RADAR_PIN, INPUT_PULLUP);
+#else
+  pinMode(RADAR_PIN, INPUT);
+#endif
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print("."); }
+  Serial.printf("\nWiFi OK  SSID=%s  IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+#if USE_FIREBASE
+  fbCfg.api_key      = API_KEY;
+  fbCfg.database_url = DATABASE_URL;
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&fbCfg, &auth);
+  Firebase.RTDB.setString(&fbdo, FB_MOVEMENT_DETECTED, "0");
+  Firebase.RTDB.setString(&fbdo, FB_SOUND_DETECTED,    "0");
+  Firebase.RTDB.setString(&fbdo, FB_ROCKET_DETECTION,  "0");
+#endif
+
+  // Start with sound OFF (avoid initial hold)
+  soundHoldStart = millis() - SOUND_HOLD_MS - 1;
+
+  oledShow(0,0,0);
+  Serial.println("Ready. Playing a rocket clip near the mic should raise SOUND, then ROCKET when RADAR is recent.");
+}
+
+void loop() {
+  // --------- Acquire N_SAMPLES at fixed Fs ---------
+  static int16_t buf[N_SAMPLES];
+  // Gather raw and compute DC mean for AC removal
+  long sum = 0;
+  for (int i=0;i<N_SAMPLES;i++) {
+    unsigned long t0 = micros();
+    int adc = analogRead(MIC_PIN);        // 0..1023
+    sum += adc;
+    buf[i] = (int16_t)adc;                // store raw for now
+    while ((micros() - t0) < sampPeriod_us) {}
+  }
+  double dc = (double)sum / N_SAMPLES;
+
+  // Build AC buffer and compute RMS (counts)
+  double rmsSum = 0;
+  for (int i=0;i<N_SAMPLES;i++) {
+    double ac = (double)buf[i] - dc;
+    rmsSum += ac*ac;
+    buf[i] = (int16_t)ac;  // reuse buffer as AC samples
+  }
+  double rms = sqrt(rmsSum / N_SAMPLES);
+
+  // --------- Goertzel band energy across 5 tones ---------
+  double energy = 0.0;
+  for (int j=0;j<NUM_TONES;j++) {
+    energy += goertzelPower(buf, N_SAMPLES, FS_HZ, TONES_HZ[j]);
+  }
+
+  // --------- Adaptive baseline (update only when not obviously loud) ---------
+  // Initialize baseline quickly for first second
+  static bool warmed = false;
+  static unsigned long t0 = millis();
+  if (!warmed && millis() - t0 > 1000) warmed = true;
+
+  if (warmed) {
+    // update EMA only when below trigger to avoid chasing the rocket
+    if (energy < baselineEnergy * ENERGY_MULT_THRESHOLD) {
+      baselineEnergy = (1.0 - BASE_ALPHA)*baselineEnergy + BASE_ALPHA*energy;
+      baselineRMS    = (1.0 - BASE_ALPHA)*baselineRMS    + BASE_ALPHA*rms;
+    }
+  } else {
+    baselineEnergy = (baselineEnergy*0.7) + (energy*0.3);
+    baselineRMS    = (baselineRMS*0.7) + (rms*0.3);
+  }
+
+  // --------- Sound decision (persistence + hold) ---------
+  bool gateEnergy = (energy >= baselineEnergy * ENERGY_MULT_THRESHOLD);
+  bool gateRMS    = (rms    >= max(MIN_RMS_COUNTS, 0.5*baselineRMS));
+  bool soundHit   = gateEnergy && gateRMS;
+
+  consecOn  = soundHit ? (consecOn + 1) : 0;
+  consecOff = soundHit ? 0              : (consecOff + 1);
+  bool soundNow = (consecOn >= CONSEC_ON_FRAMES);
+  if (soundNow) soundHoldStart = millis();
+
+  bool sound = (millis() - soundHoldStart <= SOUND_HOLD_MS);
+  if (!soundHit && consecOff >= CONSEC_OFF_FRAMES && (millis() - soundHoldStart) > 250) {
+    sound = false;  // early release if clearly quiet
+  }
+
+  // --------- RADAR gating (recent HIGH counts) ---------
+  bool radarNow = readRadarStable();
+  if (radarNow) radarLastHighMs = millis();
+  bool radarRecent = (millis() - radarLastHighMs <= RADAR_RECENT_MS);
+
+  // --------- Fusion ---------
+  bool rocket = (sound && radarRecent);
+
+  // --------- OLED + Serial ---------
+  oledShow(radarRecent ? 1 : 0, sound ? 1 : 0, rocket ? 1 : 0);
+
+  Serial.printf("radarNow=%d radarRecent=%d sound=%d rocket=%d\n",
+                radarNow, radarRecent, sound, rocket);
+
+
+  // --------- Firebase mirrors (only on change) ---------
+#if USE_FIREBASE
+  int m = radarRecent ? 1 : 0;
+  int s = sound ? 1 : 0;
+  int r = rocket ? 1 : 0;
+  if (m != lastMotion) { Firebase.RTDB.setString(&fbdo, FB_MOVEMENT_DETECTED, m ? "1":"0"); lastMotion = m; }
+  if (s != lastSound ) { Firebase.RTDB.setString(&fbdo, FB_SOUND_DETECTED,    s ? "1":"0"); lastSound  = s; }
+  if (r != lastRocket) { Firebase.RTDB.setString(&fbdo, FB_ROCKET_DETECTION,  r ? "1":"0"); lastRocket = r; }
+#endif
+}
