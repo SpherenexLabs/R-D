@@ -44,7 +44,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define MUX_CH_BATTERY   0
 #define MUX_CH_COIL      1
 
-// ===== Ultrasonic (alert only; not printed) =====
+// ===== Ultrasonic (alert only) =====
 #define TRIG_PIN D4
 #define ECHO_PIN D3
 #define SOUND_SPEED 0.034f
