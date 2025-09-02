@@ -1,0 +1,45 @@
+Yes 👍 — every time you open a **fresh terminal** on your Raspberry Pi, you need to activate the Python virtual environment (`mpu6050env`) before running your scripts. Otherwise, you’ll see errors like *“No module named board”* or *“No module named adafruit\_mpu6050”*.
+
+---
+
+## Step-by-step (starting fresh)
+
+1. **Open terminal**
+   (you’re at `admin@raspberrypi:~ $`)
+
+2. **Go to your project folder**
+
+   ```bash
+   cd ~/Desktop/Smart
+   ```
+
+3. **Activate your environment**
+
+   ```bash
+   source ~/mpu6050env/bin/activate
+   ```
+
+   Your prompt will change to:
+
+   ```
+   (mpu6050env) admin@raspberrypi:~/Desktop/Smart $
+   ```
+
+4. **Run your script**
+
+   ```bash
+   python3 pi_knee_ultra.py
+   ```
+
+   (or `python3 MPU6050_US.py` / `python3 pi_mpu6050_knee.py` depending on the file you’re testing).
+
+---
+
+## Why?
+
+* The **virtual environment** (`mpu6050env`) holds the special libraries (Adafruit Blinka, MPU6050 driver, etc.).
+* If you don’t activate it, Python uses the **system default**, which doesn’t have those packages installed.
+
+---
+
+👉 Do you want me to also show you how to make it so your environment **auto-activates** when you enter `~/Desktop/Smart` (so you don’t have to type `source ~/mpu6050env/bin/activate` every time)?
