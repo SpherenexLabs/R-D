@@ -1,3 +1,38 @@
+//Wiring Description
+//🛠 Connections (ESP8266 → Components):
+//✅ L298N Motor Driver
+
+//IN1 → D1 (ESP8266)
+
+//IN2 → D2
+
+//ENA → D3 (PWM pin, controls speed)
+
+//12V → External Battery (+)
+
+//GND → Common Ground (ESP8266 + Motor Power Supply)
+
+//OUT1, OUT2 → DC Motor terminals
+
+//✅ Ultrasonic Sensor (HC-SR04)
+
+//VCC → 5V
+
+//GND → GND
+
+//Trig → D5
+
+//Echo → D6
+
+//✅ ESP8266 Power
+
+//3.3V → ESP8266
+
+//GND → Common with L298N & Ultrasonic
+
+
+
+
 #include <ESP8266WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
