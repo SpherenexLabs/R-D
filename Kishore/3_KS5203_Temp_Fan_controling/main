@@ -1,0 +1,279 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <Servo.h>
+
+// ===== WiFi credentials =====
+#define WIFI_SSID "temp"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase credentials =====
+#define API_KEY "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+// ===== Email/Password Authentication =====
+#define USER_EMAIL "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===== Paths =====
+#define FB_BASE_PATH "/2_KS5203_Temp_control_fan"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ----------------- OLED Setup -----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ----------------- DHT11 Setup -----------------
+#define DHTPIN D5        // GPIO14
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ----------------- PIR Sensor -----------------
+#define PIR_PIN D6       // GPIO12
+
+// ----------------- Servo -----------------
+// Use D7 (GPIO13), not D3 (strap pin)
+#define SERVO_PIN D7
+Servo myServo;
+
+// ----------------- Timers -----------------
+const unsigned long SENSOR_UPDATE_MS   = 2000;  // DHT11 cadence
+const unsigned long FIREBASE_UPDATE_MS = 2000;  // push cadence
+const unsigned long CTRL_POLL_MS       = 800;   // poll Mode/Angle
+unsigned long lastSensorMs   = 0;
+unsigned long lastFirebaseMs = 0;
+unsigned long lastCtrlMs     = 0;
+
+// ----------------- State -----------------
+bool  wifiConnected = false;
+float lastGoodTemp  = NAN;
+float lastGoodHum   = NAN;
+int   lastPir       = 0;
+int   servoAngle    = 0;
+
+// Control from Firebase
+char  controlMode   = 'A';  // 'A' automatic (default), 'M' manual
+int   manualAngle   = 0;    // desired angle when Mode == 'M'
+
+// ------ Helpers ------
+void drawOLED(float t, float h, int pir, int angle, char mode) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Mode: ");
+  display.println(mode == 'M' ? "MANUAL" : "AUTO");
+
+  display.setCursor(0, 16);
+  display.print("Temp: ");
+  if (isnan(t)) display.print("--"); else display.print(String(t, 1));
+  display.println(" C");
+
+  display.setCursor(0, 28);
+  display.print("Hum : ");
+  if (isnan(h)) display.print("--"); else display.print(String(h, 1));
+  display.println(" %");
+
+  display.setCursor(0, 40);
+  display.print("Motion: ");
+  display.println(pir == HIGH ? "Detected" : "No Motion");
+
+  display.setCursor(0, 52);
+  display.print("Servo: ");
+  display.print(angle);
+  display.println(" deg");
+
+  display.display();
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    Serial.print(".");
+    delay(300);
+    yield();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    wifiConnected = true;
+  } else {
+    Serial.println("\nWiFi connect timeout");
+    wifiConnected = false;
+  }
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  config.max_token_generation_retry = 5;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+int computeServoAngleFromTemp(float t) {
+  if (isnan(t)) return servoAngle; // keep last if invalid
+  if (t < 10)  return 0;
+  if (t <= 30) return 90;
+  return 180;
+}
+
+bool pushToFirebase(float t, float h, int pir, int angle) {
+  if (!wifiConnected || !Firebase.ready()) return false;
+
+  FirebaseJson json;
+  if (!isnan(t)) json.set("Temperature", t);
+  if (!isnan(h)) json.set("Humidity", h);
+  json.set("Motion", pir);
+  json.set("ServoAngle", angle);
+
+  bool ok = Firebase.RTDB.updateNode(&fbdo, FB_BASE_PATH, &json);
+  if (!ok) {
+    Serial.print("Firebase write failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+  return ok;
+}
+
+void pollControlFromFirebase() {
+  if (!wifiConnected || !Firebase.ready()) return;
+
+  // ---- Mode ('A' / 'M') ----
+  if (Firebase.RTDB.getString(&fbdo, String(FB_BASE_PATH) + "/Mode")) {
+    String m = fbdo.stringData();
+    m.trim();
+    if (m.length() > 0) {
+      char c = toupper(m[0]);
+      if (c == 'A' || c == 'M') controlMode = c;
+    }
+  } else {
+    // Not fatal; just log once in a while
+    // Serial.printf("Mode read fail: %s\n", fbdo.errorReason().c_str());
+  }
+
+  // ---- Angle (may be stored as string "90" or number) ----
+  // Prefer getString to tolerate string-typed values
+  if (Firebase.RTDB.getString(&fbdo, String(FB_BASE_PATH) + "/Angle")) {
+    String s = fbdo.stringData();
+    s.trim();
+    int a = s.toInt();               // toInt gracefully handles numeric strings
+    if (a < 0) a = 0;
+    if (a > 180) a = 180;
+    manualAngle = a;
+  } else {
+    // Serial.printf("Angle read fail: %s\n", fbdo.errorReason().c_str());
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(PIR_PIN, INPUT);
+  dht.begin();
+
+  myServo.attach(SERVO_PIN);
+  myServo.write(0);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;)
+      yield();
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("System Starting...");
+  display.display();
+
+  connectWiFi();
+  initFirebase();
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("System Ready");
+  display.display();
+  Serial.println("System Ready...");
+}
+
+void loop() {
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  const unsigned long now = millis();
+
+  // ----- Control polling (Mode & Angle) -----
+  if (now - lastCtrlMs >= CTRL_POLL_MS) {
+    lastCtrlMs = now;
+    pollControlFromFirebase();
+  }
+
+  // ----- Sensor read -----
+  if (now - lastSensorMs >= SENSOR_UPDATE_MS) {
+    lastSensorMs = now;
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    int pirState = digitalRead(PIR_PIN);
+
+    if (!isnan(t)) lastGoodTemp = t;
+    if (!isnan(h)) lastGoodHum  = h;
+    lastPir = pirState;
+
+    // Decide desired angle by mode
+    int desiredAngle = servoAngle;
+    if (controlMode == 'M') {
+      desiredAngle = manualAngle;                 // manual override
+    } else {
+      desiredAngle = computeServoAngleFromTemp(lastGoodTemp); // automatic
+    }
+    desiredAngle = constrain(desiredAngle, 0, 180);
+
+    if (desiredAngle != servoAngle) {
+      servoAngle = desiredAngle;
+      myServo.write(servoAngle);
+    }
+
+    drawOLED(lastGoodTemp, lastGoodHum, lastPir, servoAngle, controlMode);
+
+    // Debug
+    Serial.print("Mode: ");
+    Serial.print(controlMode);
+    Serial.print(" | Temp: ");
+    if (isnan(lastGoodTemp)) Serial.print("--"); else Serial.print(lastGoodTemp, 1);
+    Serial.print(" *C | Hum: ");
+    if (isnan(lastGoodHum)) Serial.print("--"); else Serial.print(lastGoodHum, 1);
+    Serial.print(" % | Motion: ");
+    Serial.print(lastPir == HIGH ? "Detected" : "No Motion");
+    Serial.print(" | Servo Angle: ");
+    Serial.println(servoAngle);
+  }
+
+  // ----- Firebase push -----
+  if (now - lastFirebaseMs >= FIREBASE_UPDATE_MS) {
+    lastFirebaseMs = now;
+    pushToFirebase(lastGoodTemp, lastGoodHum, lastPir, servoAngle);
+  }
+
+  yield();
+}
