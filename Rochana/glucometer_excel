@@ -1,0 +1,293 @@
+==
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <MAX30105.h>
+#include "spo2_algorithm.h"
+
+// -------- Wi-Fi --------
+#define WIFI_SSID   "spherenex1"
+#define WIFI_PASS   "Spherenex@789"
+
+// -------- Google Apps Script (Web App) --------
+static const char* GAS_WEBAPP_URL =
+  "https://script.google.com/macros/s/AKfycbxFIu2ynDkfkx-iB4A3mmLgyxZSDHE0xoZVl10hN3iYCM5_5Hy4OURw_-zrvbwK1eKr/exec";
+
+// -------- OLED --------
+#define OLED_ADDR 0x3C
+#define OLED_SDA  D2
+#define OLED_SCL  D1
+#define OLED_RST  -1
+#define OLED_W    128
+#define OLED_H    64
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+
+// -------- MAX30102 --------
+MAX30105 mx;
+bool mx_ok = false;
+
+#define BUF_LEN 100
+uint32_t irBuf[BUF_LEN], redBuf[BUF_LEN];
+int32_t spo2_alg = 0, heart_alg = 0;
+int8_t  spo2_valid = 0, hr_valid = 0;
+
+uint32_t ir_dc = 0;
+bool     finger_ok = false;
+
+// -------- Filters & gates --------
+inline bool validf(float x){ return !isnan(x) && x > 0; }
+inline float ema(float prev, float s, float a){ return validf(prev) ? (a*s + (1-a)*prev) : s; }
+
+const int    HR_MIN_FLOOR   = 60;   // keep HR above 60 when finger present
+const int    SPO2_MIN_FLOOR = 90;   // keep SpO2 above 90% when finger present
+const float  A_HR    = 0.25f;       // EMA α for HR
+const float  A_SPO2  = 0.20f;       // EMA α for SpO2
+const float  A_BP    = 0.15f;       // EMA α for BP
+const float  A_GLU   = 0.20f;       // EMA α for Glucose
+
+// small median-of-5 helper
+template<typename T>
+T median5(T a, T b, T c, T d, T e){
+  T v[5] = {a,b,c,d,e};
+  for(int i=0;i<4;i++) for(int j=i+1;j<5;j++) if(v[j]<v[i]) {T t=v[i]; v[i]=v[j]; v[j]=t;}
+  return v[2];
+}
+int hr_hist[5] = {0}, spo2_hist[5] = {0}; uint8_t hist_idx=0; bool hist_primed=false;
+
+// EMA’d signals (hold when finger not present)
+float hr_ema = NAN, spo2_ema = NAN;
+float sys_ema = NAN, dia_ema = NAN, glu_ema = NAN;
+
+// “last good” ints for logging/display (after floors & clamps)
+int last_hr = 0, last_spo2 = 0, last_sys = 0, last_dia = 0, last_glu = 0;
+
+// -------- Timing --------
+uint32_t t_disp = 0, t_algo = 0, t_sheet = 0;
+const uint32_t DISP_MS = 200;
+const uint32_t ALGO_MS = 1000;
+const uint32_t SHT_MS  = 2000;  // log every 2 s
+
+// -------- Mock BP estimator --------
+static void estimate_bp(int hr, int spo2, int &sys, int &dia){
+  float s = 118.0f, d = 76.0f;
+  if(hr > 0){
+    if(hr > 100) s += 6, d += 3;
+    else if(hr < 55) s -= 5, d -= 3;
+  }
+  if(spo2 > 0){
+    if(spo2 < 93) s += 6, d += 3;
+    else if(spo2 > 98) s -= 3;
+  }
+  if(s < 90)  s = 90;  if(d < 50) d = 50;
+  if(s > 150) s = 150; if(d > 100) d = 100;
+  sys = (int)(s + 0.5f);
+  dia = (int)(d + 0.5f);
+}
+
+// -------- Glucose heuristic (bounded, stable) --------
+static int estimate_glucose(int hr, int spo2, int sys, uint32_t* irB){
+  float g = 95.0f;  // center a bit higher for stability
+  if (hr > 100)       g += 8;
+  else if (hr < 55)   g -= 4;
+  if (spo2 < 94)      g += 6;
+  if (sys > 130)      g += 6;
+  // perfusion factor (weakly)
+  uint32_t max_ir=0, min_ir=0xFFFFFFFF;
+  for(int i=0;i<BUF_LEN;i++){ if(irB[i]>max_ir) max_ir=irB[i]; if(irB[i]<min_ir) min_ir=irB[i]; }
+  float ir_factor = constrain((float)(max_ir - min_ir)/1500.0f, 0.0f, 2.0f);
+  g += ir_factor * 3.0f;
+  // keep within a narrow window for “stable reading”
+  if (g < 80)  g = 80;
+  if (g > 160) g = 160;
+  return (int)(g + 0.5f);
+}
+
+// -------- Send to Google Sheets --------
+bool sendToSheet(int hr, int spo2, int sys, int dia, int glucose, bool finger){
+  if(WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure secure; secure.setInsecure();
+  HTTPClient https;
+  if(!https.begin(secure, GAS_WEBAPP_URL)) return false;
+
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  String body = "hr=" + String(hr) + "&spo2=" + String(spo2) +
+                "&sys=" + String(sys) + "&dia=" + String(dia) +
+                "&glucose=" + String(glucose) + "&finger_ok=" + String(finger ? 1 : 0);
+
+  int code = https.POST(body);
+  String resp = https.getString();
+  https.end();
+
+  Serial.printf("[GAS] %d -> %s\n", code, resp.c_str());
+  return (code == 200);
+}
+
+// -------- Setup --------
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+
+  // I2C + OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  if(!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){
+    Serial.println("OLED not found.");
+  } else {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0,0); oled.print("BOOT"); oled.display();
+  }
+
+  // MAX30102
+  mx_ok = mx.begin(Wire, 400000);
+  if(!mx_ok) mx_ok = mx.begin(Wire, 100000);
+  if(mx_ok){
+    mx.setup(60, 4, 2, 100, 411, 4096);
+    mx.setPulseAmplitudeIR(0x7F);
+    mx.setPulseAmplitudeRed(0x2F);
+
+    // prime buffers + DC
+    int filled=0; uint32_t t0=millis();
+    while(filled<BUF_LEN && millis()-t0<1500){
+      mx.check();
+      while(mx.available() && filled<BUF_LEN){
+        redBuf[filled] = mx.getFIFORed();
+        irBuf [filled] = mx.getFIFOIR();
+        mx.nextSample();
+        filled++;
+      }
+      delay(2);
+    }
+    uint64_t sum=0; for(int i=0;i<filled;i++) sum += irBuf[i];
+    ir_dc = (filled>0)? (uint32_t)(sum/filled) : 0;
+  } else {
+    Serial.println("MAX30102 not found.");
+  }
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for(int i=0;i<40 && WiFi.status()!=WL_CONNECTED; i++) delay(250);
+
+  if(oled.width()){
+    oled.clearDisplay();
+    oled.setCursor(0,0);
+    oled.print("WiFi: "); oled.print(WiFi.status()==WL_CONNECTED ? "OK" : "FAIL");
+    oled.display();
+  }
+}
+
+// -------- Loop --------
+void loop(){
+  const uint32_t now = millis();
+
+  // --- Read FIFO ---
+  static int bufPos=0;
+  if(mx_ok){
+    mx.check();
+    int pulls=0;
+    while(mx.available()){
+      redBuf[bufPos] = mx.getFIFORed();
+      irBuf [bufPos] = mx.getFIFOIR();
+      ir_dc = (ir_dc==0)? irBuf[bufPos] : (uint32_t)(0.98f*ir_dc + 0.02f*irBuf[bufPos]);
+      bufPos = (bufPos+1) % BUF_LEN;
+      mx.nextSample();
+      pulls++; if(pulls>25) break;
+    }
+
+    // finger gate
+    uint32_t margin = max<uint32_t>(400, ir_dc/12);
+    finger_ok = (irBuf[(bufPos+BUF_LEN-1)%BUF_LEN] > ir_dc + margin);
+
+    // --- Run algorithm periodically ---
+    if(now - t_algo > ALGO_MS){
+      uint32_t irTmp[BUF_LEN], redTmp[BUF_LEN];
+      for(int i=0;i<BUF_LEN;i++){ int idx=(bufPos+i)%BUF_LEN; irTmp[i]=irBuf[idx]; redTmp[i]=redBuf[idx]; }
+
+      maxim_heart_rate_and_oxygen_saturation(irTmp, BUF_LEN, redTmp,
+                                             &spo2_alg, &spo2_valid, &heart_alg, &hr_valid);
+
+      if(finger_ok && hr_valid){
+        hr_ema = ema(hr_ema, (float)heart_alg, A_HR);
+        // push to history for median
+        hr_hist[hist_idx] = (int)(hr_ema + 0.5f);
+      }
+      if(finger_ok && spo2_valid){
+        spo2_ema = ema(spo2_ema, (float)spo2_alg, A_SPO2);
+        spo2_hist[hist_idx] = (int)(spo2_ema + 0.5f);
+      }
+
+      if(finger_ok && (hr_valid || spo2_valid)){
+        hist_idx = (hist_idx+1) % 5;
+        if(hist_idx==0) hist_primed = true;
+
+        // median-of-5 (or partial median before primed)
+        int hr_med   = hr_hist[0];
+        int spo2_med = spo2_hist[0];
+        if(hist_primed){
+          hr_med   = median5(hr_hist[0],hr_hist[1],hr_hist[2],hr_hist[3],hr_hist[4]);
+          spo2_med = median5(spo2_hist[0],spo2_hist[1],spo2_hist[2],spo2_hist[3],spo2_hist[4]);
+        }
+
+        // floors & clamps when finger present
+        int hr_out   = constrain(max(HR_MIN_FLOOR,   hr_med),   40, 180);
+        int spo2_out = constrain(max(SPO2_MIN_FLOOR, spo2_med), 70, 100);
+
+        // BP (EMA stable)
+        int sys, dia; estimate_bp(hr_out, spo2_out, sys, dia);
+        sys_ema = ema(sys_ema, (float)sys, A_BP);
+        dia_ema = ema(dia_ema, (float)dia, A_BP);
+
+        // Glucose (EMA stable)
+        int g_est  = estimate_glucose(hr_out, spo2_out, (int)(sys_ema+0.5f), irBuf);
+        glu_ema = ema(glu_ema, (float)g_est, A_GLU);
+
+        // commit “last good”
+        last_hr   = hr_out;
+        last_spo2 = spo2_out;
+        last_sys  = constrain((int)(sys_ema + 0.5f), 90, 150);
+        last_dia  = constrain((int)(dia_ema + 0.5f), 50, 100);
+        last_glu  = constrain((int)(glu_ema + 0.5f), 80, 160);
+      }
+
+      t_algo = now;
+    }
+  }
+
+  // --- OLED ---
+  if(oled.width() && (now - t_disp > DISP_MS)){
+    oled.clearDisplay();
+    oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+
+    if(!finger_ok){
+      oled.setCursor(0,0);  oled.print("Finger: NA");
+      oled.setCursor(0,12); oled.print("HR: --   SpO2: --");
+      oled.setCursor(0,24); oled.print("BP: --/--");
+      oled.setCursor(0,36); oled.print("Glucose: --");
+    }else{
+      oled.setCursor(0,0);  oled.print("Finger: OK");
+      oled.setCursor(0,12); oled.print("HR: ");   oled.print(last_hr);   oled.print(" bpm");
+      oled.setCursor(0,24); oled.print("SpO2: "); oled.print(last_spo2); oled.print("%");
+      oled.setCursor(0,36); oled.print("BP: ");   oled.print(last_sys);  oled.print("/"); oled.print(last_dia);
+      oled.setCursor(0,48); oled.print("Glucose: "); oled.print(last_glu); oled.print(" mg/dL");
+    }
+    oled.display();
+    t_disp = now;
+  }
+
+  // --- Google Sheets upload ---
+  if(now - t_sheet >= SHT_MS){
+    t_sheet = now;
+    if(finger_ok){
+      sendToSheet(last_hr, last_spo2, last_sys, last_dia, last_glu, true);
+    }else{
+      // log zeros + finger_ok=0 so your sheet clearly marks NA frames
+      sendToSheet(0, 0, 0, 0, 0, false);
+    }
+  }
+}
