@@ -1,41 +1,17 @@
 /*****************************************************
  * ESP8266 (NodeMCU) — Serial + OLED Vitals + Firebase
- * Log to Firebase ONLY when a value CHANGES.
+ * Splash -> WiFi SSID "Connecting..." -> Sensor pages
+ * Reads alert text from /KS5160_Lung_Heart/2_Notification/1_Alert
+ * and displays it on the last OLED line (Alert: ...).
  *
- * Pins:
- *   D5 : Sound (digital)         D6 : CO₂ (digital)
- *   D7 : DHT11 (Temp/Hum)        D8 : Alcohol (digital)
- *   D2 : I2C SDA -> MAX30105 + SSD1306
- *   D1 : I2C SCL -> MAX30105 + SSD1306
- *
- * OLED: SSD1306 128x64 @ 0x3C
- *
- * Firebase paths (string values):
- *   /KS5160_Lung_Heart/1_Sensor_Data/
- *     1_co2, 2_alcohol, 3_temp, 4_hum,
- *     5_bp/1_diastolic, 5_bp/2_systolic,
- *     6_hr, 7_spo2, 8_sound
- *
- * 8_sound codes: 0=none, 1=cough, 2=TB, 3=asthma
- *
- * Sound rules:
- *   - Cough: exactly 2 highs in one burst (PENDING; confirm after window)
- *   - TB:    >=5 highs in one burst (immediate)
- *   - Asthma: no sound ≥10 s (immediate)
- *   - While cough pending, if TB occurs -> log TB (2) instead of cough.
- *
- * Vitals:
- *   - 10s calibration when finger detected, then values are FROZEN until finger removed.
- *   - HR clamped to 70..120 bpm.
- *
- * Firebase writes:
- *   - Temp/Hum/CO2/Alcohol/BP/HR/SpO2 written ONLY if changed from last sent value.
- *   - 8_sound written ONLY on event (1/2/3) and de-duplicated (min gap).
+ * Sound thresholds are EASY TO TUNE:
+ *   COUGH_BURST_COUNT : exactly this many highs -> cough
+ *   TB_BURST_MIN      : >= this many highs      -> TB
  *****************************************************/
 
 #include <ESP8266WiFi.h>
-#include <FirebaseESP8266.h>    // by Mobizt
-#include <addons/TokenHelper.h> // optional
+#include <FirebaseESP8266.h>
+#include <addons/TokenHelper.h>
 #include <addons/RTDBHelper.h>
 
 #include <DHT.h>
@@ -60,12 +36,17 @@ FirebaseAuth auth;
 FirebaseConfig config;
 bool firebaseReady = false;
 
-// ---- Firebase path root ----
-const char* FB_ROOT = "/KS5160_Lung_Heart/1_Sensor_Data";
+// ---- Firebase paths ----
+const char* FB_ROOT       = "/KS5160_Lung_Heart/1_Sensor_Data";
+const char* FB_ALERT_PATH = "/KS5160_Lung_Heart/2_Notification/1_Alert";
 
-// ---- Update tick for checking changes (no forced writes) ----
-const unsigned long FB_CHECK_MS = 200;  // check ~5 Hz
-unsigned long lastFbCheckMs = 0;
+// ---- Update ticks ----
+const unsigned long FB_CHECK_MS   = 200;   // push-if-changed check
+unsigned long lastFbCheckMs       = 0;
+
+const unsigned long ALERT_POLL_MS = 2000;  // read alert text interval
+unsigned long lastAlertPollMs     = 0;
+String alertText = "";
 
 // -------- Pins --------
 #define SOUND_SENSOR    D5
@@ -94,28 +75,29 @@ const unsigned long ASTHMATIC_MS = 10000;
 const unsigned long BURST_GAP_MS = 1200;
 const unsigned long DEBOUNCE_MS  = 80;
 
+// ==== EASY-TO-TUNE SOUND THRESHOLDS ====
+const int COUGH_BURST_COUNT = 1;  // exactly this many highs -> cough
+const int TB_BURST_MIN      = 6;  // >= this many highs -> TB  (change here)
+
 // ---- Sound codes for Firebase 8_sound ----
 #define SOUND_NONE    0
 #define SOUND_COUGH   1
 #define SOUND_TB      2
 #define SOUND_ASTHMA  3
 
-// Latest sound event (nonzero only when an event occurs)
 unsigned long lastSoundEventMs = 0;
 int  lastSoundEventCode = SOUND_NONE;
 
-// De-duplicate sound writes (allow same code again after this much time)
 const unsigned long SOUND_EVENT_MIN_GAP_MS = 2500;
 unsigned long lastSoundWriteMs = 0;
-int  lastSentSoundCode = 0;  // last code actually written to Firebase
+int  lastSentSoundCode = 0;
 
-// Pending cough confirmation
 bool pendingCough = false;
 unsigned long pendingCoughMs = 0;
-const unsigned long COUGH_CONFIRM_MS = 4000; // wait up to 4s for TB after cough candidate
+const unsigned long COUGH_CONFIRM_MS = 6000;
 
 // -------- MAX30105 --------
-#define FINGER_IR_THRESHOLD 20000UL  // tune 12k..30k per sensor/placement
+#define FINGER_IR_THRESHOLD 20000UL
 MAX30105 particleSensor;
 bool max30105_ok = false;
 
@@ -123,20 +105,20 @@ bool max30105_ok = false;
 #define HR_MIN 70
 #define HR_MAX 120
 
-// ----- Live vitals (computed when finger present) -----
+// ----- Live vitals -----
 int heartRate_live = 0;   // bpm
 int spo2_live      = 0;   // %
 int systolic_live  = 0;   // mmHg (sim)
 int diastolic_live = 0;   // mmHg (sim)
 
-// ----- Frozen (latched) vitals shown on Serial & OLED -----
+// ----- Latched (frozen) vitals -----
 int heartRate_latched = 0;
 int spo2_latched      = 0;
 int systolic_latched  = 0;
 int diastolic_latched = 0;
 bool haveLatched = false;
 
-// ---- Simple HR detector state ----
+// ---- HR detection state ----
 uint32_t lastIr = 0;
 bool hrPeak = false;
 unsigned long lastBeatMs = 0;
@@ -147,20 +129,19 @@ unsigned long lastBPms = 0;
 int targetSys = 120, targetDia = 80;
 int curSys    = 120, curDia    = 80;
 
-// ---------- 10s Calibration/freeze state machine ----------
+// ---------- Calibration / freeze ----------
 enum VitalsState { NO_FINGER, CALIBRATING, FROZEN };
 VitalsState vitalsState = NO_FINGER;
 
 const unsigned long CAL_WINDOW_MS = 10000;
 unsigned long calStartMs = 0;
 
-// running averages during calibration
 uint32_t sumHR = 0, cntHR = 0;
 uint32_t sumSp = 0, cntSp = 0;
 uint32_t sumSy = 0, cntSy = 0;
 uint32_t sumDi = 0, cntDi = 0;
 
-// ========== Last-sent cache for change-only Firebase writes ==========
+// ========== Change-only cache for Firebase ==========
 int last_sent_co2      = -1;
 int last_sent_alcohol  = -1;
 int last_sent_temp     = -1000;
@@ -178,19 +159,14 @@ void printVitalsLine();
 void updateOLED(float temperature, float humidity);
 void classifyAndResetBurst();
 
-void connectWiFi();
 void initFirebase();
-void pushIfChanged(
-  int co2Flag, int alcoholFlag, int soundCode,
-  int tempC_int, int hum_int,
-  int sys, int dia, int hr, int spo2
-);
+void pushIfChanged(int co2Flag,int alcoholFlag,int soundCode,int tempC_int,int hum_int,int sys,int dia,int hr,int spo2);
+void readAlertFromFirebase();
 
-// Helpers for sound events
-void registerTB(unsigned long now);
-void registerAsthma(unsigned long now);
-void registerCoughCandidate(unsigned long now);
-void processPendingCough(); // confirm or timeout
+// ---------- OLED helpers ----------
+void oledSplash();
+void oledWiFiConnecting(const char* ssid, int dots);
+void oledWiFiConnected(IPAddress ip);
 
 // ================== Setup ==================
 void setup() {
@@ -203,34 +179,47 @@ void setup() {
 
   Wire.begin(D2, D1); // I2C
 
-  // OLED
+  // OLED init & splash
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
     Serial.println("SSD1306 init failed!");
   } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Vitals Monitor");
-    display.println("Init sensors...");
-    display.display();
+    oledSplash();
   }
 
   // MAX30105
   if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    // brightness=60, avg=4, mode=2(Red+IR), sps=400, pw=411us, range=4096
     particleSensor.setup(60, 4, 2, 400, 411, 4096);
     particleSensor.setPulseAmplitudeRed(60);
     particleSensor.setPulseAmplitudeIR(60);
     particleSensor.setPulseAmplitudeGreen(0);
     max30105_ok = true;
-    Serial.println("MAX30105 initialized. Place finger for Calibration (10s).");
+    Serial.println("MAX30105 OK. Place finger for 10s calibration.");
   } else {
     max30105_ok = false;
     Serial.println("MAX30105 not found — vitals will show NA.");
   }
 
-  connectWiFi();
+  // Wi-Fi connect with OLED “SSID + Connecting…”
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int tries = 0, dots = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 80) { // ~20 s
+    oledWiFiConnecting(WIFI_SSID, dots);
+    dots = (dots + 1) % 4;
+    delay(250);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK, IP: "); Serial.println(WiFi.localIP());
+    oledWiFiConnected(WiFi.localIP());
+    delay(1200);
+  } else {
+    Serial.println("WiFi FAILED");
+  }
+
   initFirebase();
 
   Serial.println("🌡️ ESP8266 Environmental + Sound + Vitals Monitor Ready");
@@ -242,32 +231,39 @@ void loop() {
 
   // ---------- SOUND ----------
   int s = digitalRead(SOUND_SENSOR);
-  if (s == HIGH) {                               // If your module is active-LOW, change to (s == LOW)
+  if (s == HIGH) {
     if (now - burstLastEventMs > DEBOUNCE_MS) {
       if (!inBurst) { inBurst = true; soundCount = 0; }
       soundCount++;
       burstLastEventMs = now;
       lastSoundMs = now;
 
-      // TB: immediate classification at >=5 highs
-      if (soundCount >= 5) {
-        registerTB(now);
+      // TB immediate if >= TB_BURST_MIN highs
+      if (soundCount >= TB_BURST_MIN) {
+        Serial.print("🔴 Detected: TB (>= "); Serial.print(TB_BURST_MIN); Serial.println(" highs)");
+        lastSoundEventMs   = now;
+        lastSoundEventCode = SOUND_TB;
+        if (pendingCough) { pendingCough = false; Serial.println("↪️ TB overrides pending cough"); }
         soundCount = 0; inBurst = false;
       }
     }
   }
-  // End of burst -> classify
   if (inBurst && (now - burstLastEventMs > BURST_GAP_MS)) classifyAndResetBurst();
-
-  // Asthma: no sound >= 10 s
   if (lastSoundMs != 0 && (now - lastSoundMs >= ASTHMATIC_MS)) {
-    registerAsthma(now);
-    classifyAndResetBurst(); // end any partial burst
-    lastSoundMs = now;       // throttle asthma message
+    Serial.println("⚠️ Possible Asthmatic (no sound ≥ 10s)");
+    lastSoundEventMs   = now;
+    lastSoundEventCode = SOUND_ASTHMA;
+    if (pendingCough) { pendingCough = false; Serial.println("↪️ Asthma cancels pending cough"); }
+    classifyAndResetBurst();
+    lastSoundMs = now;
   }
-
-  // Handle cough confirmation timeout
-  processPendingCough();
+  // Cough confirmation timeout
+  if (pendingCough && (millis() - pendingCoughMs >= COUGH_CONFIRM_MS)) {
+    lastSoundEventMs   = millis();
+    lastSoundEventCode = SOUND_COUGH;
+    pendingCough = false;
+    Serial.println("🟠 Cough confirmed (no TB within window)");
+  }
 
   // ---------- CO₂ ----------
   int co2Flag = (digitalRead(CO2_SENSOR) == LOW) ? 1 : 0;
@@ -288,34 +284,35 @@ void loop() {
     Serial.println(" %");
   }
 
-  // ---------- MAX30105 live vitals ----------
+  // ---------- Vitals ----------
   readMAX30105Vitals();
-
-  // ---------- Calibration/freeze state machine ----------
   bool fingerPresent = max30105_ok && (particleSensor.getIR() >= FINGER_IR_THRESHOLD);
   updateCalibrationState(fingerPresent);
-
-  // ---------- Serial summary (frozen values) ----------
   printVitalsLine();
 
-  // ---------- OLED (frozen values; status banner) ----------
+  // ---------- Firebase: read alert text ----------
+  if (firebaseReady && (millis() - lastAlertPollMs >= ALERT_POLL_MS)) {
+    lastAlertPollMs = millis();
+    if (Firebase.getString(fbdo, FB_ALERT_PATH)) {
+      String v = fbdo.stringData(); v.trim();
+      if (v.length() == 0) v = "-";
+      if (v != alertText) { alertText = v; Serial.print("Firebase Alert: "); Serial.println(alertText); }
+    }
+  }
+
+  // ---------- OLED ----------
   updateOLED(temperature, humidity);
 
-  // ---------- Firebase push (ONLY IF CHANGED) ----------
+  // ---------- Firebase push (change-only) ----------
   if (firebaseReady && (millis() - lastFbCheckMs >= FB_CHECK_MS)) {
     lastFbCheckMs = millis();
 
-    // Only nonzero sound events are candidates to write.
-    // We also de-duplicate same events using SOUND_EVENT_MIN_GAP_MS.
     int soundEventToWrite = SOUND_NONE;
     if (lastSoundEventCode != SOUND_NONE) {
       bool allowSameAgain = (millis() - lastSoundWriteMs >= SOUND_EVENT_MIN_GAP_MS);
-      if (lastSoundEventCode != lastSentSoundCode || allowSameAgain) {
-        soundEventToWrite = lastSoundEventCode; // write this event
-      }
+      if (lastSoundEventCode != lastSentSoundCode || allowSameAgain) soundEventToWrite = lastSoundEventCode;
     }
 
-    // ints (like your DB)
     int temp_i = isnan(temperature) ? 0 : (int)(temperature + 0.5f);
     int hum_i  = isnan(humidity)    ? 0 : (int)(humidity + 0.5f);
 
@@ -326,150 +323,95 @@ void loop() {
 
     pushIfChanged(co2Flag, alcoholFlag, soundEventToWrite, temp_i, hum_i, sys, dia, hr, sp);
 
-    // after pushing an event, clear local desire to write duplicates too quickly
     if (soundEventToWrite != SOUND_NONE) {
       lastSoundWriteMs   = millis();
       lastSentSoundCode  = soundEventToWrite;
-      // keep lastSoundEventCode as is; next event can overwrite it
     }
   }
 
   Serial.println("---------------------------");
-  delay(10); // keep loop responsive for pulse detection
+  delay(10);
 }
 
-// ================== Sound helpers ==================
+// ================== Sound classification at burst end ==================
 void classifyAndResetBurst() {
   if (!inBurst) return;
 
-  if (soundCount >= 5) {
-    // TB at burst end too (>=5 highs)
-    registerTB(millis());
+  if (soundCount >= TB_BURST_MIN) {
+    Serial.print("🔴 Detected: TB (>= "); Serial.print(TB_BURST_MIN); Serial.println(" highs)");
+    lastSoundEventMs   = millis();
+    lastSoundEventCode = SOUND_TB;
+    if (pendingCough) { pendingCough = false; Serial.println("↪️ TB overrides pending cough"); }
   }
-  else if (soundCount == 2) {
-    // Start cough confirmation window; don't log yet
-    registerCoughCandidate(millis());
+  else if (soundCount == COUGH_BURST_COUNT) {
+    // start cough confirmation window
+    if (!pendingCough) {
+      pendingCough   = true;
+      pendingCoughMs = millis();
+      Serial.print("🟠 Cough candidate ("); Serial.print(COUGH_BURST_COUNT); Serial.println(" highs) — checking for TB...");
+    }
   }
-  else if (soundCount == 1 || (soundCount >= 3 && soundCount <= 4)) {
+  else if (soundCount == 1 || (soundCount > COUGH_BURST_COUNT && soundCount < TB_BURST_MIN)) {
     Serial.print("ℹ️ Sound burst: "); Serial.print(soundCount); Serial.println(" highs (no label)");
-    // generic burst -> no logging
   }
 
   soundCount = 0;
   inBurst = false;
 }
 
-void registerTB(unsigned long now) {
-  Serial.println("🔴 Detected: TB (>=5 highs)");
-  lastSoundEventMs   = now;
-  lastSoundEventCode = SOUND_TB;
-  // override any pending cough
-  if (pendingCough) {
-    pendingCough = false;
-    Serial.println("↪️ TB overrides pending cough");
-  }
-}
-
-void registerAsthma(unsigned long now) {
-  Serial.println("⚠️ Possible Asthmatic (no sound ≥ 10s)");
-  lastSoundEventMs   = now;
-  lastSoundEventCode = SOUND_ASTHMA;
-  // cancel pending cough
-  if (pendingCough) {
-    pendingCough = false;
-    Serial.println("↪️ Asthma cancels pending cough");
-  }
-}
-
-void registerCoughCandidate(unsigned long now) {
-  // if a TB event just happened, ignore cough candidate
-  if ((millis() - lastSoundEventMs) <= 200 && lastSoundEventCode == SOUND_TB) return;
-
-  pendingCough   = true;
-  pendingCoughMs = now;
-  Serial.println("🟠 Cough candidate (2 highs) — checking for TB (4s window)...");
-}
-
-void processPendingCough() {
-  if (!pendingCough) return;
-  if (millis() - pendingCoughMs >= COUGH_CONFIRM_MS) {
-    // Confirm cough now
-    lastSoundEventMs   = millis();
-    lastSoundEventCode = SOUND_COUGH;
-    pendingCough = false;
-    Serial.println("🟠 Cough confirmed (no TB within window)");
-  }
-}
-
 // ================== MAX30105 live vitals ==================
 void readMAX30105Vitals() {
   if (!max30105_ok) { heartRate_live = 0; spo2_live = 0; systolic_live = 0; diastolic_live = 0; return; }
 
-  // Pull latest sample
   particleSensor.check();
   long ir  = particleSensor.getIR();
   long red = particleSensor.getRed();
 
-  // Finger gate
   if (ir < FINGER_IR_THRESHOLD) {
     heartRate_live = 0; spo2_live = 0; systolic_live = 0; diastolic_live = 0;
-    lastIr = ir;
-    return;
+    lastIr = ir; return;
   }
 
-  // ---- HR (naive peak detector) ----
   if (ir > lastIr && !hrPeak) {
     hrPeak = true;
   } else if (ir < lastIr && hrPeak) {
     unsigned long now = millis();
-    unsigned long ibi = now - lastBeatMs;          // inter-beat interval
-    if (ibi > 300 && ibi < 2000) {                 // 30..200 bpm plausible
+    unsigned long ibi = now - lastBeatMs;
+    if (ibi > 300 && ibi < 2000) {
       int newHR = (int)(60000UL / ibi);
       if (newHR >= 50 && newHR <= 180) tempHR = newHR;
     }
-    lastBeatMs = now;
-    hrPeak = false;
+    lastBeatMs = now; hrPeak = false;
   }
   lastIr = ir;
 
   heartRate_live = tempHR;
+  if (heartRate_live < HR_MIN || heartRate_live > HR_MAX) heartRate_live = 0;
 
-  // Reject out-of-range live HR from averaging
-  if (heartRate_live < HR_MIN || heartRate_live > HR_MAX) {
-    heartRate_live = 0;
-  }
-
-  // ---- SpO2 (simple Red/IR ratio; demo only) ----
   float ratio = (float)red / (float)ir;
-  int est = 110 - int(25.0f * ratio);              // ~90..99 typical
+  int est = 110 - int(25.0f * ratio);
   est = constrain(est, 90, 99);
   spo2_live = est;
 
-  // ---- BP(sim) ----
   simulateBP();
 }
-
 void simulateBP() {
   unsigned long now = millis();
-
   if (now - lastBPms > 10000) {
-    int hrAdj = 0;
-    if (heartRate_live > 0) hrAdj = constrain(heartRate_live - 70, -20, 40);
+    int hrAdj = 0; if (heartRate_live > 0) hrAdj = constrain(heartRate_live - 70, -20, 40);
     targetSys = 118 + (hrAdj / 8) + random(-4, 5);
     targetDia = 78  + random(-3, 4);
     lastBPms  = now;
   }
-
   if (curSys < targetSys) curSys++;
   if (curSys > targetSys) curSys--;
   if (curDia < targetDia) curDia++;
   if (curDia > targetDia) curDia--;
-
   systolic_live  = curSys;
   diastolic_live = curDia;
 }
 
-// ========== 10s Calibration/Freeze logic ==========
+// ========== Calibration / freeze ==========
 void updateCalibrationState(bool fingerPresent) {
   unsigned long now = millis();
 
@@ -501,9 +443,7 @@ void updateCalibrationState(bool fingerPresent) {
         if (cntSy > 0 && cntDi > 0) {
           systolic_latched  = (int)((sumSy + cntSy/2) / cntSy);
           diastolic_latched = (int)((sumDi + cntDi/2) / cntDi);
-        } else {
-          systolic_latched = diastolic_latched = 0;
-        }
+        } else { systolic_latched = diastolic_latched = 0; }
         haveLatched = true;
         vitalsState = FROZEN;
         Serial.println("✅ Calibration complete — values latched.");
@@ -512,14 +452,14 @@ void updateCalibrationState(bool fingerPresent) {
 
     case FROZEN:
       if (!fingerPresent) {
-        vitalsState = NO_FINGER;  // keep showing frozen values
+        vitalsState = NO_FINGER;
         Serial.println("👆 Finger removed — holding last calibrated values.");
       }
       break;
   }
 }
 
-// ================== Serial line (frozen values) ==================
+// ================== Serial print (frozen values) ==================
 void printVitalsLine() {
   Serial.print("HR=");
   Serial.print(haveLatched && heartRate_latched > 0 ? String(heartRate_latched) : "NA");
@@ -528,45 +468,38 @@ void printVitalsLine() {
   Serial.print(" % | BP=");
   if (haveLatched && systolic_latched > 0 && diastolic_latched > 0) {
     Serial.print(systolic_latched); Serial.print("/"); Serial.print(diastolic_latched);
-  } else {
-    Serial.print("NA");
-  }
+  } else Serial.print("NA");
   Serial.print(" mmHg");
 
   if (vitalsState == CALIBRATING) {
     float secs = (millis() - calStartMs) / 1000.0f;
-    Serial.print("  |  Calibration: ");
-    Serial.print(secs, 1);
-    Serial.print("/");
-    Serial.print(CAL_WINDOW_MS / 1000);
-    Serial.print(" s");
+    Serial.print("  |  Calibration: "); Serial.print(secs,1); Serial.print("/10 s");
   } else if (vitalsState == FROZEN) {
     Serial.print("  |  Calibration Complete");
   }
-
   if (pendingCough) {
     int left = (int)((COUGH_CONFIRM_MS - (millis() - pendingCoughMs)) / 1000);
     if (left < 0) left = 0;
-    Serial.print("  |  Pending cough… waiting "); Serial.print(left); Serial.print("s");
+    Serial.print("  |  Pending cough… "); Serial.print(left); Serial.print("s");
   }
   Serial.println();
 }
 
-// ================== OLED rendering (compact 2-column layout) ==================
+// ================== OLED: sensor page ==================
 void updateOLED(float temperature, float humidity) {
   static unsigned long lastOLED = 0;
   if (millis() - lastOLED < 300) return;   // ~3 fps
   lastOLED = millis();
 
   const int LEFT_X  = 0;
-  const int RIGHT_X = 68;   // second column start
+  const int RIGHT_X = 68;
   int y = 0;
 
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // ---- Line 1: Status ----
+  // Status
   display.setCursor(LEFT_X, y);
   if (vitalsState == CALIBRATING) {
     int secs = (int)((millis() - calStartMs) / 1000);
@@ -578,19 +511,18 @@ void updateOLED(float temperature, float humidity) {
   }
   y += 12;
 
-  // ---- Line 2: HR | SpO2 ----
+  // HR | SpO2
   display.setCursor(LEFT_X, y);
   display.print("HR: ");
   if (haveLatched && heartRate_latched > 0) { display.print(heartRate_latched); display.print(" bpm"); }
   else display.print("NA");
-
   display.setCursor(RIGHT_X, y);
   display.print("SpO2: ");
   if (haveLatched && spo2_latched > 0) { display.print(spo2_latched); display.print(" %"); }
   else display.print("NA");
   y += 12;
 
-  // ---- Line 3: BP ----
+  // BP
   display.setCursor(LEFT_X, y);
   display.print("BP: ");
   if (haveLatched && systolic_latched > 0 && diastolic_latched > 0) {
@@ -598,117 +530,85 @@ void updateOLED(float temperature, float humidity) {
   } else display.print("NA");
   y += 12;
 
-  // ---- Line 4: Temp | Hum ----
+  // Temp | Hum
   display.setCursor(LEFT_X, y);
-  display.print("Temp: ");
+  display.print("T: ");
   if (!isnan(temperature)) { display.print(temperature, 1); display.print(" C"); }
   else display.print("NA");
-
   display.setCursor(RIGHT_X, y);
-  display.print("Hum: ");
+  display.print("H: ");
   if (!isnan(humidity)) { display.print(humidity, 1); display.print(" %"); }
   else display.print("NA");
+  y += 12;
+
+  // Alert line
+  display.setCursor(LEFT_X, y);
+  display.print("Alert: ");
+  if (alertText.length() > 14) display.print(alertText.substring(0, 14));
+  else display.print(alertText.length() ? alertText : "-");
 
   display.display();
 }
 
-// ================== Wi-Fi & Firebase ==================
-void connectWiFi() {
-  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) {
-    delay(250);
-    Serial.print(".");
-    tries++;
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK, IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi FAILED");
-  }
-}
-
+// ================== Firebase init & change-only writes ==================
 void initFirebase() {
   if (WiFi.status() != WL_CONNECTED) { firebaseReady = false; return; }
-
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
-  config.token_status_callback = tokenStatusCallback; // optional
-
+  config.token_status_callback = tokenStatusCallback;
   auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASSWORD;
-
   Firebase.reconnectWiFi(true);
   Firebase.begin(&config, &auth);
-
-  int waitMs = 0;
-  while (!Firebase.ready() && waitMs < 8000) { delay(200); waitMs += 200; }
-
+  int waitMs = 0; while (!Firebase.ready() && waitMs < 8000) { delay(200); waitMs += 200; }
   firebaseReady = Firebase.ready();
   Serial.println(firebaseReady ? "Firebase connected." : "Firebase NOT ready.");
 }
 
-// ========= Change-only Firebase writes =========
-void pushIfChanged(
-  int co2Flag, int alcoholFlag, int soundCode,
-  int tempC_int, int hum_int,
-  int sys, int dia, int hr, int spo2
-) {
+void pushIfChanged(int co2Flag,int alcoholFlag,int soundCode,int tempC_int,int hum_int,int sys,int dia,int hr,int spo2) {
   if (!firebaseReady) return;
+  if (co2Flag != last_sent_co2)   { Firebase.setString(fbdo, String(FB_ROOT) + "/1_co2", String(co2Flag)); last_sent_co2 = co2Flag; }
+  if (alcoholFlag != last_sent_alcohol) { Firebase.setString(fbdo, String(FB_ROOT) + "/2_alcohol", String(alcoholFlag)); last_sent_alcohol = alcoholFlag; }
+  if (tempC_int != last_sent_temp){ Firebase.setString(fbdo, String(FB_ROOT) + "/3_temp", String(tempC_int)); last_sent_temp = tempC_int; }
+  if (hum_int  != last_sent_hum)  { Firebase.setString(fbdo, String(FB_ROOT) + "/4_hum", String(hum_int));  last_sent_hum = hum_int;  }
+  if (dia != last_sent_dia)       { Firebase.setString(fbdo, String(FB_ROOT) + "/5_bp/1_diastolic", String(dia)); last_sent_dia = dia; }
+  if (sys != last_sent_sys)       { Firebase.setString(fbdo, String(FB_ROOT) + "/5_bp/2_systolic",  String(sys)); last_sent_sys = sys; }
+  if (hr  != last_sent_hr)        { Firebase.setString(fbdo, String(FB_ROOT) + "/6_hr",   String(hr));  last_sent_hr = hr; }
+  if (spo2!= last_sent_spo2)      { Firebase.setString(fbdo, String(FB_ROOT) + "/7_spo2", String(spo2)); last_sent_spo2 = spo2; }
+  if (soundCode != SOUND_NONE)    { Firebase.setString(fbdo, String(FB_ROOT) + "/8_sound", String(soundCode)); }
+}
 
-  // CO2
-  if (co2Flag != last_sent_co2) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/1_co2", String(co2Flag));
-    last_sent_co2 = co2Flag;
-  }
-
-  // Alcohol
-  if (alcoholFlag != last_sent_alcohol) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/2_alcohol", String(alcoholFlag));
-    last_sent_alcohol = alcoholFlag;
-  }
-
-  // Temperature
-  if (tempC_int != last_sent_temp) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/3_temp", String(tempC_int));
-    last_sent_temp = tempC_int;
-  }
-
-  // Humidity
-  if (hum_int != last_sent_hum) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/4_hum", String(hum_int));
-    last_sent_hum = hum_int;
-  }
-
-  // BP (Diastolic / Systolic)
-  if (dia != last_sent_dia) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/5_bp/1_diastolic", String(dia));
-    last_sent_dia = dia;
-  }
-  if (sys != last_sent_sys) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/5_bp/2_systolic", String(sys));
-    last_sent_sys = sys;
-  }
-
-  // HR
-  if (hr != last_sent_hr) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/6_hr", String(hr));
-    last_sent_hr = hr;
-  }
-
-  // SpO2
-  if (spo2 != last_sent_spo2) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/7_spo2", String(spo2));
-    last_sent_spo2 = spo2;
-  }
-
-  // 8_sound — only send on events; no "0" writes
-  if (soundCode != SOUND_NONE) {
-    Firebase.setString(fbdo, String(FB_ROOT) + "/8_sound", String(soundCode));
-    // lastSentSoundCode & lastSoundWriteMs updated by caller after success
-  }
+// ================== OLED helper screens ==================
+void oledSplash() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("Lungs & Heart");
+  display.println("Disease Analysis");
+  display.println();
+  display.println("Initializing...");
+  display.display();
+}
+void oledWiFiConnecting(const char* ssid, int dots) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("WiFi:");
+  display.print("SSID: "); display.println(ssid);
+  display.println();
+  display.print("Connecting");
+  for (int i = 0; i < dots; i++) display.print(".");
+  display.display();
+}
+void oledWiFiConnected(IPAddress ip) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("WiFi Connected!");
+  display.print("IP: ");
+  display.println(ip);
+  display.display();
 }
