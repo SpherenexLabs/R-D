@@ -1,0 +1,13 @@
+# pca9548a.py
+
+class PCA9548A:
+    def __init__(self, i2c, address=0x70):
+        self.i2c = i2c
+        self.addr = address
+        if self.addr not in self.i2c.scan():
+            raise OSError("PCA9548A not found on the I2C bus")
+
+    def channel(self, ch):
+        if not (0 <= ch <= 7):
+            raise ValueError("Invalid channel number (must be 0–7)")
+        self.i2c.writeto(self.addr, bytes([1 << ch]))
