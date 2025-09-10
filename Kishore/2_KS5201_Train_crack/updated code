@@ -1,0 +1,160 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===== WiFi credentials =====
+#define WIFI_SSID "train"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase credentials =====
+#define API_KEY "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+// ===== Email/Password Authentication (Firebase user, not Gmail!) =====
+#define USER_EMAIL "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Motor pins (L298N)
+const int motorPin1 = D1; 
+const int motorPin2 = D2; 
+const int ENA = D3;        // PWM pin
+
+// Ultrasonic pins
+const int trigPin = D5;
+const int echoPin = D6;
+
+// Microphone pin
+const int micPin = A0;                // Analog input
+const int soundThreshold = 50;        // Adjust based on your environment
+
+// Distance threshold
+const int stopDistance = 15;  
+
+// Motor speed (PWM: 0–1023 on ESP8266)
+int motorSpeed = 80;  // slow speed
+
+// WiFi tracker
+bool wifiConnected = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor setup
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  // Ultrasonic setup
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // ===== WiFi setup =====
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n✅ WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  wifiConnected = true;
+
+  // ===== Firebase setup =====
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("System Ready...");
+}
+
+// === Ultrasonic Distance Measurement ===
+long measureDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 20000); // 20 ms timeout
+  return duration * 0.034 / 2;
+}
+
+// === Motor Control ===
+void moveForward(int speed) {
+  digitalWrite(motorPin1, HIGH);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(ENA, speed);
+}
+
+void stopMotor() {
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(ENA, 0);
+}
+
+void loop() {
+  // === Distance Measurement ===
+  long distance = measureDistance();
+
+  // === Microphone Sound Detection ===
+  int micValue = analogRead(micPin);
+  int soundFlag = (micValue > soundThreshold) ? 1 : 0;
+
+  // === Control Logic ===
+  String motorCmd;
+  int obstacleFlag;
+
+  if (soundFlag == 1) {
+    // 👂 Loud sound detected — STOP
+    stopMotor();
+    motorCmd = "S";
+    obstacleFlag = 0;
+  } 
+  else if (distance <= stopDistance) {
+    // 🚧 Obstacle detected — STOP
+    stopMotor();
+    motorCmd = "S";
+    obstacleFlag = 1;
+  } 
+  else {
+    // ✅ Clear path — GO
+    moveForward(motorSpeed);
+    motorCmd = "F";
+    obstacleFlag = 0;
+  }
+
+  // === Serial Debug Output ===
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.print(" cm → MotorCmd: ");
+  Serial.print(motorCmd);
+  Serial.print(" | Obstacle: ");
+  Serial.print(obstacleFlag);
+  Serial.print(" | Mic: ");
+  Serial.print(micValue);
+  Serial.print(" | SoundFlag: ");
+  Serial.println(soundFlag);
+
+  // === Push to Firebase ===
+  if (wifiConnected && Firebase.ready()) {
+    Firebase.RTDB.setString(&fbdo, "/1_KS5210_Train/motor_cmd", motorCmd);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/obstacle", obstacleFlag);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/distance", distance);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/mic_value", micValue);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/sound_flag", soundFlag);
+  }
+
+  delay(800);  // adjust as needed
+}
