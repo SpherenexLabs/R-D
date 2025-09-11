@@ -1,0 +1,405 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MPU6050.h>
+#include <DHT.h>
+#include <MAX30105.h>
+#include "spo2_algorithm.h"
+#include <math.h>
+
+// ================== OLED ==================
+#define OLED_ADDR   0x3C
+#define OLED_SDA    D2
+#define OLED_SCL    D1
+#define OLED_RST    -1
+#define OLED_W      128
+#define OLED_H      64
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+
+// ================== DHT11 =================
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================== MAX3010x ==============
+MAX30105 mx;
+bool mx_ok = false;
+#define BUF_LEN 100
+static uint32_t irBuf[BUF_LEN], redBuf[BUF_LEN];
+static int bufPos = 0;
+int32_t spo2_alg = 0, heart_alg = 0;
+int8_t  spo2_valid = 0, hr_valid = 0;
+float   hr_ema = NAN, spo2_ema = NAN;
+float   last_hr = NAN, last_spo2 = NAN;
+bool    finger_ok = false;
+uint32_t latest_ir = 0;
+
+// Tunables for MAX finger detection & smoothing
+const uint32_t FINGER_DC_MIN = 22000;     // IR mean must exceed this
+const uint32_t FINGER_AC_MIN = 3500;      // IR peak-to-peak must exceed this
+const float    HR_EMA_A = 0.25f;
+const float    SPO2_EMA_A = 0.20f;
+
+// ================== MPU6050 ===============
+Adafruit_MPU6050 mpu;
+bool mpu_ok = false;
+
+// Fall detection parameters (simple & robust)
+const float G = 9.80665f;
+const float IMPACT_G      = 2.5f;    // impact threshold (g's)
+const float TILT_DEG      = 60.0f;   // post-impact tilt magnitude threshold
+const uint32_t IMPACT_WIN_MS = 700;  // window to confirm tilt after impact
+const uint32_t FALL_LATCH_MS = 5000; // show FALL:1 for this long after detection
+
+enum FallState { IDLE, IMPACT_SEEN };
+FallState fall_state = IDLE;
+uint32_t  impact_t0 = 0;
+bool      fall_latched = false;
+uint32_t  fall_latch_until = 0;
+
+// ================== Buttons ===============
+#define BTN_EMERGENCY   D5   // GPIO14 (safe)
+#define BTN_HEALTH      D6   // GPIO12 (safe)
+#define BTN_SAFE        D7   // GPIO13 (safe)
+#define BTN_FAMILY      D3   
+
+struct Debounce {
+  uint8_t pin;
+  uint32_t lastMs;
+  bool state;      // debounced logical state (true=pressed)
+  bool lastRaw;
+};
+Debounce db_emg{BTN_EMERGENCY, 0, false, true};
+Debounce db_hlp{BTN_HEALTH,    0, false, true};
+Debounce db_safe{BTN_SAFE,     0, false, true};
+Debounce db_fam{BTN_FAMILY,    0, false, true};
+
+const uint16_t DB_MS = 25; // debounce window
+
+// ================== Timers =================
+uint32_t t_disp = 0, t_algo = 0, t_log = 0;
+const uint32_t DISP_MS = 500;   // faster UI
+const uint32_t ALGO_MS = 1000;
+const uint32_t LOG_MS  = 1000;
+
+// ================== Helpers ===============
+inline bool validf(float x) { return !isnan(x) && x > 0; }
+inline float ema(float prev, float s, float a) { return validf(prev) ? (a*s + (1-a)*prev) : s; }
+
+static void compute_dc_ac(const uint32_t *x, int n, uint32_t &dc, uint32_t &pp)
+{
+  uint64_t sum = 0;
+  uint32_t xmin = UINT32_MAX, xmax = 0;
+  for (int i = 0; i < n; ++i) {
+    uint32_t v = x[i];
+    sum += v;
+    if (v < xmin) xmin = v;
+    if (v > xmax) xmax = v;
+  }
+  dc = (uint32_t)(sum / (uint64_t)n);
+  pp = (xmax > xmin) ? (xmax - xmin) : 0;
+}
+
+static void read_mpu(float &gmag, float &pitch_deg, float &roll_deg) {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+  float am = sqrtf(ax*ax + ay*ay + az*az);
+  gmag = am / G;
+  // tilt estimates
+  pitch_deg = atan2f(ax, sqrtf(ay*ay + az*az)) * 180.0f / PI;
+  roll_deg  = atan2f(ay, az) * 180.0f / PI;
+}
+
+static void deb_update(Debounce &d)
+{
+  // Pullups active; pressed -> raw LOW
+  bool raw = (digitalRead(d.pin) == LOW);
+  uint32_t now = millis();
+  if (raw != d.lastRaw) {
+    d.lastMs = now;
+    d.lastRaw = raw;
+  }
+  if ((now - d.lastMs) >= DB_MS) {
+    d.state = raw; // stable
+  }
+}
+
+static void estimate_bp(int hr, int spo2, int &sys, int &dia) {
+  // Heuristic demo only, not medical
+  float s = 118.0f, d = 76.0f;
+  if (hr > 0) {
+    if (hr > 100) { s += 6; d += 3; }
+    else if (hr < 55) { s -= 5; d -= 3; }
+  }
+  if (spo2 > 0) {
+    if (spo2 < 93) { s += 6; d += 3; }
+    else if (spo2 > 98) { s -= 3; }
+  }
+  s = constrain(s, 90.0f, 150.0f);
+  d = constrain(d, 55.0f, 100.0f);
+  sys = (int)(s + 0.5f);
+  dia = (int)(d + 0.5f);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+
+  // OLED
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+  oled.println("Wearable init...");
+  oled.display();
+
+  // DHT
+  dht.begin();
+
+  // MAX3010x
+  mx_ok = mx.begin(Wire, 400000);
+  if (!mx_ok) {
+    Serial.println("MAX3010x not found.");
+  } else {
+    mx.setup(60 /*brightness*/, 4 /*avg*/, 2 /*mode*/, 100 /*Hz*/, 411 /*us*/, 4096 /*range*/);
+    mx.setPulseAmplitudeIR(0x7F);
+    mx.setPulseAmplitudeRed(0x2F);
+    // Pre-fill buffers
+    int filled = 0;
+    uint32_t t0 = millis();
+    while (filled < BUF_LEN && (millis() - t0) < 1500) {
+      mx.check();
+      while (mx.available() && filled < BUF_LEN) {
+        redBuf[filled] = mx.getFIFORed();
+        irBuf[filled]  = mx.getFIFOIR();
+        latest_ir = irBuf[filled];
+        mx.nextSample();
+        filled++;
+      }
+      delay(2);
+      yield();
+    }
+  }
+
+  // MPU6050
+  mpu_ok = mpu.begin();
+  if (!mpu_ok) {
+    Serial.println("MPU6050 not found.");
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    delay(10);
+  }
+
+  // Buttons
+  pinMode(BTN_EMERGENCY, INPUT_PULLUP);
+  pinMode(BTN_HEALTH,    INPUT_PULLUP);
+  pinMode(BTN_SAFE,      INPUT_PULLUP);
+  pinMode(BTN_FAMILY,    INPUT_PULLUP);
+
+  // CSV header
+  Serial.println("t_ms,HR,SpO2,TempC,Hum,IR_mean,IR_pp,Finger,Fall,g,Pitch,Roll,HR_valid,SpO2_valid,EMG,HELP,SAFE,FAM");
+}
+
+void loop() {
+  const uint32_t now = millis();
+
+  // ===== Buttons (debounced) =====
+  deb_update(db_emg);
+  deb_update(db_hlp);
+  deb_update(db_safe);
+  deb_update(db_fam);
+
+  // ===== MAX3010x acquisition =====
+  if (mx_ok) {
+    mx.check();
+    while (mx.available()) {
+      redBuf[bufPos] = mx.getFIFORed();
+      irBuf[bufPos]  = mx.getFIFOIR();
+      latest_ir = irBuf[bufPos];
+      bufPos = (bufPos + 1) % BUF_LEN;
+      mx.nextSample();
+    }
+
+    if (now - t_algo >= ALGO_MS) {
+      // Copy ring buffer to time-order window
+      uint32_t irTmp[BUF_LEN], redTmp[BUF_LEN];
+      for (int i = 0; i < BUF_LEN; i++) {
+        int idx = (bufPos + i) % BUF_LEN;
+        irTmp[i]  = irBuf[idx];
+        redTmp[i] = redBuf[idx];
+      }
+
+      // Finger detection: require both DC and AC presence
+      uint32_t dc = 0, pp = 0;
+      compute_dc_ac(irTmp, BUF_LEN, dc, pp);
+      finger_ok = (dc >= FINGER_DC_MIN) && (pp >= FINGER_AC_MIN);
+
+      // Run HR/SpO2 only when a finger is likely present
+      maxim_heart_rate_and_oxygen_saturation(irTmp, BUF_LEN, redTmp,
+                                             &spo2_alg, &spo2_valid,
+                                             &heart_alg, &hr_valid);
+
+      if (finger_ok && hr_valid && heart_alg > 0) {
+        hr_ema   = ema(hr_ema, (float)heart_alg, HR_EMA_A);
+        last_hr  = hr_ema;
+      } else if (!finger_ok) {
+        last_hr = NAN; hr_ema = NAN;
+      }
+
+      if (finger_ok && spo2_valid && spo2_alg > 0) {
+        spo2_ema   = ema(spo2_ema, (float)spo2_alg, SPO2_EMA_A);
+        last_spo2  = spo2_ema;
+      } else if (!finger_ok) {
+        last_spo2 = NAN; spo2_ema = NAN;
+      }
+
+      t_algo = now;
+    }
+  }
+
+  // ===== DHT11 =====
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  // ===== MPU6050 & Fall detection =====
+  float gmag = NAN, pitch = NAN, roll = NAN;
+  if (mpu_ok) {
+    read_mpu(gmag, pitch, roll);
+
+    switch (fall_state) {
+      case IDLE:
+        if (gmag > IMPACT_G) {
+          fall_state = IMPACT_SEEN;
+          impact_t0 = now;
+        }
+        break;
+      case IMPACT_SEEN:
+        if (now - impact_t0 <= IMPACT_WIN_MS) {
+          if (fabsf(pitch) >= TILT_DEG || fabsf(roll) >= TILT_DEG) {
+            fall_latched = true;
+            fall_latch_until = now + FALL_LATCH_MS;
+            fall_state = IDLE;
+          }
+        } else {
+          fall_state = IDLE;
+        }
+        break;
+    }
+
+    if (fall_latched && now >= fall_latch_until) {
+      fall_latched = false;
+    }
+  }
+
+  // ===== Display =====
+  if (now - t_disp >= DISP_MS) {
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+
+    // Line 0: HR & SpO2 on same line
+    int hr_out = (validf(last_hr)   ? constrain((int)(last_hr + 0.5f), 40, 180) : 0);
+    int s2_out = (validf(last_spo2) ? constrain((int)(last_spo2 + 0.5f), 85, 100) : 0);
+    oled.setCursor(0, 0);
+    oled.print("HR:");
+    if (hr_out > 0) { oled.print(hr_out); oled.print(" "); }
+    else            { oled.print("-- "); }
+    oled.print("SpO2:");
+    if (s2_out > 0) { oled.print(s2_out); oled.print("%"); }
+    else            { oled.print("--"); }
+
+    // Line 10: Temp & Hum on same line
+    oled.setCursor(0, 10);
+    if (!isnan(temperature) && !isnan(humidity)) {
+      oled.print("T:");
+      oled.print(temperature, 1);
+      oled.print("C H:");
+      oled.print((int)humidity);
+      oled.print("%");
+    } else {
+      oled.print("DHT: NA");
+    }
+
+    // Line 20: BP (demo)
+    int bp_sys = 0, bp_dia = 0;
+    if (hr_out > 0 && s2_out > 0) estimate_bp(hr_out, s2_out, bp_sys, bp_dia);
+    oled.setCursor(0, 20);
+    if (bp_sys > 0) { oled.print("BP: "); oled.print(bp_sys); oled.print("/"); oled.print(bp_dia); }
+    else            { oled.print("BP: --/--"); }
+
+    // Line 30: Fall flag only (1 when detected, else 0)
+    oled.setCursor(0, 30);
+    oled.print("FALL: ");
+    oled.print(fall_latched ? 1 : 0);
+
+    // Line 40: Emergency & Help
+    oled.setCursor(0, 40);
+    oled.print("Emerg:");
+    oled.print(db_emg.state ? 1 : 0);
+    oled.print("  Help:");
+    oled.print(db_hlp.state ? 1 : 0);
+
+    // Line 50: Safe & Family
+    oled.setCursor(0, 50);
+    oled.print("Safe:");
+    oled.print(db_safe.state ? 1 : 0);
+    oled.print("  Family:");
+    oled.print(db_fam.state ? 1 : 0);
+
+    oled.display();
+    t_disp = now;
+  }
+  // ===== Logging =====
+  if (now - t_log >= LOG_MS) {
+    // For logging consistency, recompute IR stats on the most recent window
+    uint32_t dc=0, pp=0;
+    if (mx_ok) {
+      uint32_t irTmp[BUF_LEN];
+      for (int i = 0; i < BUF_LEN; i++) {
+        int idx = (bufPos + i) % BUF_LEN;
+        irTmp[i]  = irBuf[idx];
+      }
+      compute_dc_ac(irTmp, BUF_LEN, dc, pp);
+    }
+
+    int hr_out = (validf(last_hr)   ? constrain((int)(last_hr + 0.5f), 40, 180) : 0);
+    int s2_out = (validf(last_spo2) ? constrain((int)(last_spo2 + 0.5f), 85, 100) : 0);
+
+    Serial.print(now); Serial.print(",");
+    Serial.print(hr_out); Serial.print(",");
+    Serial.print(s2_out); Serial.print(",");
+    Serial.print(isnan(temperature) ? NAN : temperature); Serial.print(",");
+    Serial.print(isnan(humidity) ? NAN : humidity); Serial.print(",");
+    Serial.print(dc); Serial.print(",");
+    Serial.print(pp); Serial.print(",");
+    Serial.print(finger_ok ? 1 : 0); Serial.print(",");
+    Serial.print(fall_latched ? 1 : 0); Serial.print(",");
+    Serial.print(isnan(gmag) ? NAN : gmag); Serial.print(",");
+    Serial.print(isnan(pitch) ? NAN : pitch); Serial.print(",");
+    Serial.print(isnan(roll) ? NAN : roll); Serial.print(",");
+    Serial.print((int)hr_valid); Serial.print(",");
+    Serial.print((int)spo2_valid); Serial.print(",");
+    Serial.print(db_emg.state ? 1 : 0); Serial.print(",");
+    Serial.print(db_hlp.state ? 1 : 0); Serial.print(",");
+    Serial.print(db_safe.state ? 1 : 0); Serial.print(",");
+    Serial.println(db_fam.state ? 1 : 0);
+
+    t_log = now;
+  }
+
+  yield(); // keep WDT happy on ESP8266
+}
