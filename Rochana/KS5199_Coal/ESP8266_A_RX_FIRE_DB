@@ -1,0 +1,229 @@
+// ---------- File: esp8266_a_oled_fields_server.ino  (ESP8266_A)
+// Role: SoftAP + TCP server; receives newline-delimited JSON from ESP8266_B
+//       containing ONLY the OLED fields: ts, hr, spo2, temp, hum, bp_sys, bp_dia,
+//       fall, btn{emg,hlp,safe,fam}. Prints a tidy table on Serial (115200).
+
+#include <ESP8266WiFi.h>
+
+// ---- SoftAP config ----
+static const char* AP_SSID = "ESP_A_AP";
+static const char* AP_PASS = "12345678";                  // >= 8 chars
+IPAddress apIP(192,168,4,1), gw(192,168,4,1), mask(255,255,255,0);
+
+// ---- TCP server ----
+WiFiServer server(5000);
+
+// Table header control
+uint32_t lineCount = 0;
+const uint32_t HEADER_EVERY = 20;
+
+// ---------- Minimal JSON helpers (no external libs) ----------
+static int findKey(const String& s, const char* key) {
+  String pat = String("\"") + key + "\"";
+  return s.indexOf(pat);
+}
+
+// Extract token after "key": colon, optional spaces, then a primitive (number/null/true/false)
+// Returns false if key missing or value is 'null'.
+static bool extractTokenAfterKey(const String& s, const char* key, String& token) {
+  int k = findKey(s, key);
+  if (k < 0) return false;
+  int colon = s.indexOf(':', k);
+  if (colon < 0) return false;
+
+  int i = colon + 1;
+  while (i < (int)s.length() && isspace(s[i])) ++i;
+  if (i >= (int)s.length()) return false;
+
+  // Objects/arrays not handled here
+  if (s[i] == '{' || s[i] == '[') return false;
+
+  int j = i;
+  while (j < (int)s.length() && s[j] != ',' && s[j] != '}') ++j;
+  token = s.substring(i, j);
+  token.trim();
+
+  if (token.startsWith("null")) return false;
+  return token.length() > 0;
+}
+
+static bool jsonGetInt(const String& s, const char* key, int& out) {
+  String tok;
+  if (!extractTokenAfterKey(s, key, tok)) return false;
+  if (tok.equalsIgnoreCase("true"))  { out = 1; return true; }
+  if (tok.equalsIgnoreCase("false")) { out = 0; return true; }
+  out = (int)strtol(tok.c_str(), nullptr, 10);
+  return true;
+}
+
+static bool jsonGetUL(const String& s, const char* key, unsigned long& out) {
+  String tok;
+  if (!extractTokenAfterKey(s, key, tok)) return false;
+  out = (unsigned long)strtoul(tok.c_str(), nullptr, 10);
+  return true;
+}
+
+static bool jsonGetFloat(const String& s, const char* key, float& out) {
+  String tok;
+  if (!extractTokenAfterKey(s, key, tok)) return false;
+  out = strtof(tok.c_str(), nullptr);
+  return true;
+}
+
+// Extract the substring of the "btn" object and parse ints within it
+static bool extractBtnObject(const String& s, String& btnObj) {
+  int b = findKey(s, "btn");
+  if (b < 0) return false;
+  int brace = s.indexOf('{', b);
+  if (brace < 0) return false;
+  int end = s.indexOf('}', brace);
+  if (end < 0) return false;
+  btnObj = s.substring(brace, end + 1);
+  return true;
+}
+
+static bool jsonBtnGetInt(const String& s, const char* key, int& out) {
+  String btn;
+  if (!extractBtnObject(s, btn)) return false;
+  return jsonGetInt(btn, key, out);
+}
+
+// ---------- Printing ----------
+static void printHeader() {
+  Serial.println();
+  Serial.println(F("   ts(ms) | HR  SpO2 |  TempC   Hum% |   BP(sys/dia) | Fall | EMG HLP SAFE FAM"));
+  Serial.println(F("----------+---------+-------------+---------------+------+-------------------"));
+}
+
+static void printOneLine(unsigned long ts,
+                         int hr_present, int hr,
+                         int spo2_present, int spo2,
+                         int temp_present, float tempC,
+                         int hum_present,  float hum,
+                         int bp_present, int bp_sys, int bp_dia,
+                         int fall_present, int fall,
+                         int emg, int hlp, int safe, int fam) {
+  if ((lineCount % HEADER_EVERY) == 0) printHeader();
+
+  // ts
+  Serial.printf("%10lu |", ts);
+
+  // HR / SpO2
+  if (hr_present && hr > 0)       Serial.printf(" %3d", hr);   else Serial.print("  --");
+  if (spo2_present && spo2 > 0)   Serial.printf("   %3d |", spo2); else Serial.print("   -- |");
+
+  // Temp / Hum
+  if (temp_present) Serial.printf(" %6.2f", tempC); else Serial.print("   --  ");
+  if (hum_present)  Serial.printf("  %5.1f |", hum); else Serial.print("   --  |");
+
+  // BP
+  if (bp_present) Serial.printf("     %3d/%-3d |", bp_sys, bp_dia);
+  else            Serial.print("      --/--   |");
+
+  // Fall
+  if (fall_present) Serial.printf("  %d   |", fall);
+  else              Serial.print("  -   |");
+
+  // Buttons
+  Serial.printf("  %d   %d    %d    %d", emg, hlp, safe, fam);
+
+  Serial.println();
+  lineCount++;
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println(F("[ESP_A] Boot (SoftAP + TCP server; OLED fields parser)"));
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAPConfig(apIP, gw, mask);
+  if (!WiFi.softAP(AP_SSID, AP_PASS)) {
+    Serial.println(F("[ESP_A] ERROR: SoftAP start failed"));
+  } else {
+    Serial.print(F("[ESP_A] AP up: ")); Serial.print(AP_SSID);
+    Serial.print(F("  IP: ")); Serial.println(WiFi.softAPIP());
+  }
+
+  server.begin();
+  server.setNoDelay(true);
+  Serial.println(F("[ESP_A] TCP server listening on :5000"));
+  printHeader();
+}
+
+// ---------- Loop ----------
+void loop() {
+  WiFiClient client = server.available();
+  if (!client) { delay(1); return; }
+
+  Serial.print(F("[ESP_A] Client connected from "));
+  Serial.print(client.remoteIP()); Serial.print(F(":"));
+  Serial.println(client.remotePort());
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) { delay(1); continue; }
+
+    // Optional ACK
+    client.println(F("ACK"));
+
+    // If not JSON, just print raw
+    if (line[0] != '{') {
+      Serial.print(F("[RAW] ")); Serial.println(line);
+      continue;
+    }
+
+    // Defaults
+    unsigned long ts = 0;
+    int hr = 0, spo2 = 0, fall = 0;
+    float tempC = NAN, hum = NAN;
+    int bp_sys = 0, bp_dia = 0;
+    int emg = 0, hlp = 0, safe = 0, fam = 0;
+
+    // Presence flags (for pretty printing)
+    int has_ts=0, has_hr=0, has_spo2=0, has_temp=0, has_hum=0, has_bp=0, has_fall=0;
+
+    // Parse fields (tolerant to missing/null)
+    if (jsonGetUL(line, "ts", ts)) has_ts = 1;
+    if (jsonGetInt(line, "hr", hr)) has_hr = 1;
+    if (jsonGetInt(line, "spo2", spo2)) has_spo2 = 1;
+
+    if (jsonGetFloat(line, "temp", tempC)) has_temp = 1;
+    if (jsonGetFloat(line, "hum",  hum))   has_hum  = 1;
+
+    int tmp;
+    bool bp1 = jsonGetInt(line, "bp_sys", tmp);
+    if (bp1) { bp_sys = tmp; }
+    bool bp2 = jsonGetInt(line, "bp_dia", tmp);
+    if (bp2) { bp_dia = tmp; }
+    if (bp1 && bp2 && bp_sys > 0 && bp_dia > 0) has_bp = 1;
+
+    if (jsonGetInt(line, "fall", fall)) has_fall = 1;
+
+    // Buttons object
+    jsonBtnGetInt(line, "emg",  emg);
+    jsonBtnGetInt(line, "hlp",  hlp);
+    jsonBtnGetInt(line, "safe", safe);
+    jsonBtnGetInt(line, "fam",  fam);
+
+    // Print formatted row
+    printOneLine(has_ts ? ts : 0UL,
+                 has_hr, hr,
+                 has_spo2, spo2,
+                 has_temp, tempC,
+                 has_hum,  hum,
+                 has_bp, bp_sys, bp_dia,
+                 has_fall, fall,
+                 emg, hlp, safe, fam);
+
+    if (!client.available()) delay(1);  // yield to Wi-Fi
+  }
+
+  Serial.println(F("[ESP_A] Client disconnected"));
+  client.stop();
+}
