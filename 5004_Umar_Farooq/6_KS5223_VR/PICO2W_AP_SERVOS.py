@@ -1,10 +1,18 @@
-# main.py — Pico W AP "VR" + UDP receiver
-# Prints X,Z (deg) and corresponding virtual servo angles.
+# main.py — Pico W AP "VR" + UDP receiver + 2x PWM servos
+# Prints X,Z (deg) and drives two servos (ServoX, ServoZ).
 import network, socket, time
+from machine import Pin, PWM
 
 SSID = "VR"
 PASS = "123456789"
 UDP_PORT = 4210
+
+# ====== Servo config ======
+SERVO_X_PIN = 16   # GP16 -> Servo X signal
+SERVO_Z_PIN = 17   # GP17 -> Servo Z signal
+PWM_FREQ_HZ = 50   # 50 Hz standard
+MIN_US = 500       # pulse width at 0 degrees  (tune per servo)
+MAX_US = 2500      # pulse width at 180 degrees (tune per servo)
 
 # Print every packet or only when values change:
 PRINT_EVERY_PACKET = False
@@ -26,11 +34,19 @@ print("X_deg,Z_deg,ServoX_deg,ServoZ_deg")  # header
 last_x = None
 last_z = None
 
+# ---------- PWM/Servo setup ----------
+pwm_x = PWM(Pin(SERVO_X_PIN, Pin.OUT))
+pwm_z = PWM(Pin(SERVO_Z_PIN, Pin.OUT))
+pwm_x.freq(PWM_FREQ_HZ)
+pwm_z.freq(PWM_FREQ_HZ)
+
+PERIOD_US = int(1_000_000 // PWM_FREQ_HZ)  # 20_000 us for 50 Hz
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 def snap10(v):
-    # nearest 10°, clamped to a valid servo range
+    # nearest 10 degrees, clamped to a valid servo range
     sv = int(round(v / 10.0)) * 10
     return 0 if sv < 0 else 180 if sv > 180 else sv
 
@@ -41,6 +57,21 @@ def parse_xz(msg: str):
         k, v = part.split(":")
         kv[k.strip()] = int(v)
     return kv.get("X"), kv.get("Z")
+
+def angle_to_duty_u16(angle_deg: int) -> int:
+    """Map 0..180 degrees to duty_u16 for the configured PWM frequency."""
+    angle = clamp(angle_deg, 0, 180)
+    pulse_us = MIN_US + (MAX_US - MIN_US) * angle / 180.0
+    duty = int(pulse_us * 65535 / PERIOD_US)
+    # RP2040 clamps internally, but we keep it safe:
+    return clamp(duty, 0, 65535)
+
+def servo_write(pwm: PWM, angle_deg: int):
+    pwm.duty_u16(angle_to_duty_u16(angle_deg))
+
+# Center both servos at boot
+servo_write(pwm_x, 90)
+servo_write(pwm_z, 90)
 
 while True:
     try:
@@ -54,9 +85,13 @@ while True:
     x = clamp(x, -50, 50)   # Roll/X
     z = clamp(z, -30, 30)   # Yaw/Z
 
-    # Virtual servo mapping: 90 + 2*angle, snapped to 10°
+    # Virtual servo mapping: 90 + 2*angle, snapped to 10 degrees
     sx = snap10(90 + 2*x)
     sz = snap10(90 + 2*z)
+
+    # Drive the servos
+    servo_write(pwm_x, sx)
+    servo_write(pwm_z, sz)
 
     if PRINT_EVERY_PACKET or (x != last_x or z != last_z):
         print(f"{x},{z},{sx},{sz}")
