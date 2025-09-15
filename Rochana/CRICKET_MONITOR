@@ -12,22 +12,24 @@
 // ===== WiFi + HTTPS (Sheets) =====
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+
 #include <WiFiClientSecure.h>
 
 // -------- Wi-Fi --------
-#define WIFI_SSID       "spherenex1"
-#define WIFI_PASSWORD   "Spherenex@789"
+#define WIFI_SSID     "cricket"
+#define WIFI_PASSWORD "123456789"
 
-// -------- Apps Script Web App URL (Deploy → copy URL here) --------
-const char* SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwK26qIfPvrXKUdPMj9RP5J0y6ejquaceXWB-GwADrtLnaGabSm2L8rtmMJrEUs0z4Mgw/exec";
+// -------- Apps Script Web App URL --------
+const char* SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbwK26qIfPvrXKUdPMj9RP5J0y6ejquaceXWB-GwADrtLnaGabSm2L8rtmMJrEUs0z4Mgw/exec";
 
 // ================== OLED ==================
-#define OLED_ADDR   0x3C
-#define OLED_SDA    D2
-#define OLED_SCL    D1
-#define OLED_RST    -1
-#define OLED_W      128
-#define OLED_H      64
+#define OLED_ADDR 0x3C
+#define OLED_SDA  D2
+#define OLED_SCL  D1
+#define OLED_RST  -1
+#define OLED_W    128
+#define OLED_H    64
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
 
 // ================== DHT11 =================
@@ -46,11 +48,10 @@ int8_t  spo2_valid = 0, hr_valid = 0;
 float   hr_ema = NAN, spo2_ema = NAN;
 float   last_hr = NAN, last_spo2 = NAN;
 bool    finger_ok = false;
-uint32_t latest_ir = 0;
 
 const uint32_t FINGER_DC_MIN = 22000;
 const uint32_t FINGER_AC_MIN = 3500;
-const float    HR_EMA_A = 0.25f;
+const float    HR_EMA_A   = 0.25f;
 const float    SPO2_EMA_A = 0.20f;
 
 // ================== MPU6050 ===============
@@ -58,54 +59,47 @@ Adafruit_MPU6050 mpu;
 bool mpu_ok = false;
 
 const float G = 9.80665f;
-const float IMPACT_G      = 0.5f;
-const float TILT_DEG      = 60.0f;
-const uint32_t IMPACT_WIN_MS = 700;
-const uint32_t FALL_LATCH_MS = 5000;
 
+// --- Impact/Fall thresholds (tune here) ---
+const float    IMPACT_G_HI     = 1.7f;   // high-G spike (gmag > this)
+const float    FREEFALL_G_LO   = 0.45f;  // free-fall (gmag < this)
+const float    TILT_DEG        = 45.0f;  // was 60; easier to trigger real falls
+const uint32_t IMPACT_WIN_MS   = 1200;   // time to see tilt after impact
+const uint32_t IMPACT_HOLD_MS  = 300;    // keep impact flag on-screen briefly
+const uint32_t FALL_LATCH_MS   = 5000;   // hold "Fall" for 5 s
+
+// State
 enum FallState { IDLE, IMPACT_SEEN };
 FallState fall_state = IDLE;
-uint32_t  impact_t0 = 0;
+uint32_t  impact_t0 = 0;            // impact start for fall-check window
 bool      fall_latched = false;
 uint32_t  fall_latch_until = 0;
 
-// ================== Buttons (pull-up, press→LOW) ===============
-#define BTN_EMERGENCY   D5
-#define BTN_HEALTH      D6
-#define BTN_SAFE        D7
-#define BTN_FAMILY      D3
+// Raw impact (free-fall OR spike), for UI/logs:
+bool      impact_raw = false;
+uint32_t  impact_hold_until = 0;
 
+// ================== Buttons =================
+// D3 = CALIBRATE (pull-up, press→LOW)
+#define BTN_CAL D3
 struct Debounce { uint8_t pin; uint32_t lastMs; bool state; bool lastRaw; };
-Debounce db_emg{BTN_EMERGENCY, 0, false, true};
-Debounce db_hlp{BTN_HEALTH,    0, false, true};
-Debounce db_safe{BTN_SAFE,     0, false, true};
-Debounce db_fam{BTN_FAMILY,    0, false, true};
-
+Debounce db_cal{BTN_CAL, 0, false, true};
 const uint16_t DB_MS = 25;
 
 // ================== Timers =================
-uint32_t t_disp = 0, t_algo = 0, t_log = 0, t_sheet = 0;
-const uint32_t DISP_MS = 500;
-const uint32_t ALGO_MS = 1000;
-const uint32_t LOG_MS  = 1000;
-const uint32_t SHEET_MS = 1000;   // post to sheet every 1s
+uint32_t t_disp = 0, t_algo = 0, t_sheet = 0, t_dbg = 0;
+const uint32_t DISP_MS  = 500;
+const uint32_t ALGO_MS  = 1000;
+const uint32_t SHEET_MS = 1000;
 
 // ================== Helpers =================
 inline bool  validf(float x){ return !isnan(x) && x > 0; }
-inline float ema   (float p,float s,float a){ return validf(p)?(a*s+(1-a)*p):s; }
+inline float ema(float prev, float sample, float a){ return validf(prev) ? (a*sample + (1-a)*prev) : sample; }
 
 static void compute_dc_ac(const uint32_t *x, int n, uint32_t &dc, uint32_t &pp){
   uint64_t sum=0; uint32_t mn=UINT32_MAX, mxv=0;
   for(int i=0;i<n;i++){ uint32_t v=x[i]; sum+=v; if(v<mn) mn=v; if(v>mxv) mxv=v; }
   dc=(uint32_t)(sum/(uint64_t)n); pp=(mxv>mn)?(mxv-mn):0;
-}
-
-static void read_mpu(float &gmag, float &pitch_deg, float &roll_deg){
-  sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
-  float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
-  float am=sqrtf(ax*ax+ay*ay+az*az); gmag=am/G;
-  pitch_deg = atan2f(ax, sqrtf(ay*ay+az*az))*180.0f/PI;
-  roll_deg  = atan2f(ay, az)*180.0f/PI;
 }
 
 static void deb_update(Debounce &d){
@@ -114,12 +108,42 @@ static void deb_update(Debounce &d){
   if((now-d.lastMs)>=DB_MS){ d.state=raw; }
 }
 
-static void estimate_bp(int hr, int spo2, int &sys, int &dia){
-  float s=118.0f,d=76.0f;
-  if(hr>100){ s+=6; d+=3; } else if(hr>0 && hr<55){ s-=5; d-=3; }
-  if(spo2>0 && spo2<93){ s+=6; d+=3; } else if(spo2>98){ s-=3; }
-  s=constrain(s,90.0f,150.0f); d=constrain(d,55.0f,100.0f);
-  sys=(int)(s+0.5f); dia=(int)(d+0.5f);
+// ====== MPU angles + calibration offsets ======
+float pitch_off=0.0f, roll_off=0.0f;
+
+static void read_mpu(float &gmag, float &pitch_deg, float &roll_deg){
+  sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+  float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
+  float am=sqrtf(ax*ax+ay*ay+az*az); gmag=am/G;               // g units
+  float pitch = atan2f(ax, sqrtf(ay*ay+az*az))*180.0f/PI;
+  float roll  = atan2f(ay, az)*180.0f/PI;
+  pitch_deg = pitch - pitch_off;
+  roll_deg  = roll  - roll_off;
+}
+
+// Hold still and sample for ~1.5s to define new zero
+void calibrate_mpu(uint16_t ms=1500){
+  if(!mpu_ok) return;
+  oled.clearDisplay(); oled.setTextSize(1); oled.setCursor(0,0);
+  oled.println("CAL... hold still"); oled.display();
+
+  const uint32_t t0 = millis();
+  uint32_t n=0; double ps=0.0, rs=0.0;
+  while(millis()-t0 < ms){
+    sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+    float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
+    float pitch = atan2f(ax, sqrtf(ay*ay+az*az))*180.0f/PI;
+    float roll  = atan2f(ay, az)*180.0f/PI;
+    ps += pitch; rs += roll; n++;
+    delay(5); yield();
+  }
+  if(n>0){ pitch_off = ps/n; roll_off = rs/n; }
+
+  oled.clearDisplay(); oled.setCursor(0,0);
+  oled.print("CAL OK  poff="); oled.print(pitch_off,1);
+  oled.print(" roff="); oled.print(roll_off,1);
+  oled.display();
+  delay(800);
 }
 
 // ===== WiFi =====
@@ -130,28 +154,26 @@ static void wifiBegin(){
   while(WiFi.status()!=WL_CONNECTED && (millis()-t0)<15000){ delay(250); yield(); }
 }
 
-// ===== Send one row to Google Sheet (via Apps Script) =====
+// ===== Send one row to Google Sheet =====
 bool sendToSheet(int hr, int spo2, int sys, int dia,
-                 float angle_deg, bool impact,
+                 float angle_deg, bool impact_flag,
                  float tC, float hum)
 {
   if(WiFi.status()!=WL_CONNECTED) return false;
 
   String bp = (sys>0 && dia>0) ? (String(sys)+"/"+String(dia)) : "";
 
-  // build JSON
   String json = "{";
   json += "\"hr\":"        + String(hr)            + ",";
   json += "\"bp\":\""      + bp                      + "\",";
   json += "\"spo2\":"      + String(spo2)           + ",";
   json += "\"angle\":"     + String(angle_deg,1)    + ",";
-  json += "\"impact\":"    + String(impact?1:0)     + ",";
+  json += "\"impact\":"    + String(impact_flag?1:0)+ ",";
   json += "\"temp\":"      + (isnan(tC)?String(""):String(tC,1)) + ",";
   json += "\"humidity\":"  + (isnan(hum)?String(""):String(hum,0));
   json += "}";
 
-  WiFiClientSecure client; 
-  client.setInsecure();          // skip cert validation (ESP8266)
+  WiFiClientSecure client; client.setInsecure();
   HTTPClient http;
   if(!http.begin(client, SCRIPT_URL)) return false;
   http.addHeader("Content-Type", "application/json");
@@ -165,9 +187,14 @@ bool sendToSheet(int hr, int spo2, int sys, int dia,
   return false;
 }
 
+// ---------- Debug toggle ----------
+#define IMPACT_DEBUG 1
+
 // ================== setup / loop ==================
 void setup(){
   Serial.begin(115200); delay(150);
+  pinMode(BTN_CAL, INPUT_PULLUP);
+
   wifiBegin();
 
   Wire.begin(OLED_SDA, OLED_SCL); Wire.setClock(400000);
@@ -188,7 +215,6 @@ void setup(){
       while(mx.available() && filled<BUF_LEN){
         redBuf[filled]=mx.getFIFORed();
         irBuf[filled] =mx.getFIFOIR();
-        latest_ir=irBuf[filled];
         mx.nextSample(); filled++;
       }
       delay(2); yield();
@@ -201,32 +227,28 @@ void setup(){
   if(mpu_ok){
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);  // << less smoothing → catch spikes
+    calibrate_mpu(800); // quick initial zero
   }else{
     Serial.println("MPU6050 not found.");
   }
-
-  pinMode(BTN_EMERGENCY, INPUT_PULLUP);
-  pinMode(BTN_HEALTH,    INPUT_PULLUP);
-  pinMode(BTN_SAFE,      INPUT_PULLUP);
-  pinMode(BTN_FAMILY,    INPUT_PULLUP);
-
-  Serial.println("t_ms,HR,SpO2,TempC,Hum,IR_mean,IR_pp,Finger,Fall,g,Pitch,Roll");
 }
 
 void loop(){
   const uint32_t now = millis();
 
-  // Buttons (still available for your logic if needed)
-  deb_update(db_emg); deb_update(db_hlp); deb_update(db_safe); deb_update(db_fam);
+  // CAL button
+  deb_update(db_cal);
+  static bool prev_cal=false;
+  if(db_cal.state && !prev_cal){ calibrate_mpu(1500); }
+  prev_cal = db_cal.state;
 
-  // MAX3010x pipeline (same as before)
+  // MAX3010x pipeline (unchanged)
   if(mx_ok){
     mx.check();
     while(mx.available()){
       redBuf[bufPos]=mx.getFIFORed();
       irBuf[bufPos] =mx.getFIFOIR();
-      latest_ir=irBuf[bufPos];
       bufPos=(bufPos+1)%BUF_LEN;
       mx.nextSample();
     }
@@ -238,11 +260,11 @@ void loop(){
 
       maxim_heart_rate_and_oxygen_saturation(irTmp, BUF_LEN, redTmp,
                                              &spo2_alg,&spo2_valid,&heart_alg,&hr_valid);
-      if(finger_ok && hr_valid && heart_alg>0){ hr_ema=ema(hr_ema,(float)heart_alg,HR_EMA_A); last_hr=hr_ema; }
-      else { last_hr=NAN; hr_ema=NAN; }
 
-      if(finger_ok && spo2_valid && spo2_alg>0){ spo2_ema=ema(spo2_ema,(float)spo2_alg,SPO2_EMA_A); last_spo2=spo2_ema; }
-      else { last_spo2=NAN; spo2_ema=NAN; }
+      if(finger_ok && hr_valid && heart_alg>0)  hr_ema   = ema(hr_ema,   (float)heart_alg, HR_EMA_A);
+      else                                      hr_ema   = NAN;
+      if(finger_ok && spo2_valid && spo2_alg>0) spo2_ema = ema(spo2_ema,(float)spo2_alg, SPO2_EMA_A);
+      else                                      spo2_ema = NAN;
 
       t_algo = now;
     }
@@ -252,36 +274,80 @@ void loop(){
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
 
-  // MPU6050 & fall detection
+  // MPU6050: impact + fall logic
   float gmag=NAN, pitch=NAN, roll=NAN;
   if(mpu_ok){
     read_mpu(gmag, pitch, roll);
+
+    // raw impact (free-fall or spike)
+    bool spike = (!isnan(gmag) && (gmag > IMPACT_G_HI));
+    bool drop  = (!isnan(gmag) && (gmag < FREEFALL_G_LO));
+    if(spike || drop){
+      impact_raw = true;
+      impact_hold_until = now + IMPACT_HOLD_MS;
+    }
+    if(impact_raw && now >= impact_hold_until) impact_raw = false;
+
+    // fall latch: impact (spike OR drop) then big tilt soon after
     switch(fall_state){
-      case IDLE: if(gmag>IMPACT_G){ fall_state=IMPACT_SEEN; impact_t0=now; } break;
+      case IDLE:
+        if(spike || drop){ fall_state=IMPACT_SEEN; impact_t0=now; }
+        break;
       case IMPACT_SEEN:
-        if(now-impact_t0<=IMPACT_WIN_MS){
+        if(now - impact_t0 <= IMPACT_WIN_MS){
           if(fabsf(pitch)>=TILT_DEG || fabsf(roll)>=TILT_DEG){
-            fall_latched=true; fall_latch_until=now+FALL_LATCH_MS; fall_state=IDLE;
+            fall_latched = true;
+            fall_latch_until = now + FALL_LATCH_MS;
+            fall_state = IDLE;
           }
-        }else fall_state=IDLE;
+        }else{
+          fall_state = IDLE;
+        }
         break;
     }
     if(fall_latched && now>=fall_latch_until) fall_latched=false;
+
+#if IMPACT_DEBUG
+    if(now - t_dbg >= 120){
+      t_dbg = now;
+      Serial.printf("g=%.2f  pitch=%.1f  roll=%.1f  impact=%d fall=%d\n",
+                    (double)gmag, (double)pitch, (double)roll,
+                    impact_raw?1:0, fall_latched?1:0);
+    }
+#endif
   }
 
-  // Derived values for display / sheet
-  int hr_out  = (validf(last_hr)   ? constrain((int)(last_hr+0.5f), 40, 180) : 0);
-  int s2_out  = (validf(last_spo2) ? constrain((int)(last_spo2+0.5f), 85, 100) : 0);
-  int bp_sys=0, bp_dia=0; if(hr_out>0 && s2_out>0) estimate_bp(hr_out, s2_out, bp_sys, bp_dia);
+  // Derived vitals with your caps/defaults
+  int hr_out  = validf(hr_ema)   ? constrain((int)(hr_ema+0.5f), 60, 140) : 0;
+  int s2_meas = validf(spo2_ema) ? (int)(spo2_ema+0.5f) : 0;
+  int s2_out  = max(90, s2_meas);             // assume >=90 when invalid
+  s2_out      = constrain(s2_out, 90, 100);
+
+  // BP baseline 120/80 with mild adjustments
+  int bp_sys=0, bp_dia=0;
+  if(hr_out>0 || s2_out>0){
+    float s=120.0f, d=80.0f;
+    if(hr_out>110){ s+=8; d+=4; }
+    else if(hr_out>100){ s+=6; d+=3; }
+    else if(hr_out<65 && hr_out>0){ s-=5; d-=3; }
+    if(s2_meas>0){
+      if(s2_meas<93){ s+=6; d+=3; }
+      else if(s2_meas>98){ s-=2; }
+    }
+    s = constrain(s, 90.0f, 180.0f);
+    d = constrain(d, 55.0f, 110.0f);
+    bp_sys=(int)(s+0.5f); bp_dia=(int)(d+0.5f);
+  }
+
   float angle_deg = (isnan(pitch)||isnan(roll)) ? NAN : max(fabsf(pitch), fabsf(roll));
 
-  // OLED: HR/BP/SPO2/Angle/Impact/Temp/Humidity
+  // OLED
   if(now - t_disp >= DISP_MS){
     oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
 
     oled.setCursor(0,0);
-    oled.print("HR:");   if(hr_out>0){ oled.print(hr_out); } else { oled.print("--"); }
-    oled.print("  SpO2:"); if(s2_out>0){ oled.print(s2_out); oled.print("%"); } else { oled.print("--"); }
+    oled.print("HR:"); if(hr_out>0){ oled.print(hr_out); } else { oled.print("--"); }
+    oled.print("  SpO2:"); oled.print(s2_out); oled.print("%");
 
     oled.setCursor(0,12);
     if(bp_sys>0) { oled.print("BP: "); oled.print(bp_sys); oled.print("/"); oled.print(bp_dia); }
@@ -292,12 +358,11 @@ void loop(){
     if(!isnan(angle_deg)) { oled.print(angle_deg,1); oled.print(" deg"); } else oled.print("--");
 
     oled.setCursor(0,36);
-    oled.print("Impact: "); oled.print(fall_latched ? 1 : 0);
-
+    oled.print("Fall: "); oled.print(fall_latched ? 1 : 0);
     oled.setCursor(0,48);
     if(!isnan(temperature) && !isnan(humidity)){
-      oled.print("T:"); oled.print(temperature,1);
-      oled.print("C  H:"); oled.print((int)humidity); oled.print("%");
+      oled.print("T:"); oled.print(temperature,1); oled.print("C ");
+      oled.print("H:"); oled.print((int)humidity); oled.print("%");
     }else{
       oled.print("T/H: NA");
     }
@@ -306,11 +371,12 @@ void loop(){
     t_disp = now;
   }
 
-  // Periodic POST to Google Sheet
+  // Post to Google Sheet: send "impact" as the raw/held impact signal
+  bool impact_flag = impact_raw || (now < impact_hold_until);
   if(now - t_sheet >= SHEET_MS){
     t_sheet = now;
     sendToSheet(hr_out, s2_out, bp_sys, bp_dia,
-                angle_deg, fall_latched,
+                angle_deg, impact_flag,
                 temperature, humidity);
   }
 
