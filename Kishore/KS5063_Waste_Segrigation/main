@@ -1,0 +1,229 @@
+/*
+ * ESP8266 + L293D (IN1/IN2 only) + Servo + 128x64 OLED + Firebase RTDB
+ * RTDB URL: https://waterdtection-default-rtdb.firebaseio.com/
+ * API Key:   AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4
+ * Email:     spherenexgpt@gmail.com
+ * Password:  Spherenex@123
+ *
+ * Behavior:
+ *  - Bio_Degradable == "1"  -> motor forward 5s, then reset to "0"
+ *  - Recyclable == "1"      -> motor forward 5s, servo 90° for 7s then 0°, reset to "0"
+ *  - Non_Recyclable == "1"  -> motor reverse 5s, then reset to "0"
+ *  - OLED shows True/False for each path
+ */
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>   
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+// -------- USER CONFIG --------
+const char* WIFI_SSID     = "waste";
+const char* WIFI_PASSWORD = "123456789";
+
+#define L293D_IN1 D5  // GPIO14
+#define L293D_IN2 D6  // GPIO12
+#define SERVO_PIN  D4 // GPIO2
+#define I2C_SDA    D2 // GPIO4
+#define I2C_SCL    D1 // GPIO5
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1          // Reset pin not used
+#define OLED_I2C_ADDRESS 0x3C  // Most common
+
+// Firebase
+#define API_KEY     "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL  "spherenexgpt@gmail.com"
+#define USER_PASS   "Spherenex@123"
+
+// RTDB paths
+const char* PATH_BIO  = "/Waste_Management/Bio_Degradable";
+const char* PATH_REC  = "/Waste_Management/Recyclable";
+const char* PATH_NON  = "/Waste_Management/Non_Recyclable";
+
+// Poll interval
+const unsigned long POLL_MS = 600; // ~2 reads per second
+// -----------------------------
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Peripherals
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Servo sorterServo;
+
+// State cache for display
+bool bioFlag = false, recFlag = false, nonFlag = false;
+unsigned long lastPoll = 0;
+
+// ---- Helpers ----
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected: ");
+  Serial.println(WiFi.localIP());
+}
+
+void initOLED() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+    while (true) delay(100);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Waste Management");
+  display.println("ESP8266 + Firebase");
+  display.display();
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println("Waste Management");
+
+  display.setTextSize(1);
+  display.setCursor(0, 18);
+  display.print("Bio-Degradable: ");
+  display.println(bioFlag ? "True" : "False");
+
+  display.setCursor(0, 32);
+  display.print("Recyclable:     ");
+  display.println(recFlag ? "True" : "False");
+
+  display.setCursor(0, 46);
+  display.print("Non-Recyclable: ");
+  display.println(nonFlag ? "True" : "False");
+
+  display.display();
+}
+
+void motorStop() {
+  digitalWrite(L293D_IN1, LOW);
+  digitalWrite(L293D_IN2, LOW);
+}
+
+void motorForward() {
+  digitalWrite(L293D_IN1, HIGH);
+  digitalWrite(L293D_IN2, LOW);
+}
+
+void motorReverse() {
+  digitalWrite(L293D_IN1, LOW);
+  digitalWrite(L293D_IN2, HIGH);
+}
+
+void doMotorForwardFor(unsigned long ms) {
+  motorForward();
+  delay(ms);
+  motorStop();
+}
+
+void doMotorReverseFor(unsigned long ms) {
+  motorReverse();
+  delay(ms);
+  motorStop();
+}
+
+bool readBoolPath(const char* path, bool& out) {
+  if (Firebase.RTDB.getString(&fbdo, path)) {
+    String v = fbdo.to<const char*>();
+    v.trim();
+    out = (v == "1" || v == "true" || v == "True" || v == "TRUE" || v == "on");
+    return true;
+  } else if (Firebase.RTDB.getInt(&fbdo, path)) {
+    out = (fbdo.to<int>() != 0);
+    return true;
+  } else {
+    Serial.printf("Read fail %s, %s\n", path, fbdo.errorReason().c_str());
+    return false;
+  }
+}
+
+void writeZero(const char* path) {
+  if (!Firebase.RTDB.setString(&fbdo, path, "0")) {
+    Serial.printf("Write reset fail %s, %s\n", path, fbdo.errorReason().c_str());
+  }
+}
+
+void handleTriggers() {
+  bool bBio = false, bRec = false, bNon = false;
+
+  bool ok1 = readBoolPath(PATH_BIO, bBio);
+  bool ok2 = readBoolPath(PATH_REC, bRec);
+  bool ok3 = readBoolPath(PATH_NON, bNon);
+
+  if (!(ok1 && ok2 && ok3)) {
+    return;
+  }
+
+  bioFlag = bBio;
+  recFlag = bRec;
+  nonFlag = bNon;
+  updateOLED();
+
+  if (bRec) {
+    Serial.println("Trigger: Recyclable");
+    doMotorForwardFor(5000);
+    sorterServo.write(90);
+    delay(7000);
+    sorterServo.write(0);
+    writeZero(PATH_REC);
+  } else if (bBio) {
+    Serial.println("Trigger: Bio-Degradable");
+    doMotorForwardFor(5000);
+    writeZero(PATH_BIO);
+  } else if (bNon) {
+    Serial.println("Trigger: Non-Recyclable");
+    doMotorReverseFor(5000);
+    writeZero(PATH_NON);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(L293D_IN1, OUTPUT);
+  pinMode(L293D_IN2, OUTPUT);
+  motorStop();
+
+  sorterServo.attach(SERVO_PIN);
+  sorterServo.write(0);
+
+  initOLED();
+
+  wifiConnect();
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASS;
+
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+  Serial.println("Firebase initialized.");
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastPoll >= POLL_MS) {
+    lastPoll = now;
+    handleTriggers();
+  }
+}
