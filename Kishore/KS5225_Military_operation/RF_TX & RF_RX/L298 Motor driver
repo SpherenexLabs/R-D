@@ -1,0 +1,142 @@
+ /************************************************************
+ * F/B/R/L -> L298N differential drive (without PWM)
+ * Inputs: RF receiver or buttons
+ * - Forward/Backward straight
+ * - Steering: F+L, F+R, B+L, B+R
+ * - Pivot in place: L only, R only
+ ************************************************************/
+
+// -------- Input pins (buttons/joystick switches) --------
+#define PIN_F 2   // Forward
+#define PIN_B 3   // Backward
+#define PIN_R 4   // Right
+#define PIN_L 5   // Left
+
+// -------- L298N motor driver pins --------
+// Left motor channel (A)
+#define IN1   6
+#define IN2   7
+// Right motor channel (B)
+#define IN3   8
+#define IN4   11
+
+// ====== Low-level motor control ======
+void setMotorLeft(int spd) {
+  if (spd > 0) {            // forward
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else if (spd < 0) {     // backward
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  } else {                  // stop
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+  }
+}
+
+void setMotorRight(int spd) {
+  if (spd > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else if (spd < 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+  }
+}
+
+void stopAll() {
+  setMotorLeft(0);
+  setMotorRight(0);
+}
+
+// ====== Setup ======
+void setup() {
+  Serial.begin(9600);
+
+  // Inputs with internal pull-ups
+  pinMode(PIN_F, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+  pinMode(PIN_R, INPUT_PULLUP);
+  pinMode(PIN_L, INPUT_PULLUP);
+
+  // L298N outputs
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopAll();
+  Serial.println("L298N drive ready (no PWM).");
+}
+
+// ====== Main control logic ======
+void loop() {
+  // Read buttons (LOW = pressed)
+  bool F = (digitalRead(PIN_F) == LOW);
+  bool B = (digitalRead(PIN_B) == LOW);
+  bool R = (digitalRead(PIN_R) == LOW);
+  bool L = (digitalRead(PIN_L) == LOW);
+
+  // Resolve contradictory pairs
+  if (F && B) { F = false; B = false; } // cancel out
+
+  // Decide motion
+  if (F && !B) {
+    if (L && !R) {
+      // forward-left: left motor off, right motor forward
+      setMotorLeft(0);
+      setMotorRight(1);
+      Serial.println("F+L");
+    } else if (R && !L) {
+      // forward-right
+      setMotorLeft(1);
+      setMotorRight(0);
+      Serial.println("F+R");
+    } else {
+      // straight forward
+      setMotorLeft(1);
+      setMotorRight(1);
+      Serial.println("F");
+    }
+  }
+  else if (B && !F) {
+    if (L && !R) {
+      // back-left: left motor off, right backward
+      setMotorLeft(0);
+      setMotorRight(-1);
+      Serial.println("B+L");
+    } else if (R && !L) {
+      // back-right
+      setMotorLeft(-1);
+      setMotorRight(0);
+      Serial.println("B+R");
+    } else {
+      // straight backward
+      setMotorLeft(-1);
+      setMotorRight(-1);
+      Serial.println("B");
+    }
+  }
+  else if (!F && !B && L && !R) {
+    // Pivot left (one forward, one backward)
+    setMotorLeft(-1);
+    setMotorRight(1);
+    Serial.println("L (pivot)");
+  }
+  else if (!F && !B && R && !L) {
+    // Pivot right
+    setMotorLeft(1);
+    setMotorRight(-1);
+    Serial.println("R (pivot)");
+  }
+  else {
+    // No command -> stop
+    stopAll();
+    Serial.println("STOP");
+  }
+
+  delay(20);  // debounce / response delay
+}
