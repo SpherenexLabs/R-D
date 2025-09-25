@@ -1,0 +1,237 @@
+
+#define SIMULATE_CURRENT 1   
+
+// ====== Blynk / Wi-Fi ======
+#define BLYNK_TEMPLATE_ID "TMPL3IQuHT4iF"
+#define BLYNK_TEMPLATE_NAME "IOT"
+#define BLYNK_AUTH_TOKEN    "8NSl1S7w3hYr1_8-XTFwXQHl72tzzpp_"
+
+#define WIFI_SSID     "iot"
+#define WIFI_PASSWORD "123456789"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// ====== Display / Math ======
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+// ====== OLED ======
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ====== ADC pins ======
+#define PIN_CURRENT 34   // ADC1_CH6 (input-only)
+#define PIN_VOLTAGE 35   // ADC1_CH7 (input-only)
+
+// ====== User calibration (only affects V or the non-simulated I path) ======
+static const float Rtop_ohm    = 100000.0f;
+static const float Rbottom_ohm = 33000.0f;
+static const float VOLTAGE_DIVIDER_RATIO = (Rtop_ohm + Rbottom_ohm) / Rbottom_ohm;
+
+// ACS712 sensitivity (only used if SIMULATE_CURRENT==0)
+static const float CURRENT_SENSITIVITY_V_PER_A = 0.185f;
+
+// If you halved the ACS712 output with a 1:1 divider, set 2.0; else 1.0
+static const float CURRENT_VOLTAGE_DIVIDER_RATIO = 2.0f;
+
+// Deadband for noise (A) when using real sensor
+static const float I_DEADBAND_A = 0.005f;
+
+// ====== ADC config ======
+static const float ADC_FS_VOLTS     = 3.3f;
+static const int   SAMPLES_PER_READ = 20;
+static const int   AVG_WINDOW       = 8;
+static const auto  ADC_ATTEN_ENUM   = ADC_11db; // ~3.6 V headroom
+
+// ====== Publishing ======
+static const uint32_t SAMPLE_PERIOD_MS = 1000; // 1 Hz
+
+BlynkTimer timer;
+
+// ====== Simple moving average ======
+struct SMA {
+  float buf[AVG_WINDOW] = {0};
+  int idx = 0;
+  float push(float x) {
+    buf[idx] = x;
+    idx = (idx + 1) % AVG_WINDOW;
+    float s = 0;
+    for (int k = 0; k < AVG_WINDOW; ++k) s += buf[k];
+    return s / AVG_WINDOW;
+  }
+};
+SMA vAvg, iAvg, pAvg;
+
+// ====== Sensor zero (only used if SIMULATE_CURRENT==0) ======
+float currentMidpoint_V = 0.0f;
+
+int readADC(int pin, int samples = SAMPLES_PER_READ) {
+  long sum = 0;
+  for (int i = 0; i < samples; ++i) {
+    sum += analogRead(pin);
+    delayMicroseconds(150);
+  }
+  return (int)(sum / samples); // 0..4095
+}
+
+inline float countsToVolts(int counts) {
+  return (counts / 4095.0f) * ADC_FS_VOLTS;
+}
+
+float median3(float a, float b, float c) {
+  if (a > b) { float t=a; a=b; b=t; }
+  if (b > c) { float t=b; b=c; c=t; }
+  if (a > b) { float t=a; a=b; b=t; }
+  return b;
+}
+
+void autoZeroCurrent() {
+#if SIMULATE_CURRENT==0
+  float m[3];
+  for (int j = 0; j < 3; ++j) {
+    float s = 0;
+    const int N = 60;
+    for (int i = 0; i < N; ++i) {
+      int   raw  = readADC(PIN_CURRENT, 4);
+      float Vadc = countsToVolts(raw);
+      float Vsns = Vadc * CURRENT_VOLTAGE_DIVIDER_RATIO;
+      s += Vsns;
+      delay(2);
+    }
+    m[j] = s / N;
+  }
+  currentMidpoint_V = median3(m[0], m[1], m[2]);
+#else
+  currentMidpoint_V = 0.0f;
+#endif
+}
+
+// ====== OLED helpers ======
+void drawRow(int y, const char* label, float value, const char* unit, uint8_t prec=2) {
+  display.setTextSize(2);
+  display.setCursor(0, y);
+  display.print(label);
+  display.print(" ");
+  display.print(value, prec);
+  display.print(" ");
+  display.print(unit);
+}
+
+// ====== Random-walk current generator ======
+float simI = 0.30f;                       // start ~300 mA
+const float I_MIN = 0.20f;                // 200 mA
+const float I_MAX = 0.60f;                // 600 mA
+const float I_STEP = 0.03f;               // step per second (±30 mA)
+float nextSimCurrent() {
+  // random step in [-I_STEP, +I_STEP]
+  float step = (random(-1000, 1001) / 1000.0f) * I_STEP;
+  simI += step;
+  if (simI < I_MIN) simI = I_MIN + (I_MIN - simI)*0.3f;
+  if (simI > I_MAX) simI = I_MAX - (simI - I_MAX)*0.3f;
+  return simI;
+}
+
+// ====== Main sampling/publish ======
+void sampleAndPublish() {
+  // --- Voltage from divider (real) ---
+  int   rawV = readADC(PIN_VOLTAGE);
+  float Vpin = countsToVolts(rawV);
+  float V    = Vpin * VOLTAGE_DIVIDER_RATIO;
+
+  // --- Current path ---
+  float I;
+#if SIMULATE_CURRENT==1
+  I = nextSimCurrent();                   // simulated/bounded
+#else
+  // Real sensor -> reconstruct, remove offset, deadband, then clamp to range
+  int   rawI = readADC(PIN_CURRENT);
+  float Vadc = countsToVolts(rawI);
+  float Vsns = Vadc * CURRENT_VOLTAGE_DIVIDER_RATIO;
+  I = (Vsns - currentMidpoint_V) / CURRENT_SENSITIVITY_V_PER_A;
+  if (fabsf(I) < I_DEADBAND_A) I = 0.0f;
+  // Clamp to [I_MIN, I_MAX] as requested
+  if (I < I_MIN) I = I_MIN;
+  if (I > I_MAX) I = I_MAX;
+#endif
+
+  // --- Power ---
+  float P = V * I;
+
+  // smoothing
+  float Vf = vAvg.push(V);
+  float If = iAvg.push(I);
+  float Pf = pAvg.push(P);
+
+  // Debug
+  Serial.print("V="); Serial.print(Vf, 3);
+  Serial.print(" I="); Serial.print(If, 3);
+  Serial.print(" P="); Serial.println(Pf, 3);
+
+  // OLED
+  display.clearDisplay();
+  drawRow(0,  "V", Vf, "V", 2);
+  drawRow(22, "I", If, "A", 3);
+  display.setTextSize(2);
+  display.setCursor(0, 44);
+  display.print("P "); display.print(Pf, 2); display.print(" W");
+  display.display();
+
+  // Blynk Virtuals (history logging happens automatically for these datastreams)
+  Blynk.virtualWrite(V0, Vf);  // Voltage
+  Blynk.virtualWrite(V1, If);  // Current
+  Blynk.virtualWrite(V2, Pf);  // Power
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Seed RNG for simulation
+  randomSeed(esp_random());
+
+  // I2C (ESP32 default pins)
+  Wire.begin(21, 22);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 init failed");
+    while (1) { delay(10); }
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2); display.setCursor(0, 0); display.println("PowerMon");
+  display.setTextSize(1); display.setCursor(0, 24); display.println("Init ADC & Zero");
+  display.display();
+
+  // ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_VOLTAGE, ADC_ATTEN_ENUM);
+  analogSetPinAttenuation(PIN_CURRENT, ADC_ATTEN_ENUM);
+
+  // Zero current (only used when SIMULATE_CURRENT==0)
+  autoZeroCurrent();
+
+  // Wi-Fi + Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASSWORD);
+
+  // 1 Hz sampling/publish
+  timer.setInterval(SAMPLE_PERIOD_MS, sampleAndPublish);
+
+  // Splash
+  display.clearDisplay();
+  display.setTextSize(2); display.setCursor(0, 16); display.println("READY");
+  display.setTextSize(1); display.setCursor(0, 40); display.println("Blynk logging V/I/P");
+  display.display();
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
+
+
