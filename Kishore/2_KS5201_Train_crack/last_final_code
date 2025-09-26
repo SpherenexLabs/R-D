@@ -1,0 +1,168 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===== WiFi credentials =====
+#define WIFI_SSID "train"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase credentials =====
+#define API_KEY "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+// ===== Email/Password Authentication (Firebase user, not Gmail!) =====
+#define USER_EMAIL "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Motor pins (L298N)
+const int motorPin1 = D1; 
+const int motorPin2 = D2; 
+const int ENA = D3;        // PWM pin
+
+// Ultrasonic pins
+const int trigPin = D5;
+const int echoPin = D6;
+
+// Microphone pin
+const int micPin = A0;                // Analog input
+const int soundThreshold = 50;        // Adjust based on your environment
+
+// Distance threshold
+const int stopDistance = 15;  
+
+// Motor speed (PWM: 0–1023 on ESP8266)
+int motorSpeed = 80;  // slow speed
+
+// WiFi tracker
+bool wifiConnected = false;
+
+// Firebase control flag (read from /1_KS5210_Train/Crack)
+int crackFlag = 0;
+
+long measureDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 20000); // 20 ms timeout
+  return duration * 0.034 / 2;
+}
+
+void moveForward(int speed) {
+  digitalWrite(motorPin1, HIGH);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(ENA, speed);
+}
+
+void stopMotor() {
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, LOW);
+  analogWrite(ENA, 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor setup
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+
+  // Ultrasonic setup
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // ===== WiFi setup =====
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  wifiConnected = true;
+
+  // ===== Firebase setup =====
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Optional: ensure Crack node exists (won't overwrite if already present and readable)
+  if (Firebase.ready()) {
+    if (!Firebase.RTDB.getInt(&fbdo, "/1_KS5210_Train/Crack")) {
+      Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/Crack", 0);
+    } else if (fbdo.dataType() != "int") {
+      Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/Crack", 0);
+    }
+  }
+
+  Serial.println("System Ready...");
+}
+
+void loop() {
+  // === Read Crack override from Firebase (highest-priority kill switch) ===
+  crackFlag = 0;
+  if (wifiConnected && Firebase.ready()) {
+    if (Firebase.RTDB.getInt(&fbdo, "/1_KS5210_Train/Crack")) {
+      if (fbdo.dataType() == "int") {
+        crackFlag = fbdo.intData();
+      }
+    }
+  }
+
+  // === Distance Measurement ===
+  long distance = measureDistance();
+
+  // === Microphone Sound Detection ===
+  int micValue = analogRead(micPin);
+  int soundFlag = (micValue > soundThreshold) ? 1 : 0;
+
+  // === Control Logic: stop if ANY flag is 1 (Crack OR Sound OR Obstacle) ===
+  String motorCmd;
+  int obstacleFlag = (distance <= stopDistance) ? 1 : 0;     // compute first
+  bool shouldStop = (crackFlag == 1) || (soundFlag == 1) || (obstacleFlag == 1);
+
+  if (shouldStop) {
+    stopMotor();
+    motorCmd = "S";
+  } else {
+    moveForward(motorSpeed);
+    motorCmd = "F";
+  }
+
+  // === Serial Debug Output ===
+  Serial.print("Crack: "); Serial.print(crackFlag);
+  Serial.print(" | Distance: "); Serial.print(distance);
+  Serial.print(" cm → MotorCmd: "); Serial.print(motorCmd);
+  Serial.print(" | Obstacle: "); Serial.print(obstacleFlag);
+  Serial.print(" | Mic: "); Serial.print(micValue);
+  Serial.print(" | SoundFlag: "); Serial.println(soundFlag);
+
+  // === Push telemetry to Firebase ===
+  if (wifiConnected && Firebase.ready()) {
+    Firebase.RTDB.setString(&fbdo, "/1_KS5210_Train/motor_cmd", motorCmd);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/obstacle", obstacleFlag);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/distance", distance);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/mic_value", micValue);
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/sound_flag", soundFlag);
+
+    // Echo back what the device is currently honoring
+    Firebase.RTDB.setInt(&fbdo, "/1_KS5210_Train/crack_flag_effective", crackFlag);
+  }
+
+  delay(800);  // adjust as needed
+}
