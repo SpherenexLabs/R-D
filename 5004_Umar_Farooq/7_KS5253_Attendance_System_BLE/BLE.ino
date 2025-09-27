@@ -1,7 +1,10 @@
 /*
  * ESP32 AP+STA + Firebase RTDB logging for 5 known devices
- * - SAFE: no Firebase calls inside Wi-Fi event callback.
- * - Uses RTDB.deleteNode() instead of setString("", ...) to clear.
+ * - Persistent slots Device_1..Device_5 always exist.
+ * - On AP join:   /Device_X/Connected = true
+ * - On AP leave:  /Device_X/Connected = false
+ * - Debounce AP events and retry Firebase writes to avoid TLS drop errors.
+ * - No Firebase calls inside Wi-Fi event callback.
  */
 
 #include <WiFi.h>
@@ -11,18 +14,18 @@
 #define WIFI_PASS_STA     "123456789"
 
 // ---------- ESP32 SoftAP (local hotspot for presence) ----------
-const char* AP_SSID       = "BLE";
-const char* AP_PASS       = "123456789";
-const uint8_t AP_CHANNEL  = 6;
-const uint8_t AP_MAX_CONN = 7;   // you asked for >= 5
+static const char* AP_SSID       = "BLE";
+static const char* AP_PASS       = "123456789";
+static const uint8_t AP_CHANNEL  = 6;
+static const uint8_t AP_MAX_CONN = 7;   // >=5
 
 // ---------- Firebase (Mobizt Firebase-ESP-Client) ----------
 #include <Firebase_ESP_Client.h>
-#include <addons/TokenHelper.h>
+#include <addons/TokenHelper.h>   // provides tokenStatusCallback
 #include <addons/RTDBHelper.h>
 
-#define API_KEY       "AIzaSyBzXzocbdytn4N8vLrT-V2JYZ8pgqWrbC0"
-#define DATABASE_URL  "https://self-balancing-7a9fe-default-rtdb.firebaseio.com"
+#define API_KEY       "AIzaSyC4ZJdYQSAaK0lLR8xsTRfiWNCi-EtV5k4"
+#define DATABASE_URL  "https://home-automation-385a6-default-rtdb.firebaseio.com/"
 #define USER_EMAIL    "spherenexgpt@gmail.com"
 #define USER_PASSWORD "Spherenex@123"
 
@@ -30,7 +33,7 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-const char* BASE_PATH = "/19_KS5253_BLE";
+static const char* BASE_PATH = "/19_KS5253_BLE";
 
 // ===== Whitelist: EXACTLY 5 devices =====
 struct Device {
@@ -40,8 +43,8 @@ struct Device {
 };
 
 Device devices[5] = {
-  {"D0:97:FE:1D:B9:09", "UFK",       "Device_1"},
-  {"D4:63:DE:8B:AD:2E", "Sushma",    "Device_2"},
+  {"80:54:9C:C5:5C:08", "Vibha",       "Device_1"},
+  {"CC:F9:F0:F6:3F:7C", "Harshitha",    "Device_2"},
   {"7E:FC:0D:9B:F9:AD", "Eshanya",   "Device_3"},
   {"C8:58:95:A8:A6:C6", "Marnal",    "Device_4"},
   {"3C:B0:ED:6F:82:B8", "Yashwanth", "Device_5"}
@@ -65,36 +68,85 @@ bool firebaseReady() {
   return WiFi.status() == WL_CONNECTED && Firebase.ready();
 }
 
-// ---------- Defer Firebase work: flags set by event, handled in loop() ----------
+String slotPath(int idx) {
+  return String(BASE_PATH) + "/" + devices[idx].slotKey;
+}
+
+// ---------- Deferred flags (set by event, handled in loop) ----------
 volatile bool pendingConnect[5]    = {false,false,false,false,false};
 volatile bool pendingDisconnect[5] = {false,false,false,false,false};
 
-void queueConnect(int idx)    { pendingConnect[idx] = true; }
-void queueDisconnect(int idx) { pendingDisconnect[idx] = true; }
+// Debounce and retry controls
+unsigned long dueAtMs[5] = {0,0,0,0,0};
+static const unsigned long AP_EVENT_DEBOUNCE_MS = 700;  // wait after AP event
+static const int FIREBASE_RETRIES = 3;
+
+void queueConnect(int idx)    { pendingConnect[idx] = true;  dueAtMs[idx] = millis() + AP_EVENT_DEBOUNCE_MS; }
+void queueDisconnect(int idx) { pendingDisconnect[idx] = true; dueAtMs[idx] = millis() + AP_EVENT_DEBOUNCE_MS; }
+
+// ---------- Robust Firebase setters with small retry/backoff ----------
+bool fb_trySetBool(const String& path, bool v) {
+  for (int attempt = 1; attempt <= FIREBASE_RETRIES; ++attempt) {
+    if (!firebaseReady()) return false;
+    if (Firebase.RTDB.setBool(&fbdo, path.c_str(), v)) return true;
+    Serial.printf("[FB] setBool failed (attempt %d/%d): %s\n",
+                  attempt, FIREBASE_RETRIES, fbdo.errorReason().c_str());
+    delay(250 * attempt);  // simple backoff
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[FB] Wi-Fi down, retrying STA connect...");
+      WiFi.disconnect();
+      delay(50);
+      WiFi.begin(WIFI_SSID_STA, WIFI_PASS_STA);
+    }
+  }
+  return false;
+}
+
+bool fb_trySetString(const String& path, const String& v) {
+  for (int attempt = 1; attempt <= FIREBASE_RETRIES; ++attempt) {
+    if (!firebaseReady()) return false;
+    if (Firebase.RTDB.setString(&fbdo, path.c_str(), v.c_str())) return true;
+    Serial.printf("[FB] setString failed (attempt %d/%d): %s\n",
+                  attempt, FIREBASE_RETRIES, fbdo.errorReason().c_str());
+    delay(250 * attempt);
+  }
+  return false;
+}
 
 // ---------- Firebase actions (called ONLY from loop) ----------
-void fb_setName(int idx) {
+void fb_initSlots() {
   if (!firebaseReady()) return;
-  String path = String(BASE_PATH) + "/" + devices[idx].slotKey;
-  String value = devices[idx].name;
-  if (Firebase.RTDB.setString(&fbdo, path.c_str(), value.c_str())) {
-    Serial.printf("[FB] %s <- \"%s\"\n", path.c_str(), value.c_str());
-  } else {
-    Serial.printf("[FB] setString failed: %s\n", fbdo.errorReason().c_str());
+  for (int i = 0; i < 5; i++) {
+    String base = slotPath(i);
+    // Ensure stable structure: Name + Connected=false
+    if (!fb_trySetString(base + "/fullName", devices[i].name)) {
+      Serial.printf("[FB] init Name failed for %s\n", base.c_str());
+    }
+    if (!fb_trySetBool(base + "/Connected", false)) {
+      Serial.printf("[FB] init Connected failed for %s\n", base.c_str());
+    }
   }
 }
 
-void fb_clearSlot(int idx) {
+void fb_setConnected(int idx, bool connecte/d) {
   if (!firebaseReady()) return;
-  String path = String(BASE_PATH) + "/" + devices[idx].slotKey;
-  if (Firebase.RTDB.deleteNode(&fbdo, path.c_str())) {
-    Serial.printf("[FB] deleteNode %s OK\n", path.c_str());
+  String base = slotPath(idx);
+
+  // Keep Name present (idempotent)
+  (void)fb_trySetString(base + "/fullName", devices[idx].name);
+
+  // Optional tiny jitter to decorrelate writes under AP churn
+  delay(50 + (esp_random() % 100));
+
+  if (fb_trySetBool(base + "/Connected", connected)) {
+    Serial.printf("[FB] %s/Connected <- %s\n", base.c_str(), connected ? "true" : "false");
   } else {
-    Serial.printf("[FB] deleteNode failed: %s\n", fbdo.errorReason().c_str());
+    Serial.printf("[FB] FINAL FAIL: %s/Connected <- %s\n",
+                  base.c_str(), connected ? "true" : "false");
   }
 }
 
-// ---------- Wi-Fi event (do NOT touch Firebase here) ----------
+// ---------- Wi-Fi event (no Firebase calls here) ----------
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
@@ -113,7 +165,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       int idx = findDeviceIndexByMac(mac);
       if (idx >= 0) {
         Serial.printf("%s Disconnected (MAC=%s)\n", devices[idx].name, mac.c_str());
-        queueDisconnect(idx); // defer Firebase delete
+        queueDisconnect(idx); // defer Firebase write
       } else {
         Serial.printf("Unknown device disconnected: %s\n", mac.c_str());
       }
@@ -145,7 +197,7 @@ void setupFirebase() {
   config.database_url = DATABASE_URL;
   auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASSWORD;
-  config.token_status_callback = tokenStatusCallback;
+  config.token_status_callback = tokenStatusCallback;  // from TokenHelper.h
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 }
@@ -158,6 +210,9 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.onEvent(onWiFiEvent);
 
+  // Reduce micro-outages during AP events
+  WiFi.setSleep(false);
+
   if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0 /*visible*/, AP_MAX_CONN)) {
     Serial.println("SoftAP start failed!");
     while (true) delay(1000);
@@ -168,9 +223,9 @@ void setup() {
   connectSTA();
   setupFirebase();
 
-  // Optional: clean slate on boot (delete 5 nodes)
+  // Create/refresh stable structure on boot (no deletes).
   if (firebaseReady()) {
-    for (int i = 0; i < 5; i++) fb_clearSlot(i);
+    fb_initSlots();
   }
 }
 
@@ -183,17 +238,16 @@ void loop() {
     connectSTA();
   }
 
-  // Handle deferred Firebase writes/deletes
+  // Handle deferred Firebase updates once debounce has elapsed
   for (int i = 0; i < 5; i++) {
-    if (pendingConnect[i]) {
+    bool time_ok = ((long)(millis() - dueAtMs[i]) >= 0);
+    if (pendingConnect[i] && time_ok) {
       pendingConnect[i] = false;
-      fb_setName(i);
+      fb_setConnected(i, true);
     }
-    if (pendingDisconnect[i]) {
+    if (pendingDisconnect[i] && time_ok) {
       pendingDisconnect[i] = false;
-      fb_clearSlot(i);
+      fb_setConnected(i, false);
     }
   }
-
-  // (Nothing else needed)
 }
