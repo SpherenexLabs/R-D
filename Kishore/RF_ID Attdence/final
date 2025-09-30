@@ -1,0 +1,307 @@
+/*
+ * ESP32 Dual MFRC522 + IR → Firebase RTDB (root keys + Count)
+ * Writes at database root (all values are STRINGs):
+ *   /IR      : "0" | "1"
+ *   /Person  : "in" | "out"
+ *   /RF_id   : "<UID_HEX>"
+ *   /Count   : "<number>"          // occupancy = IN - OUT, never below 0
+ *
+ * Libraries (Arduino IDE → Library Manager):
+ *   - Firebase ESP Client (by Mobizt)
+ *   - MFRC522 (miguelbalboa/MFRC522)
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// ================= USER CONFIG =================
+#define WIFI_SSID     "rfid"
+#define WIFI_PASSWORD "123456789"
+
+// Firebase (your project)
+#define API_KEY       "AIzaSyCU2sFCShY6m4jQoo1m1-dyqlmnl_CkSGI"
+#define DATABASE_URL  "https://rf-id-attdence-system-default-rtdb.firebaseio.com"
+
+// Auth (you provided email/password)
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ================ SPI / RFID ===================
+// ESP32 VSPI pins
+#define PIN_SCK   18
+#define PIN_MISO  19
+#define PIN_MOSI  23
+
+// IN reader
+#define SS_PIN_IN   5
+#define RST_PIN_IN  17
+MFRC522 mfrc522_in(SS_PIN_IN, RST_PIN_IN);
+
+// OUT reader
+#define SS_PIN_OUT  16
+#define RST_PIN_OUT 4
+MFRC522 mfrc522_out(SS_PIN_OUT, RST_PIN_OUT);
+
+// ================ IR SENSOR ====================
+// Safe pin (avoid strap pins like GPIO15)
+#define IR_PIN     27
+#define IR_ACTIVE  LOW           // most IR modules pull LOW on detect
+
+// ========== CARD CACHE / DEBOUNCE =============
+const unsigned long DEBOUNCE_MS = 10000;
+
+String cardIDs_IN[50];
+unsigned long lastRead_IN[50];
+int count_IN = 0;
+
+String cardIDs_OUT[50];
+unsigned long lastRead_OUT[50];
+int count_OUT = 0;
+
+// ================= Firebase ====================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool fbReady = false;  // becomes true only after Wi-Fi + Firebase begin succeed
+
+// Rate limit RTDB writes
+int lastIrBit = -1;
+unsigned long t_lastIRWrite = 0;
+
+// Live occupancy (IN - OUT)
+int occupancy = 0;
+bool countLoaded = false;
+
+// ---------------- Helpers ----------------
+String uidToString(MFRC522 &r) {
+  String s;
+  for (byte i = 0; i < r.uid.size; i++) {
+    if (r.uid.uidByte[i] < 0x10) s += '0';
+    s += String(r.uid.uidByte[i], HEX);
+  }
+  s.toUpperCase();
+  return s;
+}
+int idxIN(const String& id) {
+  for (int i=0;i<count_IN;i++) if (cardIDs_IN[i]==id) return i;
+  if (count_IN >= 50) return -1;
+  cardIDs_IN[count_IN] = id; lastRead_IN[count_IN] = 0; return count_IN++;
+}
+int idxOUT(const String& id) {
+  for (int i=0;i<count_OUT;i++) if (cardIDs_OUT[i]==id) return i;
+  if (count_OUT >= 50) return -1;
+  cardIDs_OUT[count_OUT] = id; lastRead_OUT[count_OUT] = 0; return count_OUT++;
+}
+
+inline bool wifiIsUp() { return WiFi.status() == WL_CONNECTED; }
+
+// Safe RTDB string write (guards all states)
+void rtdbSet(const char* path, const String& val) {
+  if (!fbReady) return;
+  if (!wifiIsUp()) return;
+  if (!Firebase.ready()) return;
+  if (!Firebase.RTDB.setString(&fbdo, path, val)) {
+    Serial.print("RTDB write fail @ "); Serial.print(path);
+    Serial.print(" : "); Serial.println(fbdo.errorReason());
+  }
+}
+
+// Read a string from RTDB (guarded)
+bool rtdbGetString(const char* path, String& out) {
+  if (!fbReady || !wifiIsUp() || !Firebase.ready()) return false;
+  if (!Firebase.RTDB.getString(&fbdo, path)) return false;
+  out = fbdo.stringData();
+  return true;
+}
+
+// Occupancy helpers
+void setCount(int value) {
+  if (value < 0) value = 0;
+  occupancy = value;
+  rtdbSet("/Count", String(occupancy));
+  Serial.print("[Count] = "); Serial.println(occupancy);
+}
+void adjustCount(int delta) {
+  int next = occupancy + delta;
+  if (next < 0) next = 0;
+  if (next != occupancy) setCount(next);
+}
+
+// ---------------- Wi-Fi ----------------
+void connectWiFiBlocking() {
+  WiFi.persistent(false);      // reduce flash wear
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);        // better stability
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("[WiFi] Connecting to "); Serial.println(WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+}
+
+// ---------------- Firebase ----------------
+bool beginFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.max_token_generation_retry = 5;
+  Firebase.reconnectWiFi(true);
+
+  bool authOK;
+  if (strlen(USER_EMAIL)) {
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+    authOK = true; // credentials present; begin() will sign in
+  } else {
+    // Anonymous sign-in (must be enabled in Firebase Console)
+    authOK = Firebase.signUp(&config, &auth, "", "");
+    if (!authOK) {
+      Serial.print("Anonymous signUp failed: ");
+      Serial.println(config.signer.signupError.message.c_str());
+      return false;
+    }
+  }
+
+  // Optional: tune TLS buffers a bit smaller to avoid memory pressure
+  fbdo.setBSSLBufferSize(2048, 512);
+
+  Firebase.begin(&config, &auth);
+  // Seed root keys only after client is ready
+  unsigned long t0 = millis();
+  while (!Firebase.ready() && millis() - t0 < 8000) { delay(50); }
+  if (!Firebase.ready()) {
+    Serial.println("Firebase client not ready yet (will retry in loop).");
+    return true; // still OK; rtdbSet guards Firebase.ready()
+  }
+
+  rtdbSet("/IR", "0");
+  rtdbSet("/Person", "");
+  rtdbSet("/RF_id", "");
+
+  // Load Count if already present; else initialize to 0
+  String cnt;
+  if (rtdbGetString("/Count", cnt)) {
+    int c = cnt.toInt();
+    occupancy = (c < 0) ? 0 : c;
+    countLoaded = true;
+    Serial.print("[Firebase] Loaded Count="); Serial.println(occupancy);
+  } else {
+    setCount(0);
+    countLoaded = true;
+    Serial.println("[Firebase] Count not found; initialized to 0");
+  }
+
+  return true;
+}
+
+// ================== Setup ==================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.print("Reset reason: "); Serial.println((int)esp_reset_reason());
+
+  // 1) Wi-Fi first (blocking)
+  connectWiFiBlocking();
+
+  // 2) Firebase next (only after Wi-Fi)
+  fbReady = beginFirebase();
+
+  // 3) SPI + readers
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, -1);
+  pinMode(SS_PIN_IN, OUTPUT);
+  pinMode(SS_PIN_OUT, OUTPUT);
+  digitalWrite(SS_PIN_IN, HIGH);
+  digitalWrite(SS_PIN_OUT, HIGH);
+
+  mfrc522_in.PCD_Init();  delay(60);
+  mfrc522_out.PCD_Init(); delay(60);
+
+  // 4) IR input with pull-up
+  pinMode(IR_PIN, INPUT_PULLUP);
+
+  Serial.println("Ready: ESP32 + 2xMFRC522 + IR + Firebase (+ Count)");
+}
+
+// ================== Loop ===================
+void loop() {
+  // If Wi-Fi was lost, block here until it comes back (prevents null calls inside libs)
+  if (!wifiIsUp()) {
+    Serial.println("[WiFi] Lost. Reconnecting...");
+    connectWiFiBlocking();
+    // Try to (re)start Firebase once Wi-Fi is back
+    if (!fbReady) fbReady = beginFirebase();
+    delay(100);
+    return; // let system breathe
+  }
+
+  // ---- IR live → /IR (only on change; min 100 ms) ----
+  int irBit = (digitalRead(IR_PIN) == IR_ACTIVE) ? 1 : 0;
+  if (irBit != lastIrBit && millis() - t_lastIRWrite > 100) {
+    lastIrBit = irBit;
+    t_lastIRWrite = millis();
+    rtdbSet("/IR", String(irBit));   // "0" / "1"
+  }
+
+  // ---- IN reader ----
+  digitalWrite(SS_PIN_IN, LOW);
+  digitalWrite(SS_PIN_OUT, HIGH);
+  if (mfrc522_in.PICC_IsNewCardPresent() && mfrc522_in.PICC_ReadCardSerial()) {
+    String card = uidToString(mfrc522_in);
+    int i = idxIN(card);
+    if (i >= 0) {
+      if (millis() - lastRead_IN[i] > DEBOUNCE_MS) {
+        lastRead_IN[i] = millis();
+        rtdbSet("/IR", String(irBit));
+        rtdbSet("/Person", "in");
+        rtdbSet("/RF_id", card);
+        adjustCount(+1);  // <<< Count increment
+        Serial.print("IN  -> "); Serial.print(card);
+        Serial.print(" | IR=");  Serial.print(irBit);
+        Serial.print(" | Count="); Serial.println(occupancy);
+      } else {
+        Serial.println("IN  -> Same card, wait");
+      }
+    } else {
+      Serial.println("IN  -> Cache full");
+    }
+    mfrc522_in.PICC_HaltA();
+    mfrc522_in.PCD_StopCrypto1();
+  }
+  digitalWrite(SS_PIN_IN, HIGH);
+
+  // ---- OUT reader ----
+  digitalWrite(SS_PIN_OUT, LOW);
+  digitalWrite(SS_PIN_IN, HIGH);
+  if (mfrc522_out.PICC_IsNewCardPresent() && mfrc522_out.PICC_ReadCardSerial()) {
+    String card = uidToString(mfrc522_out);
+    int i = idxOUT(card);
+    if (i >= 0) {
+      if (millis() - lastRead_OUT[i] > DEBOUNCE_MS) {
+        lastRead_OUT[i] = millis();
+        rtdbSet("/IR", String(irBit));
+        rtdbSet("/Person", "out");
+        rtdbSet("/RF_id", card);
+        adjustCount(-1);  // <<< Count decrement (floors at 0)
+        Serial.print("OUT -> "); Serial.print(card);
+        Serial.print(" | IR=");  Serial.print(irBit);
+        Serial.print(" | Count="); Serial.println(occupancy);
+      } else {
+        Serial.println("OUT -> Same card, wait");
+      }
+    } else {
+      Serial.println("OUT -> Cache full");
+    }
+    mfrc522_out.PICC_HaltA();
+    mfrc522_out.PCD_StopCrypto1();
+  }
+  digitalWrite(SS_PIN_OUT, HIGH);
+
+  delay(5); // short yield
+}
