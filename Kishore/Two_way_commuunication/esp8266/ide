@@ -1,0 +1,332 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <string.h>  // for strlen
+
+// Firebase helper headers (Mobizt lib)
+#include "addons/TokenHelper.h"   // tokenStatusCallback
+#include "addons/RTDBHelper.h"
+
+// ===== WiFi =====
+#define WIFI_SSID "two"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase =====
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+// Email/Password user enabled in Firebase Authentication
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===== RTDB path =====
+static const char* SERVO_SELECTOR_PATH = "/Two_way/servo";
+
+// ===== Servo pins (safe vs boot-strap) =====
+#define SERVO1_PIN D1  // GPIO5
+#define SERVO2_PIN D2  // GPIO4
+#define SERVO3_PIN D5  // GPIO14
+#define SERVO4_PIN D6  // GPIO12
+
+// ===== Buzzer pin =====
+#define BUZZER_PIN D7  // GPIO13 (active buzzer)
+
+// ===== OLED (SSD1306 128x64 I2C) =====
+// Custom I2C so D1/D2 stay free for servos.
+#define I2C_SDA D3     // GPIO0
+#define I2C_SCL D4     // GPIO2
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
+#define OLED_ADDR    0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===== Motion behavior / calibration =====
+static const bool DETACH_AFTER_MOVE = true;  // detach after move to reduce heat/jitter
+static const int  MOVE_HOLD_MS      = 500;   // ms keep PWM after write
+static const int  SERVO_MIN_US      = 544;
+static const int  SERVO_MAX_US      = 2400;
+
+// Optional trims
+static const int TRIM_S1 = 0;
+static const int TRIM_S2 = 0;
+static const int TRIM_S3 = 0;
+static const int TRIM_S4 = 0;
+
+// Target angle for "ON"
+static const int ON_DEG = 90;
+
+// ===== Firebase globals =====
+FirebaseData fbdo;
+FirebaseData stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== Servos =====
+Servo s1, s2, s3, s4;
+int lastCmd = -999;
+
+// ===== Helpers =====
+inline int clamp180(int v){ return v < 0 ? 0 : (v > 180 ? 180 : v); }
+
+void attachIfNeeded(Servo &s, int pin){
+  if (!s.attached()) s.attach(pin, SERVO_MIN_US, SERVO_MAX_US);
+}
+void detachIfAttached(Servo &s){
+  if (s.attached()) s.detach();
+}
+int applyTrim(int deg, int trim){ return clamp180(deg + trim); }
+void writeDeg(Servo &s, int deg){ s.write(clamp180(deg)); }
+
+void driveInstant(Servo &s, int pin, int trim, int targetDeg){
+  attachIfNeeded(s, pin);
+  writeDeg(s, applyTrim(targetDeg, trim));
+  if (DETACH_AFTER_MOVE){
+    delay(MOVE_HOLD_MS);
+    detachIfAttached(s);
+  }
+}
+void setS1(int deg){ driveInstant(s1, SERVO1_PIN, TRIM_S1, deg); }
+void setS2(int deg){ driveInstant(s2, SERVO2_PIN, TRIM_S2, deg); }
+void setS3(int deg){ driveInstant(s3, SERVO3_PIN, TRIM_S3, deg); }
+void setS4(int deg){ driveInstant(s4, SERVO4_PIN, TRIM_S4, deg); }
+
+void allTo(int deg){
+  setS1(deg); setS2(deg); setS3(deg); setS4(deg);
+}
+void allDetach(){
+  detachIfAttached(s1); detachIfAttached(s2); detachIfAttached(s3); detachIfAttached(s4);
+}
+void allZeroAndOff(){
+  allTo(0);
+  allDetach();
+  Serial.println("ALL -> 0° and detached");
+}
+
+// ===== OLED helpers =====
+void oledClear(){
+  display.clearDisplay();
+  display.display();
+}
+void oledShowLines(const char* l1, const char* l2){
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Line 1: big if short
+  display.setTextSize((strlen(l1) > 10) ? 1 : 2);
+  display.setCursor(0, 0);
+  display.println(l1);
+
+  // Line 2: auto shrink if long
+  display.setTextSize((strlen(l2) > 10) ? 1 : 2);
+  display.setCursor(0, 28);
+  display.println(l2);
+
+  display.display();
+}
+
+// ===== Buzzer helpers (active buzzer) =====
+void buzzerOn(){ digitalWrite(BUZZER_PIN, HIGH); }
+void buzzerOff(){ digitalWrite(BUZZER_PIN, LOW); }
+void buzzerBeepMs(unsigned ms){
+  buzzerOn();
+  delay(ms);
+  buzzerOff();
+}
+
+// ===== Firebase utilities =====
+bool waitForFirebaseReady(uint32_t timeoutMs = 20000){
+  uint32_t start = millis();
+  while (!Firebase.ready()){
+    if (millis() - start > timeoutMs) return false;
+    delay(50);
+  }
+  return true;
+}
+bool ensureSelectorNode(){
+  if (!Firebase.RTDB.get(&fbdo, SERVO_SELECTOR_PATH)){
+    Serial.printf("ensure get failed: %s\n", fbdo.errorReason().c_str());
+    if (!Firebase.RTDB.setInt(&fbdo, SERVO_SELECTOR_PATH, 0)){
+      Serial.printf("create selector failed: %s\n", fbdo.errorReason().c_str());
+      return false;
+    }
+    Serial.println("Created /Two_way/servo = 0");
+    return true;
+  }
+  if (fbdo.dataType() != "int"){
+    Serial.println("Selector node not int; forcing to 0.");
+    if (!Firebase.RTDB.setInt(&fbdo, SERVO_SELECTOR_PATH, 0)){
+      Serial.printf("force int failed: %s\n", fbdo.errorReason().c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+// ===== Command handling (instant moves + OLED + buzzer) =====
+void handleCommand(int cmd){
+  if (cmd == lastCmd){
+    Serial.printf("Same cmd %d; ignoring. To retrigger, set 0 then %d.\n", cmd, cmd);
+    return;
+  }
+  lastCmd = cmd;
+
+  switch(cmd){
+    case 0:
+      Serial.println("CMD 0: ALL -> 0° (OFF), OLED clear, buzzer off");
+      allZeroAndOff();
+      oledClear();      // No message
+      buzzerOff();
+      break;
+
+    case 1:
+      Serial.println("CMD 1: S1 -> 90°, others -> 0°, OLED: 'Servo:1' + 'Hi'");
+      setS1(ON_DEG); setS2(0); setS3(0); setS4(0);
+      oledShowLines("Servo:1", "Hi");
+      buzzerOff();
+      break;
+
+    case 2:
+      Serial.println("CMD 2: S2 -> 90°, others -> 0°, OLED: 'Servo:2' + 'How are You'");
+      setS1(0); setS2(ON_DEG); setS3(0); setS4(0);
+      oledShowLines("Servo:2", "How are You");
+      buzzerOff();
+      break;
+
+    case 3:
+      Serial.println("CMD 3: S3 -> 90°, others -> 0°, OLED: 'Servo:3' + 'Help', buzzer 5s");
+      setS1(0); setS2(0); setS3(ON_DEG); setS4(0);
+      oledShowLines("Servo:3", "Help");
+      buzzerBeepMs(5000);   // 5 seconds solid beep
+      break;
+
+    case 4:
+      Serial.println("CMD 4: S4 -> 90°, others -> 0°, OLED: 'Servo:4' + 'Thankyou'");
+      setS1(0); setS2(0); setS3(0); setS4(ON_DEG);
+      oledShowLines("Servo:4", "Thankyou");
+      buzzerOff();
+      break;
+
+    case 5:
+      Serial.println("CMD 5: ALL -> 90°, OLED: 'All Servo's are On'");
+      allTo(ON_DEG);
+      oledShowLines("Servo:5", "All Servo's are On");  // <— requested message
+      buzzerOff();
+      break;
+
+    default:
+      Serial.printf("Unknown cmd %d -> ALL -> 0°\n", cmd);
+      allZeroAndOff();
+      oledClear();
+      buzzerOff();
+      break;
+  }
+}
+
+void applyInitialSelector(){
+  if (!Firebase.RTDB.getInt(&fbdo, SERVO_SELECTOR_PATH)){
+    Serial.printf("Initial get failed: %s\n", fbdo.errorReason().c_str());
+    allZeroAndOff();
+    oledClear();
+    buzzerOff();
+    return;
+  }
+  int cmd = fbdo.intData();
+  Serial.printf("Initial selector = %d\n", cmd);
+  handleCommand(cmd);
+}
+
+// Stream callback: /Two_way/servo is an INT
+void streamCallback(FirebaseStream data){
+  const String type = data.dataType();  // "int" or "null"
+  if (type == "int"){
+    int cmd = data.intData();
+    Serial.printf("[STREAM] cmd -> %d\n", cmd);
+    handleCommand(cmd);
+  } else if (type == "null"){
+    Serial.println("[STREAM] node deleted, restoring 0");
+    Firebase.RTDB.setInt(&fbdo, SERVO_SELECTOR_PATH, 0);
+    allZeroAndOff();
+    oledClear();
+    buzzerOff();
+  } else {
+    Serial.printf("[STREAM] unexpected type: %s\n", type.c_str());
+  }
+}
+
+void streamTimeoutCallback(bool timeout){
+  if (timeout) Serial.println("[STREAM] timeout, resuming...");
+  if (!stream.httpConnected()){
+    Serial.printf("[STREAM] HTTP disconnected, code: %d\n", stream.httpCode());
+  }
+}
+
+// ===== Arduino lifecycle =====
+void setup(){
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOff();
+
+  // I2C + OLED
+  Wire.begin(I2C_SDA, I2C_SCL);                 // SDA=D3(GPIO0), SCL=D4(GPIO2)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 allocation failed");
+  }
+  oledClear();
+
+  // Start safe
+  allZeroAndOff();
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED){
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.printf("\nWiFi OK, IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.print("Waiting for Firebase token");
+  if (!waitForFirebaseReady()){
+    Serial.println("\nToken timeout. Check API_KEY / DATABASE_URL / Auth user.");
+  } else {
+    Serial.println("\nFirebase ready.");
+    if (auth.token.uid.length()){
+      Serial.printf("Signed in UID: %s\n", auth.token.uid.c_str());
+    }
+  }
+
+  if (!ensureSelectorNode()){
+    Serial.println("Could not ensure /Two_way/servo. Check rules/credentials.");
+  }
+
+  applyInitialSelector();
+
+  if (!Firebase.RTDB.beginStream(&stream, SERVO_SELECTOR_PATH)){
+    Serial.printf("beginStream failed: %s\n", stream.errorReason().c_str());
+  } else {
+    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+    Serial.println("Streaming /Two_way/servo (INT: 0..5)");
+  }
+}
+
+void loop(){
+  delay(10);
+}
