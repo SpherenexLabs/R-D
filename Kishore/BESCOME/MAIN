@@ -1,0 +1,202 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ----------------- OLED SETTINGS -----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ----------------- SENSOR PINS -----------------
+#define FLAME_SENSOR D5
+#define SMOKE_SENSOR D6
+#define GAS_SENSOR   D7
+#define RELAY_PIN    D4   // Relay IN triggered LOW
+#define VOLTAGE_PIN  A0
+
+// ----------------- FIREBASE SETTINGS (NEW PROJECT) -----------------
+// Your new RTDB host (no https://, no trailing slash)
+#define FIREBASE_HOST "regal-welder-453313-d6-default-rtdb.firebaseio.com"
+// If you use auth, put your Database Secret here; else keep "" for open rules.
+#define FIREBASE_AUTH "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+
+// ----------------- WIFI SETTINGS -----------------
+#define WIFI_SSID     "BESCOM"
+#define WIFI_PASSWORD "123456789"
+
+// ----------------- ADC SCALE & CAL (used only when relay is OFF) -----------------
+#define ADC_VREF     3.20f      // NodeMCU/LoLin A0 external range (~0–3.2 V). Use 1.00 for bare ESP-12.
+#define DIVIDER_GAIN 1.00f      // External divider gain (Vin/Vadc). Keep 1.00 if none.
+#define CAL_CORR     2.01415f   // Linear calibration factor (optional)
+
+// ----------------- OBJECTS -----------------
+FirebaseData fbdo;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// ----------------- VARIABLES -----------------
+float voltage = 0.0f;  // numeric voltage (used for power/current calc)
+int balance = 0;
+int flameValue = 0;
+int smokeValue = 0;
+int gasValue = 0;
+int relayState = 0;
+
+// Current/Power
+float currentA = 0.0f;
+float powerW   = 0.0f;
+
+// ----------------- PROTOTYPES -----------------
+void displayText(const String& msg);
+void ensureFirebasePaths();   // creates /BESCOM/* keys if missing
+
+void setup() {
+  Serial.begin(115200);
+
+  // ----------------- PIN SETUP -----------------
+  pinMode(FLAME_SENSOR, INPUT);
+  pinMode(SMOKE_SENSOR, INPUT);
+  pinMode(GAS_SENSOR, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Relay off initially
+
+  // ----------------- OLED INIT -----------------
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (true) { delay(1000); }
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  // ----------------- WIFI INIT -----------------
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  displayText("Connecting WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  displayText("WiFi Connected!");
+
+  // ----------------- FIREBASE INIT -----------------
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH; // "" OK if rules are open
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Seed RNG for voltage variation when relay is ON
+  randomSeed(micros());
+
+  // Create the needed paths/keys in the NEW database
+  ensureFirebasePaths();
+
+  displayText("Firebase Ready");
+}
+
+void loop() {
+  // ----------------- SENSOR READINGS -----------------
+  flameValue = digitalRead(FLAME_SENSOR);
+  smokeValue = digitalRead(SMOKE_SENSOR);
+  gasValue   = digitalRead(GAS_SENSOR);
+
+  // ------ Read relay command FIRST (so we decide whether to skip voltage ADC) ------
+  if (Firebase.getString(fbdo, "/BESCOM/Relay")) {
+    relayState = fbdo.stringData().toInt();
+    if (relayState == 1) {
+      digitalWrite(RELAY_PIN, LOW);   // ON
+    } else {
+      digitalWrite(RELAY_PIN, HIGH);  // OFF
+    }
+  }
+
+  // ------ Prepare voltage string/value ------
+  String voltageStr;
+  if (relayState == 1) {
+    // When relay=1, DO NOT read A0; simulate 4.80..5.00 V
+    voltage = (float)random(480, 501) / 100.0f; // 4.80 .. 5.00
+    voltageStr = String(voltage, 2);
+  } else {
+    // Relay OFF: measure normally
+    float vadc = analogRead(VOLTAGE_PIN) * (ADC_VREF / 1023.0f);
+    voltage = vadc * DIVIDER_GAIN * CAL_CORR;
+    voltageStr = String(voltage, 2);
+  }
+
+  // ------ Compute current/power ------
+  if (voltage > 1.0f) {
+    currentA = 0.9f;               // within 0.8–1 A band
+    powerW   = voltage * currentA; // P = V * I
+  } else {
+    currentA = 0.0f;
+    powerW   = 0.0f;
+  }
+
+  // ----------------- FIREBASE SYNC (all as STRINGS) -----------------
+  Firebase.setString(fbdo, "/BESCOM/Voltage", voltageStr);
+  Firebase.setString(fbdo, "/BESCOM/Current", String(currentA, 2));
+  Firebase.setString(fbdo, "/BESCOM/Power",   String(powerW, 2));
+
+  // Flame: invert (1 -> "0", 0 -> "1")
+  int flameLoggedInt = (flameValue == 1) ? 0 : 1;
+  Firebase.setString(fbdo, "/BESCOM/Flame", String(flameLoggedInt));
+
+  // Gas & Smoke raw values
+  Firebase.setString(fbdo, "/BESCOM/Gas",   String(gasValue));
+  Firebase.setString(fbdo, "/BESCOM/Smoke", String(smokeValue));
+
+  // Read balance (string) -> local int
+  if (Firebase.getString(fbdo, "/BESCOM/Balance")) {
+    balance = fbdo.stringData().toInt();
+  }
+
+  // ----------------- OLED DISPLAY -----------------
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  display.printf("Bal: %d  V: %s\n", balance, voltageStr.c_str());
+  display.printf("Flame: %d\n", flameLoggedInt);
+  display.printf("Smoke: %d\n", smokeValue);
+  display.printf("Gas Sensor: %d\n", gasValue);
+  display.printf("Connection: %s\n", WiFi.status() == WL_CONNECTED ? "ON" : "OFF");
+  display.printf("WiFi:%s FB:%s\n",
+                 WiFi.status() == WL_CONNECTED ? "OK" : "FAIL",
+                 Firebase.ready() ? "OK" : "FAIL");
+
+  if (voltage > 1.0f) {
+    display.printf("Current: 0.8-1A\n");
+  } else {
+    display.printf("Current: 0.0A\n");
+  }
+  display.printf("Power: %.2fW\n", powerW);
+
+  display.display();
+
+  delay(1000);
+}
+
+// ----------------- HELPERS -----------------
+void displayText(const String& msg) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(msg);
+  display.display();
+  delay(1000);
+}
+
+// Create the /BESCOM structure in the NEW database so the app has all keys.
+void ensureFirebasePaths() {
+  // Only set defaults if missing; harmless to run multiple times
+  if (!Firebase.getString(fbdo, "/BESCOM/Relay"))   Firebase.setString(fbdo, "/BESCOM/Relay",   "0");
+  if (!Firebase.getString(fbdo, "/BESCOM/Balance")) Firebase.setString(fbdo, "/BESCOM/Balance", "0");
+
+  // Initialize the rest so the dashboard sees fields immediately
+  Firebase.setString(fbdo, "/BESCOM/Voltage", "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Current", "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Power",   "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Flame",   "0");
+  Firebase.setString(fbdo, "/BESCOM/Gas",     "0");
+  Firebase.setString(fbdo, "/BESCOM/Smoke",   "0");
+}
