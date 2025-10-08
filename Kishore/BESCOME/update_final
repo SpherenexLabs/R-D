@@ -1,0 +1,365 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* ---------- OLED SETTINGS ---------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ---------- SENSOR PINS ---------- */
+#define FLAME_SENSOR D5
+#define SMOKE_SENSOR D6
+#define GAS_SENSOR   D7
+#define RELAY_PIN    D4   // typical active-LOW relay boards: LOW = ON
+#define VOLTAGE_PIN  A0
+
+/* ---------- BUZZER ---------- */
+// If you are using a PASSIVE buzzer (no internal oscillator), uncomment this:
+// #define PASSIVE_BUZZER
+#define BUZZER_PIN D0
+#define BUZZER_ACTIVE_LEVEL HIGH   // set to LOW if your active buzzer is active-LOW
+
+// 5-second alarm window after any Firebase key flips to 1
+const unsigned long ALARM_DURATION_MS = 5000;
+unsigned long alarmUntilMs = 0;
+bool buzzerIsOn = false;  // track last driven state to avoid redundant writes
+
+/* ---------- FIREBASE SETTINGS ---------- */
+#define FIREBASE_HOST "regal-welder-453313-d6-default-rtdb.firebaseio.com"
+// Use Database Secret here if rules require it; leave "" for open rules
+#define FIREBASE_AUTH "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+
+// Path for theft flag in your DB (change if needed)
+#define THEFT_PATH "/BESCOM/Theft/value"
+
+/* ---------- WIFI SETTINGS ---------- */
+#define WIFI_SSID     "BESCOM"
+#define WIFI_PASSWORD "123456789"
+
+/* ---------- ADC SCALE & CAL (when relay is OFF) ---------- */
+#define ADC_VREF     3.20f
+#define DIVIDER_GAIN 1.00f
+#define CAL_CORR     2.01415f
+
+/* ---------- OBJECTS ---------- */
+FirebaseData fbdo;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+/* ---------- VARIABLES ---------- */
+float voltage = 0.0f;
+int balance = 0;
+
+int flameValue = 0;    // raw digital (local sensor)
+int smokeValue = 0;
+int gasValue   = 0;
+
+int relayState = 0;    // value read from Firebase ("1" => ON)
+int flameDet = 0;      // normalized 1=detected, 0=clear (local)
+int smokeDet = 0;
+int gasDet   = 0;
+
+float currentA = 0.0f; // demo current/power
+float powerW   = 0.0f;
+
+/* ---------- ENERGY ACCUMULATOR ---------- */
+double energyWh = 0.0;          // accumulated since boot (Watt-hours)
+unsigned long lastMs = 0;
+
+/* ---------- UPLOAD/REFRESH THROTTLING ---------- */
+const unsigned long UPLOAD_INTERVAL_MS = 900; // ~0.9s
+unsigned long lastUploadMs = 0;
+
+/* ---------- PREV STATE FOR RISING-EDGE DETECTION (Firebase values) ---------- */
+bool prevFlameFB = false;
+bool prevSmokeFB = false;
+bool prevGasFB   = false;
+bool prevTheftFB = false;
+
+/* ---------- PROTOTYPES ---------- */
+void displayText(const String& msg);
+void ensureFirebasePaths();
+void serviceBuzzer();                              // drive buzzer based on alarmUntilMs
+void triggerAlarmWindow();                         // extend alarm window to now+5s
+bool strIsOne(const String &s);                    // helper to interpret "1"/"true"/"HIGH"
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println();
+  Serial.println(F("Booting..."));
+
+  // I2C explicit pins for ESP8266 (SDA=D2, SCL=D1)
+  Wire.begin(D2, D1);
+
+  // Pins
+  pinMode(FLAME_SENSOR, INPUT_PULLUP); // LOW = detected (same as Smoke)
+  pinMode(SMOKE_SENSOR, INPUT);
+  pinMode(GAS_SENSOR,   INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // OFF initially (active-LOW board)
+
+  // Buzzer pin
+  pinMode(BUZZER_PIN, OUTPUT);
+#ifdef PASSIVE_BUZZER
+  noTone(BUZZER_PIN);
+#else
+  digitalWrite(BUZZER_PIN, !BUZZER_ACTIVE_LEVEL); // ensure OFF
+#endif
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed (0x3C). Check wiring."));
+    while (true) delay(1000);
+  }
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print(F("Connecting WiFi "));
+  displayText("Connecting WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print(F("WiFi Connected. IP: "));
+  Serial.println(WiFi.localIP());
+  displayText("WiFi Connected!");
+
+  // Firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH; // "" OK for open rules
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  randomSeed(micros());
+  ensureFirebasePaths();
+  displayText("Firebase Ready");
+  Serial.println(F("Firebase Ready."));
+
+  lastMs = millis();      // start energy timer
+  lastUploadMs = millis();
+}
+
+void loop() {
+  /* ---------- LOCAL SENSOR READINGS (still uploaded like before) ---------- */
+  flameValue = digitalRead(FLAME_SENSOR); // pulled up; LOW when detected
+  smokeValue = digitalRead(SMOKE_SENSOR); // many modules: LOW when detected
+  gasValue   = digitalRead(GAS_SENSOR);
+
+  // Normalize to 1=DETECTED, 0=CLEAR (local)
+  flameDet = (flameValue == LOW) ? 1 : 0;
+  smokeDet = (smokeValue == LOW) ? 1 : 0;
+  gasDet   = (gasValue   == LOW) ? 1 : 0;
+
+  // Always service the buzzer (non-blocking)
+  serviceBuzzer();
+
+  /* ---------- THROTTLED FIREBASE I/O + OLED ---------- */
+  unsigned long now = millis();
+  if (now - lastUploadMs >= UPLOAD_INTERVAL_MS) {
+    lastUploadMs = now;
+
+    /* ---- RELAY CONTROL (read) ---- */
+    if (Firebase.getString(fbdo, "/BESCOM/Relay")) {
+      relayState = fbdo.stringData().toInt();  // "1" -> 1, others -> 0
+    } else {
+      relayState = 0; // default OFF if read fails
+    }
+    digitalWrite(RELAY_PIN, (relayState == 1) ? LOW : HIGH); // active-LOW
+
+    /* ---- VOLTAGE (simulate when ON) ---- */
+    if (relayState == 1) {
+      voltage = (float)random(480, 501) / 100.0f; // 4.80 .. 5.00
+    } else {
+      float vadc = analogRead(VOLTAGE_PIN) * (ADC_VREF / 1023.0f);
+      voltage = vadc * DIVIDER_GAIN * CAL_CORR;
+    }
+    String voltageStr = String(voltage, 2);
+
+    /* ---- DEMO CURRENT/POWER ---- */
+    if (voltage > 1.0f) {
+      currentA = 0.9f;
+      powerW   = voltage * currentA;
+    } else {
+      currentA = 0.0f;
+      powerW   = 0.0f;
+    }
+
+    /* ---- ENERGY ACCUMULATION ---- */
+    unsigned long nowMs = millis();
+    double dt_s = (nowMs - lastMs) / 1000.0;   // seconds since last update
+    lastMs = nowMs;
+    // Wh += (W * seconds) / 3600
+    energyWh += (powerW * dt_s) / 3600.0;
+
+    /* ---- UPLOAD CURRENT READINGS ---- */
+    Firebase.setString(fbdo, "/BESCOM/Voltage",   voltageStr);
+    Firebase.setString(fbdo, "/BESCOM/Current",   String(currentA, 2));
+    Firebase.setString(fbdo, "/BESCOM/Power",     String(powerW, 2));
+    Firebase.setString(fbdo, "/BESCOM/Flame",     String(flameDet));
+    Firebase.setString(fbdo, "/BESCOM/Smoke",     String(smokeDet));
+    Firebase.setString(fbdo, "/BESCOM/Gas",       String(gasDet));
+    Firebase.setString(fbdo, "/BESCOM/EnergyWh",  String(energyWh, 3));
+    Firebase.setString(fbdo, "/BESCOM/EnergyKWh", String(energyWh / 1000.0, 6));
+    // Convenience display string for energy with units
+    String energyDisplay = (energyWh >= 1000.0)
+                             ? String(energyWh / 1000.0, 3) + " kWh"
+                             : String(energyWh, 3) + " Wh";
+    Firebase.setString(fbdo, "/BESCOM/EnergyDisplay", energyDisplay);
+
+    // Balance (optional)
+    if (Firebase.getInt(fbdo, "/BESCOM/Balance")) {
+      balance = fbdo.intData();
+    } else if (Firebase.getString(fbdo, "/BESCOM/Balance")) {
+      balance = fbdo.stringData().toInt();
+    }
+
+    /* ---- READ BACK FROM FIREBASE FOR OLED + BUZZER TRIGGERS ---- */
+    String fbBalance="--", fbVoltage="--", fbCurrent="--", fbPower="--";
+    String fbFlame="0", fbSmoke="0", fbGas="0", fbEnergyWh="--", fbEnergyDisp="--";
+
+    if (Firebase.getString(fbdo, "/BESCOM/Balance"))       fbBalance   = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Voltage"))       fbVoltage   = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Power"))         fbPower     = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Current"))       fbCurrent   = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Flame"))         fbFlame     = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Smoke"))         fbSmoke     = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/Gas"))           fbGas       = fbdo.stringData();
+    if (Firebase.getString(fbdo, "/BESCOM/EnergyDisplay")) fbEnergyDisp= fbdo.stringData();
+    else if (Firebase.getString(fbdo, "/BESCOM/EnergyWh")) fbEnergyWh  = fbdo.stringData(); // fallback
+
+    // Theft/value may be int or string; support both
+    bool theftFB = false;
+    if (Firebase.getInt(fbdo, THEFT_PATH)) {
+      theftFB = (fbdo.intData() != 0);
+    } else if (Firebase.getString(fbdo, THEFT_PATH)) {
+      theftFB = strIsOne(fbdo.stringData());
+    }
+
+    // Convert strings to bools for flame/smoke/gas
+    bool flameFB = strIsOne(fbFlame);
+    bool smokeFB = strIsOne(fbSmoke);
+    bool gasFB   = strIsOne(fbGas);
+
+    // Rising-edge detection: trigger 5s alarm on any 0->1 change
+    if (flameFB && !prevFlameFB) { Serial.println(F("ALARM: Firebase Flame -> 1")); triggerAlarmWindow(); }
+    if (smokeFB && !prevSmokeFB) { Serial.println(F("ALARM: Firebase Smoke -> 1")); triggerAlarmWindow(); }
+    if (gasFB   && !prevGasFB)   { Serial.println(F("ALARM: Firebase Gas -> 1"));   triggerAlarmWindow(); }
+    if (theftFB && !prevTheftFB) { Serial.println(F("ALARM: Firebase Theft/value -> 1")); triggerAlarmWindow(); }
+
+    // Update previous states
+    prevFlameFB = flameFB;
+    prevSmokeFB = smokeFB;
+    prevGasFB   = gasFB;
+    prevTheftFB = theftFB;
+
+    /* ---- OLED (Relay REMOVED; Energy SHOWN) ---- */
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+
+    display.print(F("Balance: ")); display.println(fbBalance);
+
+    // Energy status at top
+    display.print(F("Energy:  ")); 
+    if (fbEnergyDisp != "--") display.println(fbEnergyDisp);
+    else { display.print(fbEnergyWh); display.println(F(" Wh")); }
+
+    display.print(F("Voltage: ")); display.print(fbVoltage); display.println(F(" V"));
+    display.print(F("Power:   ")); display.print(fbPower);   display.println(F(" W"));
+    display.print(F("Current: ")); display.print(fbCurrent); display.println(F(" A"));
+
+    display.print(F("Flame: "));   display.print(fbFlame);
+    display.print(F("  Smoke: ")); display.println(fbSmoke);
+    display.print(F("Gas:    "));  display.println(fbGas);
+    display.print(F("Theft:  "));  display.println(theftFB ? "1" : "0");
+
+    display.display();
+
+    /* ---- SERIAL LOG (kept the same) ---- */
+    String energySerial = energyDisplay; // same conditional string as uploaded
+    Serial.printf(
+      "OLED<=FB | Bal:%s V:%s V P:%s W I:%s A Flame:%s Smoke:%s Gas:%s Theft:%d Energy:%s\n",
+      fbBalance.c_str(),
+      fbVoltage.c_str(), fbPower.c_str(), fbCurrent.c_str(),
+      fbFlame.c_str(), fbSmoke.c_str(), fbGas.c_str(),
+      theftFB ? 1 : 0,
+      energySerial.c_str()
+    );
+  }
+
+  // Small delay to keep loop responsive
+  delay(10);
+}
+
+/* ---------- HELPERS ---------- */
+void displayText(const String& msg) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(msg);
+  display.display();
+  delay(800);
+}
+
+// Initialize keys so the app has them and types are consistent
+void ensureFirebasePaths() {
+  if (!Firebase.getString(fbdo, "/BESCOM/Relay"))     Firebase.setString(fbdo, "/BESCOM/Relay",   "0");
+  if (!Firebase.getString(fbdo, "/BESCOM/Balance"))   Firebase.setString(fbdo, "/BESCOM/Balance", "0");
+
+  Firebase.setString(fbdo, "/BESCOM/Voltage",   "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Current",   "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Power",     "0.00");
+  Firebase.setString(fbdo, "/BESCOM/Flame",     "0");
+  Firebase.setString(fbdo, "/BESCOM/Smoke",     "0");
+  Firebase.setString(fbdo, "/BESCOM/Gas",       "0");
+  Firebase.setString(fbdo, "/BESCOM/EnergyWh",  "0.000");
+  Firebase.setString(fbdo, "/BESCOM/EnergyKWh", "0.000000");
+  Firebase.setString(fbdo, "/BESCOM/EnergyDisplay", "0.000 Wh");
+
+  // Ensure theft path exists
+  if (!Firebase.getInt(fbdo, THEFT_PATH) && !Firebase.getString(fbdo, THEFT_PATH)) {
+    Firebase.setString(fbdo, THEFT_PATH, "0");
+  }
+}
+
+// Interpret common truthy string forms as 1
+bool strIsOne(const String &s) {
+  String t = s; t.trim();
+  if (t == "1") return true;
+  if (t.equalsIgnoreCase("true")) return true;
+  if (t.equalsIgnoreCase("high")) return true;
+  return false;
+}
+
+// Extend alarm window to now + 5s
+void triggerAlarmWindow() {
+  alarmUntilMs = millis() + ALARM_DURATION_MS;
+}
+
+// Drive buzzer according to current alarm window
+void serviceBuzzer() {
+  bool shouldBeOn = (millis() < alarmUntilMs);
+  if (shouldBeOn && !buzzerIsOn) {
+#ifdef PASSIVE_BUZZER
+    tone(BUZZER_PIN, 2000);             // 2 kHz continuous during alarm window
+#else
+    digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_LEVEL);
+#endif
+    buzzerIsOn = true;
+  } else if (!shouldBeOn && buzzerIsOn) {
+#ifdef PASSIVE_BUZZER
+    noTone(BUZZER_PIN);
+#else
+    digitalWrite(BUZZER_PIN, !BUZZER_ACTIVE_LEVEL);
+#endif
+    buzzerIsOn = false;
+  }
+}
