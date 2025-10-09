@@ -1,0 +1,330 @@
+/*
+  ESP8266 + L298N (2 DC motors) + Ultrasonic (debounced) from Firebase RTDB
+  RTDB keys:
+    /Robot_introduction/Direction   -> "F","B","L","R","S"
+    /Robot_introduction/Ultrasonic  -> 1 (blocked) or 0 (clear)
+
+  Motors (unchanged):
+    A_IN1=D1(GPIO5), A_IN2=D2(GPIO4)  -> OUT1/OUT2
+    B_IN1=D5(GPIO14), B_IN2=D6(GPIO12)-> OUT3/OUT4
+    ENA/ENB jumpers ON (USE_ENABLE_PINS=0)
+
+  Ultrasonic (HC-SR04):
+    VCC -> 5V, GND -> GND (common)
+    TRIG -> D0 (GPIO16)
+    ECHO -> D7 (GPIO13) via 5V->3.3V divider (e.g., 10k top, 20k bottom; tap to D7)
+*/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* ===== OPTIONS ===== */
+#define USE_ENABLE_PINS 0
+#define DEFAULT_SPEED   1023
+#define DEADTIME_MS     50
+#define B_POLARITY      0
+#define SWAP_B_PINS     0
+
+/* ===== Wi-Fi ===== */
+#define WIFI_SSID      "robot"
+#define WIFI_PASSWORD  "123456789"
+
+/* ===== Firebase ===== */
+#define API_KEY        "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL   "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL     "spherenexgpt@gmail.com"
+#define USER_PASSWORD  "Spherenex@123"
+#define FB_DIR_PATH    "/Robot_introduction/Direction"
+#define FB_ULTRA_PATH  "/Robot_introduction/Ultrasonic"
+
+/* ===== L298N pins ===== */
+#define A_IN1 D1   // GPIO5
+#define A_IN2 D2   // GPIO4
+#if SWAP_B_PINS
+  #define B_IN1 D6
+  #define B_IN2 D5
+#else
+  #define B_IN1 D5 // GPIO14
+  #define B_IN2 D6 // GPIO12
+#endif
+// EN pins unused because USE_ENABLE_PINS=0
+#define ENA_PIN D3
+#define ENB_PIN D8
+
+/* ===== Ultrasonic pins / params ===== */
+#define ULTRA_TRIG_PIN  D0      // GPIO16 (output)
+#define ULTRA_ECHO_PIN  D7      // GPIO13 (input via divider!)
+#define OBSTACLE_STOP_CM    20
+#define OBSTACLE_RELEASE_CM 25
+#define ULTRA_PERIOD_MS     80
+#define PULSE_TIMEOUT_US    30000UL
+#define NEAR_HITS_REQUIRED  3   // debounce assert
+#define FAR_HITS_REQUIRED   3   // debounce clear
+
+/* ===== Firebase objects ===== */
+FirebaseData fbdo, stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* ===== State ===== */
+bool obstacle = false;                 // debounced obstacle state
+unsigned long lastUltraMs = 0;
+uint8_t nearCount = 0, farCount = 0;
+
+char lastNonStopDir = 'S';             // last F/B/L/R seen from Firebase
+char prevDirBeforeStop = 'S';          // snapshot of Direction before we forced "S"
+
+/* ===== Motor helpers ===== */
+inline void brakeAll() {
+  digitalWrite(A_IN1, LOW); digitalWrite(A_IN2, LOW);
+  digitalWrite(B_IN1, LOW); digitalWrite(B_IN2, LOW);
+}
+void setEnablePins(uint16_t a, uint16_t b) {
+#if USE_ENABLE_PINS
+  analogWrite(ENA_PIN, a);
+  analogWrite(ENB_PIN, b);
+#else
+  (void)a; (void)b;
+#endif
+}
+void safeDrive(uint8_t a1, uint8_t a2, uint8_t b1, uint8_t b2) {
+  brakeAll();
+  delay(DEADTIME_MS);
+  digitalWrite(A_IN1, a1); digitalWrite(A_IN2, a2);
+  digitalWrite(B_IN1, b1); digitalWrite(B_IN2, b2);
+}
+void moveForward() {
+  uint8_t bF1 = (B_POLARITY==0) ? HIGH : LOW;
+  uint8_t bF2 = (B_POLARITY==0) ? LOW  : HIGH;
+  setEnablePins(DEFAULT_SPEED, DEFAULT_SPEED);
+  safeDrive(HIGH, LOW, bF1, bF2);
+  Serial.println("[MOVE] Forward");
+}
+void moveBackward() {
+  uint8_t bB1 = (B_POLARITY==0) ? LOW  : HIGH;
+  uint8_t bB2 = (B_POLARITY==0) ? HIGH : LOW;
+  setEnablePins(DEFAULT_SPEED, DEFAULT_SPEED);
+  safeDrive(LOW, HIGH, bB1, bB2);
+  Serial.println("[MOVE] Backward");
+}
+void turnLeft() {
+  // A backward, B forward
+  uint8_t bF1 = (B_POLARITY==0) ? HIGH : LOW;
+  uint8_t bF2 = (B_POLARITY==0) ? LOW  : HIGH;
+  setEnablePins(DEFAULT_SPEED, DEFAULT_SPEED);
+  safeDrive(LOW, HIGH, bF1, bF2);
+  Serial.println("[MOVE] Left");
+}
+void turnRight() {
+  // A forward, B backward
+  uint8_t bB1 = (B_POLARITY==0) ? LOW  : HIGH;
+  uint8_t bB2 = (B_POLARITY==0) ? HIGH : LOW;
+  setEnablePins(DEFAULT_SPEED, DEFAULT_SPEED);
+  safeDrive(HIGH, LOW, bB1, bB2);
+  Serial.println("[MOVE] Right");
+}
+void stopNow() { brakeAll(); setEnablePins(0,0); Serial.println("[MOVE] Stop"); }
+
+void apply(char c, bool fromStream=false) {
+  c = toupper(c);
+
+  // Remember last non-stop cmd that came from Firebase
+  if (fromStream && (c=='F'||c=='B'||c=='L'||c=='R')) lastNonStopDir = c;
+
+  // Only stop when obstacle active OR command is 'S'
+  if (obstacle) {
+    stopNow();
+    return;
+  }
+
+  switch (c) {
+    case 'F': moveForward();  break;
+    case 'B': moveBackward(); break;
+    case 'L': turnLeft();     break;
+    case 'R': turnRight();    break;
+    default : stopNow();      break;   // 'S' or anything else
+  }
+}
+
+/* ===== Ultrasonic ===== */
+long readUltrasonicCM() {
+  digitalWrite(ULTRA_TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(ULTRA_TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+
+  unsigned long dur = pulseIn(ULTRA_ECHO_PIN, HIGH, PULSE_TIMEOUT_US);
+  if (dur == 0) return 999;           // timeout -> far
+  long cm = (long)(dur / 29.1 / 2.0);
+  return cm;
+}
+void publishUltrasonic(int v) {
+  static int lastPub = -1;
+  if (v == lastPub) return;
+  if (!Firebase.RTDB.setInt(&fbdo, FB_ULTRA_PATH, v))
+    Serial.printf("[RTDB] Ultrasonic publish failed: %s\n", fbdo.errorReason().c_str());
+  else {
+    Serial.printf("[RTDB] Ultrasonic=%d\n", v);
+    lastPub = v;
+  }
+}
+bool getDirectionFromDB(char &out) {
+  String dir;
+  if (Firebase.RTDB.getString(&fbdo, FB_DIR_PATH, &dir) && dir.length()) {
+    out = toupper(dir[0]);
+    return true;
+  }
+  return false;
+}
+void setDirectionInDB(char c) {
+  String s; s += c;
+  if (!Firebase.RTDB.setString(&fbdo, FB_DIR_PATH, s))
+    Serial.printf("[RTDB] Set Direction failed: %s\n", fbdo.errorReason().c_str());
+  else
+    Serial.printf("[RTDB] Direction=\"%c\"\n", c);
+}
+
+void checkUltrasonicAndAct() {
+  unsigned long now = millis();
+  if (now - lastUltraMs < ULTRA_PERIOD_MS) return;
+  lastUltraMs = now;
+
+  long cm = readUltrasonicCM();
+  bool near = (cm <= OBSTACLE_STOP_CM);
+  bool far  = (cm >= OBSTACLE_RELEASE_CM);
+
+  if (near) nearCount++; else nearCount = 0;
+  if (far)  farCount++;  else farCount  = 0;
+
+  // Assert obstacle after consecutive near hits
+  if (!obstacle && nearCount >= NEAR_HITS_REQUIRED) {
+    obstacle = true;
+    publishUltrasonic(1);
+
+    // Snapshot current Direction BEFORE forcing 'S'
+    char currentDbDir='S';
+    if (getDirectionFromDB(currentDbDir) && (currentDbDir=='F'||currentDbDir=='B'||currentDbDir=='L'||currentDbDir=='R'))
+      prevDirBeforeStop = currentDbDir;
+    else
+      prevDirBeforeStop = lastNonStopDir; // fallback to last seen non-S
+
+    stopNow();
+    setDirectionInDB('S');        // reflect emergency stop in DB
+    Serial.println("[ULTRA] BLOCKED");
+  }
+
+  // Clear obstacle after consecutive far hits
+  if (obstacle && farCount >= FAR_HITS_REQUIRED) {
+    obstacle = false;
+    publishUltrasonic(0);
+    Serial.println("[ULTRA] CLEAR");
+
+    // If DB was left at 'S', restore the command we had before stopping.
+    char dbDir='S';
+    if (getDirectionFromDB(dbDir)) {
+      if (dbDir=='S') {
+        // restore previous command (if valid)
+        if (prevDirBeforeStop=='F'||prevDirBeforeStop=='B'||prevDirBeforeStop=='L'||prevDirBeforeStop=='R') {
+          setDirectionInDB(prevDirBeforeStop);
+          apply(prevDirBeforeStop);
+        } else if (lastNonStopDir!='S') {
+          setDirectionInDB(lastNonStopDir);
+          apply(lastNonStopDir);
+        } else {
+          apply('S');
+        }
+      } else {
+        // user/app already changed it while blocked -> honor it
+        apply(dbDir);
+      }
+    } else {
+      // DB read failed -> at least try our last known intent
+      if (prevDirBeforeStop=='F'||prevDirBeforeStop=='B'||prevDirBeforeStop=='L'||prevDirBeforeStop=='R')
+        apply(prevDirBeforeStop);
+      else if (lastNonStopDir!='S')
+        apply(lastNonStopDir);
+      else
+        apply('S');
+    }
+  }
+}
+
+/* ===== Firebase callbacks ===== */
+void streamCallback(FirebaseStream data) {
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_string) {
+    String s = data.stringData(); s.trim();
+    if (s.length()) apply(s[0], true);
+  } else if (data.dataTypeEnum() == fb_esp_rtdb_data_type_integer) {
+    apply((char)data.intData(), true);
+  }
+}
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) Serial.println("[Stream] timeout, resuming...");
+}
+
+/* ===== Setup / Loop ===== */
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nBooting...");
+
+  // Motors
+  pinMode(A_IN1, OUTPUT); pinMode(A_IN2, OUTPUT);
+  pinMode(B_IN1, OUTPUT); pinMode(B_IN2, OUTPUT);
+  brakeAll();
+
+  // Ultrasonic
+  pinMode(ULTRA_TRIG_PIN, OUTPUT);
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+  pinMode(ULTRA_ECHO_PIN, INPUT); // (through divider!)
+
+#if USE_ENABLE_PINS
+  pinMode(ENA_PIN, OUTPUT);
+  pinMode(ENB_PIN, OUTPUT);
+  analogWriteRange(1023);
+  analogWrite(ENA_PIN, 0);
+  analogWrite(ENB_PIN, 0);
+#endif
+
+  // Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  Serial.printf(" connected, IP=%s\n", WiFi.localIP().toString().c_str());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Ensure keys exist
+  bool exists = false;
+  if (Firebase.RTDB.get(&fbdo, FB_DIR_PATH)) exists = fbdo.dataTypeEnum() != fb_esp_rtdb_data_type_null;
+  if (!exists) Firebase.RTDB.setString(&fbdo, FB_DIR_PATH, "S");
+  Firebase.RTDB.setInt(&fbdo, FB_ULTRA_PATH, 0);
+
+  // Apply current Direction
+  char d='S';
+  if (getDirectionFromDB(d)) apply(d, true); else apply('S');
+
+  // Stream Direction
+  if (!Firebase.RTDB.beginStream(&stream, FB_DIR_PATH))
+    Serial.printf("Stream begin error: %s\n", stream.errorReason().c_str());
+  Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+}
+
+void loop() {
+  if (Firebase.ready()) {
+    if (!Firebase.RTDB.readStream(&stream))
+      Serial.printf("[Stream] read error: %s\n", stream.errorReason().c_str());
+  }
+
+  checkUltrasonicAndAct();  // debounced safety
+
+  yield(); // keep the watchdog happy
+}
