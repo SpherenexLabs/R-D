@@ -1,0 +1,74 @@
+ROBOT EYES BLINKING WITHOUT MUX CHANNEL
+----------------------------------------------------------------------------
+-----------------------------------------------------------------------------
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR1 0x3C   // left
+#define OLED_ADDR2 0x3D   // right
+
+Adafruit_SSD1306 display1(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display2(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const int eye_center_x = 64, eye_center_y = 32;
+const int eye_width = 100, eye_height = 56, iris_size = 16;
+
+void drawEllipse(Adafruit_SSD1306 &d, int x0, int y0, int a, int b, uint16_t color){
+  for (int16_t t = 0; t < 360; t += 2){
+    float ang = t * 3.1415926f / 180.0f;
+    int16_t x = x0 + a * cos(ang), y = y0 + b * sin(ang);
+    if (x>=0 && x<SCREEN_WIDTH && y>=0 && y<SCREEN_HEIGHT) d.drawPixel(x, y, color);
+  }
+}
+
+void drawEye(Adafruit_SSD1306 &d, int blink_level){
+  d.clearDisplay();
+  drawEllipse(d, eye_center_x, eye_center_y, eye_width/2, eye_height/2, SSD1306_WHITE);
+  if (blink_level == 0){
+    d.fillCircle(eye_center_x, eye_center_y, iris_size, SSD1306_WHITE);
+    d.fillCircle(eye_center_x, eye_center_y, iris_size/2, SSD1306_BLACK);
+    d.fillCircle(eye_center_x - 5, eye_center_y - 5, 2, SSD1306_WHITE);
+  } else if (blink_level == 1){
+    d.fillRect(eye_center_x - eye_width/2, eye_center_y, eye_width, eye_height/2, SSD1306_BLACK);
+    d.fillCircle(eye_center_x, eye_center_y, iris_size, SSD1306_WHITE);
+    d.fillCircle(eye_center_x, eye_center_y, iris_size/2, SSD1306_BLACK);
+    d.fillCircle(eye_center_x - 5, eye_center_y - 3, 2, SSD1306_WHITE);
+  } else {
+    d.drawLine(eye_center_x - eye_width/2, eye_center_y, eye_center_x + eye_width/2, eye_center_y, SSD1306_WHITE);
+  }
+  d.display();
+}
+
+void blinkBothEyes(){
+  // open
+  drawEye(display1, 0); drawEye(display2, 0); delay(200);
+  // half
+  drawEye(display1, 1); drawEye(display2, 1); delay(120);
+  // closed
+  drawEye(display1, 2); drawEye(display2, 2); delay(100);
+  // half
+  drawEye(display1, 1); drawEye(display2, 1); delay(120);
+  // open
+  drawEye(display1, 0); drawEye(display2, 0); delay(200);
+}
+
+void setup(){
+  Serial.begin(115200);
+  Wire.begin(4,5); // SDA=D2, SCL=D1
+
+  if (!display1.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR1)) { Serial.println("OLED #1 fail"); while(1); }
+  if (!display2.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR2)) { Serial.println("OLED #2 fail"); while(1); }
+
+  display1.clearDisplay(); display1.display();
+  display2.clearDisplay(); display2.display();
+}
+
+void loop(){
+  blinkBothEyes();
+  delay(random(1000, 2500));
+}
