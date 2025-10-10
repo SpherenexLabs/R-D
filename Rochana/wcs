@@ -1,1 +1,109 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Servo.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ====== Wi-Fi ======
+#define WIFI_SSID     "wcs"
+#define WIFI_PASSWORD "123456789"
+
+// ====== Firebase ======
+#define API_KEY       "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL  "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ====== DB root ======
+#define FB_ROOT "/dynamic-wireless-car-charging"
+
+// ====== Servo config ======
+#define SERVO_PIN   D2          // NodeMCU D2 = GPIO4
+#define OPEN_ANGLE  180          // paymentCompleted == "1"
+#define CLOSE_ANGLE 0           // paymentCompleted == "0"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Servo
+Servo gate;
+
+// cache last seen state to avoid redundant writes
+String lastPayment = "__unset__";
+
+void wifiConnect() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi:");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.print(" connected, IP=");
+  Serial.println(WiFi.localIP());
+}
+
+void firebaseInit() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectNetwork(true);
+  fbdo.setResponseSize(4096);
+  Firebase.begin(&config, &auth);
+}
+
+void applyServo(const String& payment) {
+  if (payment == "1") {
+    gate.write(OPEN_ANGLE);
+    Serial.println("paymentCompleted=1 -> Servo 90° (OPEN)");
+  } else {
+    gate.write(CLOSE_ANGLE);
+    Serial.println("paymentCompleted=0 -> Servo 0° (CLOSE)");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\n== Payment->Servo controller ==");
+
+  // Servo attach first so it has a defined PWM on boot
+  gate.attach(SERVO_PIN);      // uses default 50 Hz, 544–2400 µs
+  gate.write(CLOSE_ANGLE);     // safe default
+
+  wifiConnect();
+  firebaseInit();
+
+  // Initialize from current DB value (if present)
+  const String payPath = String(FB_ROOT) + "/paymentCompleted";
+  if (Firebase.RTDB.getString(&fbdo, payPath)) {
+    lastPayment = fbdo.stringData();
+    applyServo(lastPayment);
+  } else {
+    Serial.print("Init read error: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void loop() {
+  const String payPath = String(FB_ROOT) + "/paymentCompleted";
+
+  if (Firebase.RTDB.getString(&fbdo, payPath)) {
+    String value = fbdo.stringData();  // expects "0" or "1" (string type)
+    if (value != lastPayment) {        // only act on change
+      lastPayment = value;
+      applyServo(value);
+    }
+  } else {
+    Serial.print("Read error: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  delay(1000);  // poll every 1 s
+  yield();
+}
 
