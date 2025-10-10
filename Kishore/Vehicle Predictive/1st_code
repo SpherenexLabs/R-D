@@ -1,0 +1,157 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+/* ---- Pins & Types ---- */
+#define DHTPIN 2
+#define DHTTYPE DHT11
+#define FSR_PIN A0   // FSR divider junction
+
+/* ---- OLED ---- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C   // try 0x3D if your module uses that address
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ---- DHT ---- */
+DHT dht(DHTPIN, DHTTYPE);
+
+/* ---- Timing ---- */
+const unsigned long DHT_PERIOD_MS = 2000;
+unsigned long lastDhtMs = 0;
+
+/* ---- ADC & FSR mapping ---- */
+const float VREF = 5.0;          // Uno analog reference
+const int   ADC_MAX = 1023;
+const float R_FIXED = 10000.0;   // 10 kΩ pull-down at A0
+
+// Rough resistance bounds for mapping to "force %"
+const float R_NO_TOUCH = 1e6;    // ~1 MΩ (very light/no touch)
+const float R_HARD     = 1000.0; // ~1 kΩ (firm press)
+
+// Smoothing (EMA) for force %
+const float FORCE_ALPHA = 0.25f;
+float forcePctEMA = NAN;
+
+/* ---- Cached DHT values ---- */
+float lastH = NAN, lastT = NAN, lastHIC = NAN;
+
+/* ---- Helpers ---- */
+float adcToVolts(int adc) { return (adc * VREF) / ADC_MAX; }
+
+/* Convert FSR divider voltage to an approximate 0–100 % "force" */
+float fsrForcePercent(float v) {
+  if (v <= 0.001f) return 0.0f;                    // avoid div/0
+  float rfsr = (VREF - v) * R_FIXED / v;           // from divider math
+  // Clamp to expected range
+  if (rfsr < R_HARD)     rfsr = R_HARD;
+  if (rfsr > R_NO_TOUCH) rfsr = R_NO_TOUCH;
+  // Log mapping gives better feel at low forces
+  float pct = 100.0f * (log(R_NO_TOUCH) - log(rfsr)) / (log(R_NO_TOUCH) - log(R_HARD));
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+void drawError() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("DHT11 + OLED"));
+  display.setCursor(0, 20);
+  display.println(F("Read error!"));
+  display.println(F("Check DATA on D2"));
+  display.display();
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    // Display not found—continue headless
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("DHT11 + OLED + FSR"));
+  display.display();
+
+  delay(200);
+}
+
+void loop() {
+  // ----- FSR read & smooth -----
+  int   adc   = analogRead(FSR_PIN);
+  float volts = adcToVolts(adc);
+  float forcePct = fsrForcePercent(volts);
+  if (isnan(forcePctEMA)) forcePctEMA = forcePct;
+  else forcePctEMA = FORCE_ALPHA * forcePct + (1.0f - FORCE_ALPHA) * forcePctEMA;
+
+  // ----- DHT every 2s -----
+  unsigned long now = millis();
+  if (now - lastDhtMs >= DHT_PERIOD_MS) {
+    lastDhtMs = now;
+    float h = dht.readHumidity();
+    float t = dht.readTemperature(); // °C
+    if (isnan(h) || isnan(t)) {
+      Serial.println(F("⚠️ Failed to read DHT11"));
+      drawError();
+    } else {
+      lastH = h;
+      lastT = t;
+      lastHIC = dht.computeHeatIndex(t, h, false);
+
+      // Serial log
+      Serial.print(F("T="));  Serial.print(lastT, 1);  Serial.print(F("C  "));
+      Serial.print(F("H="));  Serial.print(lastH, 0);  Serial.print(F("%  "));
+      Serial.print(F("HI=")); Serial.print(lastHIC, 1);Serial.print(F("C  "));
+      Serial.print(F("Force=")); Serial.print(forcePctEMA, 0); Serial.println(F("%"));
+    }
+  }
+
+  // ----- OLED view -----
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println(F("Vehicle Proto "));
+
+  display.setCursor(0, 12);
+  display.print(F("Temp : "));
+  if (isnan(lastT)) display.print(F("--.-"));
+  else display.print(lastT, 1);
+  display.println(F(" C"));
+
+  display.setCursor(0, 24);
+  display.print(F("Hum  : "));
+  if (isnan(lastH)) display.print(F("--"));
+  else display.print(lastH, 0);
+  display.println(F(" %"));
+
+  display.setCursor(0, 36);
+  display.print(F("Heat : "));
+  if (isnan(lastHIC)) display.print(F("--.-"));
+  else display.print(lastHIC, 1);
+  display.println(F(" C"));
+
+  display.setCursor(0, 48);
+  display.print(F("Pressure: "));
+  if (isnan(forcePctEMA)) display.print(F("--"));
+  else display.print(forcePctEMA, 0);
+  display.println(F(" %"));
+
+  // Simple bar for force
+  int barX = 0, barY = 58, barW = 127, barH = 6;
+  int fillW = (int)(barW * (isnan(forcePctEMA) ? 0.0f : (forcePctEMA / 100.0f)));
+  display.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+  if (fillW > 0) display.fillRect(barX+1, barY+1, max(0, fillW-2), barH-2, SSD1306_WHITE);
+
+  display.display();
+
+  delay(30); // small pace
+}
