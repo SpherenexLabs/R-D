@@ -1,0 +1,161 @@
+/* file: relay_dht_mux_oled.ino
+   Function: Temperature-based Fan/Pump control with voltage/current sensing & OLED display
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// ---------------- Pin Definitions ----------------
+#define RELAY_FAN D0
+#define RELAY_PUMP D3
+#define DHTPIN D4
+#define DHTTYPE DHT11
+
+// MUX CD74HC4067 pins
+#define MUX_S0 D5
+#define MUX_S1 D6
+#define MUX_S2 D7
+#define MUX_S3 D8
+
+#define ANALOG_PIN A0
+
+// OLED pins (D1=SDA, D2=SCL) default Wire
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------------- Constants ----------------
+DHT dht(DHTPIN, DHTTYPE);
+
+const float VOLTAGE_DIVIDER_RATIO = 11.0;  // Adjust for your divider
+const float ADC_REFERENCE = 3.3;           // ESP8266 ADC reference
+const float MAX_VOLTAGE = 12.6;            // Full battery voltage (example)
+const float MIN_VOLTAGE = 9.6;             // Empty battery voltage
+
+// Simulated current sensor scaling (if ACS712, adjust)
+const float CURRENT_SENSOR_SCALE = 1.0;    // A/V scaling factor (adjust experimentally)
+float current = 0, voltage = 0, power = 0, soc = 0;
+
+// ---------------- MUX Helper ----------------
+void selectMUXChannel(uint8_t channel) {
+  digitalWrite(MUX_S0, channel & 0x01);
+  digitalWrite(MUX_S1, (channel >> 1) & 0x01);
+  digitalWrite(MUX_S2, (channel >> 2) & 0x01);
+  digitalWrite(MUX_S3, (channel >> 3) & 0x01);
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_FAN, OUTPUT);
+  pinMode(RELAY_PUMP, OUTPUT);
+  digitalWrite(RELAY_FAN, LOW);
+  digitalWrite(RELAY_PUMP, LOW);
+
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  dht.begin();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("System Initializing...");
+  display.display();
+  delay(1500);
+}
+
+// ---------------- Read Voltage ----------------
+float readVoltage() {
+  selectMUXChannel(0); // Assume MUX ch0 = Voltage sensor
+  delay(2);
+  int raw = analogRead(ANALOG_PIN);
+  float measured = (raw / 1024.0) * ADC_REFERENCE * VOLTAGE_DIVIDER_RATIO;
+  return measured;
+}
+
+// ---------------- Read Current ----------------
+float readCurrent() {
+  selectMUXChannel(1); // Assume MUX ch1 = Current sensor
+  delay(2);
+  int raw = analogRead(ANALOG_PIN);
+  float voltageAtSensor = (raw / 1024.0) * ADC_REFERENCE;
+  float currentMeasured = (voltageAtSensor - 2.5) * CURRENT_SENSOR_SCALE; // adjust mid-point
+  return fabs(currentMeasured);
+}
+
+// ---------------- Compute SOC ----------------
+float computeSOC(float v) {
+  if (v >= MAX_VOLTAGE) return 100.0;
+  if (v <= MIN_VOLTAGE) return 0.0;
+  return (v - MIN_VOLTAGE) * 100.0 / (MAX_VOLTAGE - MIN_VOLTAGE);
+}
+
+// ---------------- Display Data ----------------
+void showOLED(float soc, float v, float i, float t, float h) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+
+  display.print("Temp: "); display.print(t); display.println(" C");
+  display.print("Hum : "); display.print(h); display.println(" %");
+  display.println("-----------------");
+  display.print("V : "); display.print(v, 2); display.println(" V");
+  display.print("I : "); display.print(i, 2); display.println(" A");
+  display.print("P : "); display.print(v * i, 2); display.println(" W");
+  display.print("SOC: "); display.print(soc, 1); display.println(" %");
+
+  display.display();
+}
+
+// ---------------- Main Loop ----------------
+void loop() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("DHT read error");
+    delay(1000);
+    return;
+  }
+
+  // Control logic
+  if (temperature <= 25.0) {
+    digitalWrite(RELAY_FAN, HIGH);   // Fan ON
+    digitalWrite(RELAY_PUMP, LOW);   // Pump OFF
+  } else {
+    digitalWrite(RELAY_FAN, LOW);
+    digitalWrite(RELAY_PUMP, HIGH);  // Pump ON
+  }
+
+  // Read sensors
+  voltage = readVoltage();
+  current = readCurrent();
+  power = voltage * current;
+  soc = computeSOC(voltage);
+
+  // Print to Serial
+  Serial.print("Temp: "); Serial.print(temperature);
+  Serial.print("C | Hum: "); Serial.print(humidity);
+  Serial.print("% | V: "); Serial.print(voltage);
+  Serial.print("V | I: "); Serial.print(current);
+  Serial.print("A | P: "); Serial.print(power);
+  Serial.print("W | SoC: "); Serial.print(soc);
+  Serial.println("%");
+
+  // Update OLED
+  showOLED(soc, voltage, current, temperature, humidity);
+
+  delay(2000);
+}
+
