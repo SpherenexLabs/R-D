@@ -1,0 +1,321 @@
+/*********************************************************
+ * ESP8266 Wearable -> Firebase RTDB (robust + WDT-safe)
+ *
+ * - Writes to: /20_KS5265_Gesture/1_Sensor_Data/
+ *     1_HR, 2_SPO2, 3_BP, 4_T, 5_H, 6_Angle
+ *   (no fall flag; removed)
+ *   Defaults (when not measured): HR=72, SPO2=90, BP="120/80"
+ *
+ * - OLED shows only Message & Reply, updated via Firebase
+ *   STREAM callbacks (no polling, instant, low-CPU).
+ *
+ * - WDT safety:
+ *   * Throttled Firebase writes (5 s)
+ *   * Check WiFi before writes
+ *   * Short OLED refresh interval with minimal drawing
+ *   * yield() sprinkled in long sections
+ *   * TLS buffers & HTTP timeouts tuned
+ *********************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MPU6050.h>
+#include <DHT.h>
+
+// ------ OPTIONAL: Pulse oximeter (comment out to disable) ------
+#define USE_MAX3010X 1
+#if USE_MAX3010X
+  #include <MAX30105.h>
+  #include "spo2_algorithm.h"
+#endif
+
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>   // Mobizt library (install from Library Manager)
+
+// ---------------- Wi-Fi ----------------
+#define WIFI_SSID     "gesture"
+#define WIFI_PASSWORD "123456789"
+
+// -------------- Firebase ---------------
+#define API_KEY       "AIzaSyD0_pLGXMh3fSPRjSEcaqSXxff42Udj8sM"
+#define DATABASE_URL  "https://self-balancing-7a9fe-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ------------ RTDB paths ---------------
+#define FB_ROOT       "/20_KS5265_Gesture"
+#define FB_MSG        FB_ROOT "/Message"
+#define FB_REP        FB_ROOT "/Reply"
+#define FB_SENSORS    FB_ROOT "/1_Sensor_Data"
+#define FB_1_HR       FB_SENSORS "/1_HR"
+#define FB_2_SPO2     FB_SENSORS "/2_SPO2"
+#define FB_3_BP       FB_SENSORS "/3_BP"
+#define FB_4_T        FB_SENSORS "/4_T"
+#define FB_5_H        FB_SENSORS "/5_H"
+#define FB_6_ANGLE    FB_SENSORS "/6_Angle"
+
+// ---------------- OLED -----------------
+#define OLED_ADDR 0x3C
+#define OLED_SDA  D2
+#define OLED_SCL  D1
+#define OLED_RST  -1
+#define OLED_W    128
+#define OLED_H    64
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RST);
+
+// ---------------- DHT11 ----------------
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// --------------- MPU6050 ---------------
+Adafruit_MPU6050 mpu;
+bool mpu_ok = false;
+const float G = 9.80665f;
+
+// --------- MAX3010x (optional) --------
+#if USE_MAX3010X
+MAX30105 mx;
+bool mx_ok = false;
+#define BUF_LEN 100
+static uint32_t irBuf[BUF_LEN], redBuf[BUF_LEN];
+static int bufPos = 0;
+int32_t spo2_alg = 0, heart_alg = 0;
+int8_t  spo2_valid = 0, hr_valid = 0;
+float   hr_ema = NAN, spo2_ema = NAN;
+bool    finger_ok = false;
+const uint32_t FINGER_DC_MIN = 22000;
+const uint32_t FINGER_AC_MIN = 3500;
+const float    HR_EMA_A   = 0.25f;
+const float    SPO2_EMA_A = 0.20f;
+#endif
+
+// --------------- Firebase --------------
+FirebaseData    fb;        // for writes/reads
+FirebaseData    fbStream;  // for stream (Message/Reply)
+FirebaseAuth    auth;
+FirebaseConfig  fcfg;
+
+// ---------------- Timers ---------------
+uint32_t t_disp = 0, t_algo = 0, t_push = 0, t_diag = 0;
+const uint32_t DISP_MS  = 800;   // OLED refresh
+const uint32_t ALGO_MS  = 1000;  // oximeter aggregation
+const uint32_t PUSH_MS  = 5000;  // write every 5 s
+const uint32_t DIAG_MS  = 10000; // serial diag
+
+// -------------- Globals ----------------
+String lastMsg = "";
+String lastRep = "";
+volatile bool oledDirty = true;  // set by stream to force redraw
+
+// ---------- Helpers ----------
+inline bool  validf(float x){ return !isnan(x) && isfinite(x); }
+inline float ema(float prev, float sample, float a){ return validf(prev) ? (a*sample + (1-a)*prev) : sample; }
+
+static void wifiBegin(){
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && (millis()-t0)<15000){ delay(250); yield(); }
+}
+
+static void drawOLED(){
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setCursor(0, 0);
+  oled.print("Message:");
+  oled.setCursor(0, 12);
+  if (lastMsg.length()) oled.print(lastMsg); else oled.print("--");
+
+  oled.setCursor(0, 34);
+  oled.print("Reply:");
+  oled.setCursor(0, 46);
+  if (lastRep.length()) oled.print(lastRep); else oled.print("--");
+
+  oled.display();
+}
+
+// ----- Firebase Stream callbacks (Message/Reply → OLED immediately) -----
+void streamCallback(FirebaseStream data){
+  // Path will be like: /Message or /Reply (because we stream the root)
+  String path = data.dataPath();
+  if (path == "/Message") {
+    lastMsg = data.stringData();
+    oledDirty = true;
+  } else if (path == "/Reply") {
+    lastRep = data.stringData();
+    oledDirty = true;
+  }
+  yield();
+}
+void streamTimeoutCallback(bool timeout){
+  // Just in case: mark OLED dirty to keep user aware
+  if (timeout) oledDirty = true;
+}
+
+// ---------------- Setup -----------------
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+
+  wifiBegin();
+
+  // OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  if(!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){ Serial.println(F("SSD1306 fail")); for(;;) { delay(1000); } }
+  oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0,0); oled.println("Wearable init..."); oled.display();
+
+  dht.begin();
+
+  // IMU
+  mpu_ok = mpu.begin();
+  if(mpu_ok){
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
+  }
+
+  // MAX3010x (optional)
+#if USE_MAX3010X
+  mx_ok = mx.begin(Wire, 400000);
+  if(mx_ok){
+    mx.setup(60,4,2,100,411,4096);
+    mx.setPulseAmplitudeIR(0x7F);
+    mx.setPulseAmplitudeRed(0x2F);
+  }
+#endif
+
+  // Firebase config (timeouts + buffers reduce stalls)
+  fcfg.api_key = API_KEY;
+  fcfg.database_url = DATABASE_URL;
+  fcfg.signer.tokens.legacy_token = "";     // not used
+  fcfg.timeout.serverResponse = 10000;      // 10s response timeout
+  fcfg.token_status_callback = nullptr;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&fcfg, &auth);
+  Firebase.reconnectWiFi(true);
+  fb.setBSSLBufferSize(4096, 1024);     // enlarge TLS buffers
+  fb.setResponseSize(1024);
+
+  // Start stream on the ROOT so both Message & Reply arrive
+  if (Firebase.beginStream(fbStream, FB_ROOT)) {
+    Firebase.setStreamCallback(fbStream, streamCallback, streamTimeoutCallback);
+  } else {
+    Serial.printf("Stream begin failed: %s\n", fbStream.errorReason().c_str());
+  }
+
+  oledDirty = true;
+}
+
+// ---------------- Loop ------------------
+void loop(){
+  const uint32_t now = millis();
+
+  // ----- OPTIONAL: Oximeter pipeline -----
+#if USE_MAX3010X
+  if(mx_ok){
+    mx.check();
+    while(mx.available()){
+      redBuf[bufPos]=mx.getFIFORed();
+      irBuf[bufPos] =mx.getFIFOIR();
+      bufPos=(bufPos+1)%BUF_LEN;
+      mx.nextSample();
+    }
+    if(now - t_algo >= ALGO_MS){
+      uint32_t irTmp[BUF_LEN], redTmp[BUF_LEN];
+      for(int i=0;i<BUF_LEN;i++){ int idx=(bufPos+i)%BUF_LEN; irTmp[i]=irBuf[idx]; redTmp[i]=redBuf[idx]; }
+      uint32_t dc=0, pp=0;
+      // very quick stats; do not block
+      uint64_t sum=0; uint32_t mn=UINT32_MAX, mxv=0;
+      for(int i=0;i<BUF_LEN;i++){ uint32_t v=irTmp[i]; sum+=v; if(v<mn) mn=v; if(v>mxv) mxv=v; }
+      dc=(uint32_t)(sum/(uint64_t)BUF_LEN); pp=(mxv>mn)?(mxv-mn):0;
+
+      finger_ok = (dc>=FINGER_DC_MIN) && (pp>=FINGER_AC_MIN);
+
+      maxim_heart_rate_and_oxygen_saturation(irTmp, BUF_LEN, redTmp,
+                                             &spo2_alg,&spo2_valid,&heart_alg,&hr_valid);
+
+      if(finger_ok && hr_valid && heart_alg>0)  hr_ema   = ema(hr_ema,   (float)heart_alg, HR_EMA_A);
+      else                                      hr_ema   = NAN;
+      if(finger_ok && spo2_valid && spo2_alg>0) spo2_ema = ema(spo2_ema,(float)spo2_alg, SPO2_EMA_A);
+      else                                      spo2_ema = NAN;
+
+      t_algo = now;
+      yield();
+    }
+  }
+#endif
+
+  // ----- Sensors (quick) -----
+  float hum = dht.readHumidity();
+  float tC  = dht.readTemperature();
+
+  float ang = NAN;
+  if(mpu_ok){
+    sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+    float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
+    float pitch = atan2f(ax, sqrtf(ay*ay+az*az))*180.0f/PI;
+    float roll  = atan2f(ay, az)*180.0f/PI;
+    ang = max(fabsf(pitch), fabsf(roll));
+  }
+
+  // ----- Derived vitals + defaults -----
+#if USE_MAX3010X
+  int hr_out   = (validf(hr_ema)   ? (int)(hr_ema + 0.5f)   : 72);   // default 72
+  int spo2_out = (validf(spo2_ema) ? (int)(spo2_ema + 0.5f) : 90);   // default 90
+#else
+  int hr_out   = 72;
+  int spo2_out = 90;
+#endif
+  String bp = "120/80";   // default string always
+
+  // ----- OLED (only Message/Reply; redrawn when dirty or periodic) -----
+  if (oledDirty || (now - t_disp >= DISP_MS)) {
+    drawOLED();
+    oledDirty = false;
+    t_disp = now;
+  }
+
+  // ----- Throttled Firebase writes -----
+  if (now - t_push >= PUSH_MS) {
+    t_push = now;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Each write is brief; add yields
+      Firebase.setInt(fb, FB_1_HR,   hr_out);   yield();
+      Firebase.setInt(fb, FB_2_SPO2, spo2_out); yield();
+      Firebase.setString(fb, FB_3_BP, bp);      yield();
+
+      if (validf(tC))  Firebase.setFloat(fb, FB_4_T, tC);
+      else             Firebase.setString(fb, FB_4_T, "");  yield();
+
+      if (validf(hum)) Firebase.setFloat(fb, FB_5_H, hum);
+      else             Firebase.setString(fb, FB_5_H, "");  yield();
+
+      if (validf(ang)) Firebase.setFloat(fb, FB_6_ANGLE, ang);
+      else             Firebase.setString(fb, FB_6_ANGLE, ""); yield();
+    }
+  }
+
+  // ----- Occasional diagnostics -----
+  if (now - t_diag >= DIAG_MS){
+    t_diag = now;
+    Serial.printf("WiFi:%d  RSSI:%d  heap:%u  hr:%d spo2:%d\n",
+                  WiFi.status(), WiFi.RSSI(), ESP.getFreeHeap(),
+                  hr_out, spo2_out);
+  }
+
+  yield();  // keep WDT happy
+}
