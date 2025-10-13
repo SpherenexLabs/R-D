@@ -1,0 +1,70 @@
+//soil+ph sensor
+const int S0_PIN = D4; // GPIO2
+const int S1_PIN = D3; // GPIO0
+const int S2_PIN = D2; // GPIO4
+const int ANALOG_PIN = A0;
+
+// Define the sensor channels on the multiplexer
+const int PH_SENSOR_CHANNEL = 0; // Connected to Y0
+const int SOIL_MOISTURE_CHANNEL = 1; // Connected to Y1
+
+// pH sensor calibration values (adjust these after calibration)
+float pH_calibration_value = 21.34;
+float pH7_voltage = 1.5; // Example voltage at pH 7
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set the multiplexer control pins as outputs
+  pinMode(S0_PIN, OUTPUT);
+  pinMode(S1_PIN, OUTPUT);
+  pinMode(S2_PIN, OUTPUT);
+}
+
+void loop() {
+  // Read pH sensor value
+  float phValue = readSensor(PH_SENSOR_CHANNEL);
+  float voltage = phValue * (3.3 / 1024.0); // Convert to voltage
+  float pH = -5.70 * voltage + pH_calibration_value; // pH formula from DFRobot documentation
+  Serial.print("pH Value: ");
+  Serial.println(pH, 2);
+
+  // Read soil moisture sensor value
+  int moistureValue = readSensor(SOIL_MOISTURE_CHANNEL);
+  int moisturePercentage = map(moistureValue, 0, 1023, 100, 0); // Calibrate for your sensor
+  Serial.print("Soil Moisture: ");
+  Serial.print(moisturePercentage);
+  Serial.println("%");
+
+  Serial.println();
+  delay(5000); // Read sensors every 5 seconds
+}
+
+// Function to read a specific sensor channel from the multiplexer
+int readSensor(int channel) {
+  // Select the channel using the select pins
+  digitalWrite(S0_PIN, bitRead(channel, 0));
+  digitalWrite(S1_PIN, bitRead(channel, 1));
+  digitalWrite(S2_PIN, bitRead(channel, 2));
+
+  delay(10); // Give the multiplexer time to switch
+
+  // Read the analog value
+  int sensorValue = analogRead(ANALOG_PIN);
+
+  return sensorValue;
+}*/
+const int soilSensorPin = A0; // The ESP8266's analog input pin
+
+void setup() {
+  Serial.begin(115200);
+}
+
+void loop() {
+  int rawValue = analogRead(soilSensorPin);
+  Serial.print("Raw Sensor Value: ");
+  Serial.println(rawValue);
+  delay(1000); // Read the sensor every second
+}
+
+
