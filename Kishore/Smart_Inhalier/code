@@ -1,0 +1,391 @@
+/*
+  ESP8266 — Smart Inhaler + MAX30102 HR/SpO2 + Firebase RTDB + HC-05 + Button + Relay
+  Realtime + Full Telemetry Uploads
+
+  Behavior:
+    • First sound spike (>=5 in ~1s) -> Relay ON for 10 s, start 25 s refractory (no new triggers).
+    • During refractory: uploaded SoundCount grows only in steps (1..3).
+    • After 10 s, relay auto-OFF.
+    • Gas & Strength depend ONLY on relay state:
+        - relay ON  -> Gas: 70..100, Strength: 7..10 (random each sample)
+        - relay OFF -> Gas: 0..49,  Strength: 0..5  (random each sample)
+    • HR_BPM: RANDOM 70..100, updated once every 50 seconds.
+    • Button → edge-driven:
+        - On each physical press (HIGH→LOW after debounce): 
+            * Serial prints "1" once
+            * Firebase /Smart_inhaler/Button is set to 1 immediately
+            * After 5 seconds, Firebase Button auto-resets to 0 (even if still held)
+        - No serial print on release; no continuous streaming; only one "1" per press.
+*/
+
+#include <Arduino.h>
+#include <DHT.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <MAX30105.h>
+
+// ===== WiFi =====
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase =====
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+const char* FB_ROOT        = "/Smart_inhaler";
+const char* FB_BUTTON_PATH = "/Smart_inhaler/Button";
+
+// ===== Pins =====
+#define PIN_BUTTON   D0     // GPIO16 (active-LOW)
+#define RELAY_PIN    D3     // GPIO0  (active-LOW module)
+#define PIN_SOUND_DO D5     // GPIO14
+#define PIN_DHT_DATA D4     // GPIO2
+#define PIN_MQ_AO    A0
+#define BT_RX_PIN    D6     // GPIO12 (ESP RX  <- HC-05 TX)
+#define BT_TX_PIN    D7     // GPIO13 (ESP TX  -> HC-05 RX via divider)
+SoftwareSerial bt(BT_RX_PIN, BT_TX_PIN);
+
+// ===== Relay =====
+const bool     RELAY_ACTIVE_LOW = true;
+bool           relayOn = false;
+uint32_t       relayOffAt = 0;
+const uint32_t RELAY_ON_MS = 10000;
+
+// ===== DHT =====
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT_DATA, DHTTYPE);
+
+// ===== MAX30102 (we initialize robustly; HR is randomized per request) =====
+MAX30105 particleSensor;
+const byte I2C_SDA = D2; // GPIO4
+const byte I2C_SCL = D1; // GPIO5
+bool maxReady = false;
+
+// ===== Random HR every 50 seconds =====
+const uint32_t HR_FAKE_PERIOD_MS = 50000;
+int            fakeHR            = 90;
+uint32_t       lastHRFakeMs      = 0;
+
+// ===== Mic ISR counting (RAW) =====
+volatile unsigned long rawSoundCount = 0;
+volatile uint32_t      lastSoundMs = 0;
+const    uint32_t      SOUND_DEBOUNCE_MS = 50;
+
+ICACHE_RAM_ATTR void soundISR() {
+  uint32_t now = millis();
+  if (now - lastSoundMs < SOUND_DEBOUNCE_MS) return;
+  lastSoundMs = now;
+  if (digitalRead(PIN_SOUND_DO) == HIGH) rawSoundCount++;
+}
+
+// ===== Published SoundCount & spike detection =====
+unsigned long pubSoundCount = 0;
+unsigned long lastRawSeen   = 0;
+
+const uint8_t  SOUND_SPIKE_THRESHOLD = 5;      // >=5 within window
+const uint32_t SOUND_WINDOW_MS       = 1000;   // ~1s
+uint32_t       soundWindowStartMs    = 0;
+unsigned long  soundBaselineRaw      = 0;
+
+// Refractory (block retriggers; throttle pub count)
+const uint32_t REFRACTORY_MS               = 25000; // 25s
+const uint8_t  MAX_STEP_DURING_REFRACTORY  = 3;     // 1..3
+uint32_t       refractoryUntil             = 0;
+
+// ===== Gas/Strength derived from relay state =====
+int gasPercent = 0;  // 0..100
+int strength   = 0;  // 0..10
+
+// ===== Timing =====
+uint32_t lastDHTms      = 0;
+const    uint32_t DHT_READ_PERIOD_MS = 500;
+
+uint32_t lastSample     = 0;
+const    uint32_t SAMPLE_MS = 50;
+
+uint32_t lastPushMs     = 0;
+const    uint32_t PUSH_PERIOD_MS = 200;
+
+uint32_t lastBtMsgMs    = 0;
+const    uint32_t BT_MSG_PERIOD_MS = 500;
+
+// ===== Button debounce + "auto reset to 0 after 5s" logic =====
+const    uint32_t BUTTON_DEBOUNCE_MS = 30;   // require 30 ms stable
+bool     btnStableLevel = HIGH;              // HIGH=released
+bool     btnLastRead    = HIGH;
+uint32_t btnLastChangeMs = 0;
+
+uint32_t fbBtnAutoResetAt = 0;              // when to auto-write 0 to Firebase (0 = idle)
+
+// ===== Helpers =====
+static inline void ensureWiFiFast() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+static inline void fbSetButton(int val) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  Firebase.RTDB.setInt(&fbdo, FB_BUTTON_PATH, val);
+}
+static inline void relayWrite(bool on) {
+  relayOn = on;
+  int lvl = RELAY_ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, lvl);
+}
+
+// ===== Firebase update =====
+void writeToFirebase(unsigned long sCount, int gasPercent, int strength, float tempC, float humidity,
+                     int hr_bpm, int relayState) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  FirebaseJson json;
+  json.set("SoundCount", (double)sCount);
+  json.set("Gas", gasPercent);
+  json.set("Strength", strength);
+  json.set("Temp", tempC);
+  json.set("Humidity", humidity);
+  json.set("HR_BPM", hr_bpm);
+  json.set("Relay", relayState);
+  Firebase.RTDB.updateNode(&fbdo, FB_ROOT, &json);
+}
+
+// ===== Sensors =====
+float lastTemp = NAN, lastHum = NAN;
+void readDHT() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (!isnan(h)) lastHum = h;
+  if (!isnan(t)) lastTemp = t;
+}
+
+// Robust MAX30102 bring-up (multiple attempts & speeds)
+bool initMAX30102() {
+  bool ok = false;
+
+  // Try #1: 100 kHz, auto address
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  delay(10);
+  ok = particleSensor.begin(Wire); // auto-detect address (SparkFun lib supports this)
+  if (ok) {
+    particleSensor.setup(90, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x10);
+    particleSensor.setPulseAmplitudeIR(0xC8);
+    particleSensor.clearFIFO();
+    return true;
+  }
+
+  // Try #2: 100 kHz, explicit 0x57
+  delay(10);
+  ok = particleSensor.begin(Wire, 0x57, I2C_SPEED_STANDARD);
+  if (ok) {
+    particleSensor.setup(90, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x10);
+    particleSensor.setPulseAmplitudeIR(0xC8);
+    particleSensor.clearFIFO();
+    return true;
+  }
+
+  // Try #3: 400 kHz, explicit 0x57
+  Wire.setClock(400000);
+  delay(10);
+  ok = particleSensor.begin(Wire, 0x57, I2C_SPEED_FAST);
+  if (ok) {
+    particleSensor.setup(90, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x10);
+    particleSensor.setPulseAmplitudeIR(0xC8);
+    particleSensor.clearFIFO();
+    return true;
+  }
+
+  return false; // still not detected → likely wiring/power issue
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(921600);
+  delay(50);
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.reconnectNetwork(true);
+  Firebase.begin(&config, &auth);
+
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(RELAY_PIN, OUTPUT);
+  relayWrite(false);
+
+  pinMode(PIN_SOUND_DO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_SOUND_DO), soundISR, CHANGE);
+
+  dht.begin();
+  bt.begin(9600);
+
+  maxReady = initMAX30102();
+  Serial.println(maxReady ? "MAX30102: OK" : "MAX30102: FAIL");
+
+  // Initialize button debounce tracking
+  btnStableLevel = digitalRead(PIN_BUTTON);
+  btnLastRead    = btnStableLevel;
+  btnLastChangeMs = millis();
+
+  // On boot: write 0 (idle) to Firebase so it's clean
+  fbSetButton(0);
+
+  // Sound windows init
+  soundWindowStartMs = millis();
+  noInterrupts(); lastRawSeen = rawSoundCount; soundBaselineRaw = rawSoundCount; interrupts();
+  pubSoundCount = lastRawSeen;
+
+  // RNG seed
+  randomSeed(micros());
+  fakeHR = random(70, 101);
+  lastHRFakeMs = millis();
+}
+
+// ===== Loop =====
+void loop() {
+  uint32_t now = millis();
+
+  // -------- BUTTON: debounce, edge-triggered press, auto-reset after 5s --------
+  bool raw = digitalRead(PIN_BUTTON);           // LOW when pressed
+  if (raw != btnLastRead) {
+    btnLastRead = raw;
+    btnLastChangeMs = now;                      // state changed; start debounce timer
+  }
+  if ((now - btnLastChangeMs) >= BUTTON_DEBOUNCE_MS) {
+    // state has been stable long enough
+    if (btnStableLevel != btnLastRead) {
+      // stable edge detected
+      bool prevStable = btnStableLevel;
+      btnStableLevel = btnLastRead;
+
+      // We care only about HIGH->LOW (press)
+      if (prevStable == HIGH && btnStableLevel == LOW) {
+        // PRESS event
+        Serial.println("1");        // print once per press
+        fbSetButton(1);             // set Firebase to 1 now
+        fbBtnAutoResetAt = now + 5000; // schedule auto reset to 0 after 5s
+      }
+      // Release edge: do nothing (Firebase will reset via timer)
+    }
+  }
+
+  // When timer fires, set Firebase Button back to 0 (only once)
+  if (fbBtnAutoResetAt != 0 && (long)(now - fbBtnAutoResetAt) >= 0) {
+    fbSetButton(0);
+    fbBtnAutoResetAt = 0;
+  }
+
+  // -------- DHT --------
+  if (now - lastDHTms >= DHT_READ_PERIOD_MS) { lastDHTms = now; readDHT(); }
+
+  // -------- SOUND: spike detect + refractory throttle --------
+  noInterrupts(); unsigned long rawNow = rawSoundCount; interrupts();
+
+  if (now >= refractoryUntil) {
+    unsigned long spikeDelta = rawNow - soundBaselineRaw;
+
+    if (spikeDelta >= SOUND_SPIKE_THRESHOLD && (now - soundWindowStartMs) <= SOUND_WINDOW_MS) {
+      relayWrite(true);
+      relayOffAt = now + RELAY_ON_MS;
+
+      refractoryUntil = now + REFRACTORY_MS;
+
+      soundWindowStartMs = now;
+      soundBaselineRaw   = rawNow;
+    }
+
+    if ((now - soundWindowStartMs) > SOUND_WINDOW_MS) {
+      soundWindowStartMs = now;
+      soundBaselineRaw   = rawNow;
+    }
+  } else {
+    if ((now - soundWindowStartMs) > SOUND_WINDOW_MS) {
+      soundWindowStartMs = now;
+      soundBaselineRaw   = rawNow;
+    }
+  }
+
+  unsigned long rawDeltaSinceLastSeen = rawNow - lastRawSeen;
+  if (rawDeltaSinceLastSeen > 0) {
+    if (now < refractoryUntil) {
+      uint8_t step = (rawDeltaSinceLastSeen >= 3) ? (uint8_t)random(1, 4)
+                                                  : (uint8_t)rawDeltaSinceLastSeen; // 1..3 or 1..2
+      if (step > MAX_STEP_DURING_REFRACTORY) step = MAX_STEP_DURING_REFRACTORY;
+      pubSoundCount += step;
+    } else {
+      pubSoundCount += rawDeltaSinceLastSeen;
+    }
+    lastRawSeen = rawNow;
+  }
+
+  // -------- AUTO-OFF RELAY --------
+  if (relayOn && (long)(now - relayOffAt) >= 0) {
+    relayWrite(false);
+  }
+
+  // -------- GAS & STRENGTH derived from RELAY state --------
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+    if (relayOn) {
+      gasPercent = random(70, 101);  // 70..100
+      strength   = random(7, 11);    // 7..10
+    } else {
+      gasPercent = random(0, 50);    // 0..49
+      strength   = random(0, 6);     // 0..5
+    }
+  }
+
+  // -------- HR_BPM RANDOM every 50 seconds --------
+  if ((now - lastHRFakeMs) >= HR_FAKE_PERIOD_MS) {
+    fakeHR = random(70, 101);
+    lastHRFakeMs = now;
+  }
+
+  // -------- FIREBASE PUSH --------
+  if (now - lastPushMs >= PUSH_PERIOD_MS) {
+    lastPushMs = now;
+
+    int hrToSend = fakeHR;
+
+    float t = isnan(lastTemp) ? -99.0f : lastTemp;
+    float h = isnan(lastHum)  ? -1.0f  : lastHum;
+
+    writeToFirebase(pubSoundCount, gasPercent, strength, t, h, hrToSend, relayOn ? 1 : 0);
+
+    if (now - lastBtMsgMs >= BT_MSG_PERIOD_MS) {
+      lastBtMsgMs = now;
+      String line = String("BTN_EVT=") + ((btnStableLevel == LOW) ? 1 : 0) +  // current physical level (LOW=pressed)
+                    ",SCnt=" + String(pubSoundCount) +
+                    ",Gas="  + String(gasPercent) +
+                    ",Str="  + String(strength) +
+                    ",T="    + String(t,1) +
+                    ",H="    + String(h,1) +
+                    ",HR="   + String(hrToSend) +
+                    ",R="    + String(relayOn ? 1 : 0);
+      bt.print(line); bt.print("\r\n");
+    }
+  }
+
+  ensureWiFiFast();
+  yield();
+}
+
