@@ -1,0 +1,350 @@
+/*
+  ESP8266 Water Quality Monitor -> Firebase RTDB
+  Writes ALL fields directly under: /Water_Quality
+  (No /live child, no _created flag)
+
+  Hardware:
+    ESP8266 D5->S0, D6->S1, D7->S2, D8->S3  (CD74HC4067)
+    ESP8266 A0<- COM  (use divider if sensors/MUX at 5V and ADC=1.0V)
+    DHT11 DATA -> D3
+    CD74HC4067 EN -> GND, VCC->3.3V/5V (match sensors), GND->GND
+    Sensors AO -> X0(TDS), X1(pH), X2(Turbidity), X3(Water level)
+*/
+
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <DHT.h>
+
+// ===== WiFi credentials =====
+#define WIFI_SSID "smart"
+#define WIFI_PASSWORD "123456789"
+
+// ===== Firebase credentials =====
+#define API_KEY "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+// ===== Email/Password Authentication (Firebase user, not Gmail!) =====
+#define USER_EMAIL "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===== DHT11 =====
+#define DHT_PIN  D3
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ===== CD74HC4067 MUX select pins =====
+#define MUX_S0 D5
+#define MUX_S1 D6
+#define MUX_S2 D7
+#define MUX_S3 D8
+
+// ===== Channel assignments =====
+#define TDS_CHANNEL        0
+#define PH_CHANNEL         1
+#define TURBIDITY_CHANNEL  2
+#define WATER_CHANNEL      3
+
+#ifndef ADC_MAX_COUNTS
+#define ADC_MAX_COUNTS 1023
+#endif
+
+// ===== Calibration (adjust to your sensors) =====
+#define PH_RAW_MIN       0
+#define PH_RAW_MAX       1023
+#define PH_REAL_MIN      0.0
+#define PH_REAL_MAX      14.0
+
+#define TDS_RAW_MIN      0
+#define TDS_RAW_MAX      1023
+#define TDS_REAL_MIN     0.0
+#define TDS_REAL_MAX     1000.0   // ppm
+
+#define TURB_RAW_MIN     0
+#define TURB_RAW_MAX     1023
+#define TURB_REAL_MIN    0.0
+#define TURB_REAL_MAX    100.0    // NTU
+
+#define WL_RAW_MIN       0
+#define WL_RAW_MAX       1023
+#define WL_REAL_MIN      0.0
+#define WL_REAL_MAX      100.0    // %
+
+#define SAMPLE_COUNT     5
+
+// ===== Globals =====
+int   rawTDS       = 0;
+int   rawPH        = 0;
+int   rawTurbidity = 0;
+int   rawWaterLvl  = 0;
+float temperature  = 0.0;
+float humidity     = 0.0;
+
+String g_idToken;
+unsigned long g_tokenTs = 0;
+const unsigned long TOKEN_TTL_MS = 50UL * 60UL * 1000UL; // ~50 min
+
+// ===== Helpers =====
+static inline void muxSelect(uint8_t ch) {
+  digitalWrite(MUX_S0, (ch & 0x01) ? HIGH : LOW);
+  digitalWrite(MUX_S1, (ch & 0x02) ? HIGH : LOW);
+  digitalWrite(MUX_S2, (ch & 0x04) ? HIGH : LOW);
+  digitalWrite(MUX_S3, (ch & 0x08) ? HIGH : LOW);
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+int getAnalog(uint8_t channel) {
+  int sum = 0;
+  for (int i = 0; i < SAMPLE_COUNT; i++) {
+    muxSelect(channel);
+    delayMicroseconds(80);
+    sum += analogRead(A0);
+    delay(10);
+  }
+  return sum / SAMPLE_COUNT;
+}
+
+float convertPH(int raw)         { return mapFloat(raw, PH_RAW_MIN,   PH_RAW_MAX,   PH_REAL_MIN,   PH_REAL_MAX); }
+float convertTDS(int raw)        { return mapFloat(raw, TDS_RAW_MIN,  TDS_RAW_MAX,  TDS_REAL_MIN,  TDS_REAL_MAX); }
+float convertTurbidity(int raw)  { return mapFloat(raw, TURB_RAW_MIN, TURB_RAW_MAX, TURB_REAL_MIN, TURB_REAL_MAX); }
+float convertWaterLevel(int raw) { return mapFloat(raw, WL_RAW_MIN,   WL_RAW_MAX,   WL_REAL_MIN,   WL_REAL_MAX); }
+
+// ===== Minimal JSON helpers =====
+String jsonEscape(const String& s) {
+  String out; out.reserve(s.length()+8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if      (c == '\\') out += "\\\\";
+    else if (c == '"')  out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+  return out;
+}
+
+String extractJsonString(const String& body, const String& key) {
+  String pat = "\"" + key + "\":\"";
+  int i = body.indexOf(pat);
+  if (i >= 0) {
+    i += pat.length();
+    int j = body.indexOf('\"', i);
+    if (j > i) return body.substring(i, j);
+  }
+  pat = "\"" + key + "\":";
+  i = body.indexOf(pat);
+  if (i >= 0) {
+    i += pat.length();
+    int j = body.indexOf('\n', i);
+    if (j < 0) j = body.length();
+    String val = body.substring(i, j);
+    val.trim();
+    if (val.endsWith(",")) val.remove(val.length()-1);
+    if (val.startsWith("\"") && val.endsWith("\"") && val.length() >= 2) {
+      val = val.substring(1, val.length()-1);
+    }
+    return val;
+  }
+  return "";
+}
+
+// ===== Basic HTTP parsing =====
+bool parseHttpResponse(WiFiClientSecure &c, int &statusOut, String &bodyOut, uint32_t hdrTimeoutMs=8000) {
+  statusOut = -1; bodyOut = "";
+  unsigned long tmo = millis() + hdrTimeoutMs;
+
+  // Status line
+  String statusLine = c.readStringUntil('\n'); statusLine.trim();
+  if (statusLine.startsWith("HTTP/1.1 ")) {
+    int sp2 = statusLine.indexOf(' ', 9);
+    if (sp2 > 9) statusOut = statusLine.substring(9, sp2).toInt();
+  }
+
+  // Headers
+  while (c.connected() && millis() < tmo) {
+    String line = c.readStringUntil('\n');
+    if (line == "\r" || line.length() == 1) break;
+  }
+
+  // Body
+  while (c.available()) bodyOut += c.readString();
+  return true;
+}
+
+// ===== HTTPS helpers (out-params for status/body) =====
+bool httpsPOST(const char* host, const String& path, const String& payload, int &statusOut, String &bodyOut) {
+  WiFiClientSecure c; c.setInsecure();
+  if (!c.connect(host, 443)) { statusOut = -1; bodyOut = "connect failed"; return false; }
+  String req;
+  req  = "POST " + path + " HTTP/1.1\r\n";
+  req += "Host: " + String(host) + "\r\n";
+  req += "User-Agent: ESP8266-FB/1.0\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Connection: close\r\n";
+  req += "Content-Length: " + String(payload.length()) + "\r\n\r\n";
+  req += payload;
+  c.print(req);
+  parseHttpResponse(c, statusOut, bodyOut);
+  c.stop();
+  return true;
+}
+
+bool httpsPATCH(const char* host, const String& path, const String& payload, int &statusOut, String &bodyOut) {
+  WiFiClientSecure c; c.setInsecure();
+  if (!c.connect(host, 443)) { statusOut = -1; bodyOut = "connect failed"; return false; }
+  String req;
+  req  = "PATCH " + path + " HTTP/1.1\r\n";
+  req += "Host: " + String(host) + "\r\n";
+  req += "User-Agent: ESP8266-FB/1.0\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Connection: close\r\n";
+  req += "Content-Length: " + String(payload.length()) + "\r\n\r\n";
+  req += payload;
+  c.print(req);
+  parseHttpResponse(c, statusOut, bodyOut);
+  c.stop();
+  return true;
+}
+
+String rtdbHostFromUrl(const char* dbUrl) {
+  String url(dbUrl);
+  url.replace("https://", "");
+  url.replace("http://", "");
+  int slash = url.indexOf('/');
+  if (slash > 0) url = url.substring(0, slash);
+  return url;
+}
+
+// ===== Firebase Auth =====
+bool firebaseSignIn(String& idTokenOut) {
+  const char* host = "identitytoolkit.googleapis.com";
+  String path = "/v1/accounts:signInWithPassword?key=" + String(API_KEY);
+  String payload = String("{\"email\":\"") + jsonEscape(USER_EMAIL) +
+                   "\",\"password\":\"" + jsonEscape(USER_PASSWORD) +
+                   "\",\"returnSecureToken\":true}";
+
+  int status; String body;
+  httpsPOST(host, path, payload, status, body);
+  Serial.printf("Auth HTTP %d\n", status);
+
+  String idTok = extractJsonString(body, "idToken");
+  if (idTok.length() == 0) {
+    Serial.println("Auth failed: idToken not found.");
+    Serial.println(body);
+    return false;
+  }
+  idTokenOut = idTok;
+  g_tokenTs = millis();
+  Serial.println("Auth OK, token cached.");
+  return true;
+}
+
+bool ensureIdToken() {
+  if (g_idToken.length() == 0) return firebaseSignIn(g_idToken);
+  if (millis() - g_tokenTs > TOKEN_TTL_MS) {
+    Serial.println("Token stale; re-auth...");
+    g_idToken = "";
+    return firebaseSignIn(g_idToken);
+  }
+  return true;
+}
+
+// ===== Write ALL data directly under /Water_Quality =====
+bool fbPatchRoot(float tds, float ph, float turb, float lvl, float temp, float hum) {
+  if (!ensureIdToken()) return false;
+  String host = rtdbHostFromUrl(DATABASE_URL);
+  String path = "/Water_Quality.json?auth=" + g_idToken;   // root node
+
+  String payload = "{";
+  payload += "\"timestamp_ms\":" + String(millis()) + ",";
+  payload += "\"tds_ppm\":" + String(tds, 2) + ",";
+  payload += "\"ph\":" + String(ph, 2) + ",";
+  payload += "\"turb_ntu\":" + String(turb, 2) + ",";
+  payload += "\"water_level_pct\":" + String(lvl, 2) + ",";
+  payload += "\"temp_c\":" + String(temp, 2) + ",";
+  payload += "\"humidity_pct\":" + String(hum, 2);
+  payload += "}";
+
+  int status; String body;
+  httpsPATCH(host.c_str(), path, payload, status, body);
+  Serial.printf("fbPatchRoot HTTP %d\n", status);
+  if (status != 200) Serial.println(body);
+  return status == 200;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== Water Quality -> Firebase RTDB (/Water_Quality root) ===");
+
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  dht.begin();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  uint8_t cnt = 0;
+  while (WiFi.status() != WL_CONNECTED && cnt++ < 20) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wi-Fi connected: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed. Check credentials.");
+  }
+
+  // Initial auth
+  if (!ensureIdToken()) {
+    Serial.println("Initial Firebase auth failed. Will retry in loop.");
+  }
+}
+
+void loop() {
+  // Keep Wi-Fi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Reconnecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    delay(5000);
+  }
+
+  // Read raw via MUX
+  rawTDS       = getAnalog(TDS_CHANNEL);
+  rawPH        = getAnalog(PH_CHANNEL);
+  rawTurbidity = getAnalog(TURBIDITY_CHANNEL);
+  rawWaterLvl  = getAnalog(WATER_CHANNEL);
+
+  // DHT
+  temperature  = dht.readTemperature();
+  humidity     = dht.readHumidity();
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from DHT sensor!");
+    temperature = 0.0;
+    humidity    = 0.0;
+  }
+
+  // Convert
+  float tdsVal  = convertTDS(rawTDS);
+  float phVal   = convertPH(rawPH);
+  float turbVal = convertTurbidity(rawTurbidity);
+  float lvlVal  = convertWaterLevel(rawWaterLvl);
+
+  // Debug
+  Serial.println("\n=== Converted ===");
+  Serial.printf("pH=%.2f  TDS=%.1f ppm  NTU=%.1f  Level=%.1f%%  T=%.1fC  H=%.1f%%\n",
+                phVal, tdsVal, turbVal, lvlVal, temperature, humidity);
+
+  // Push snapshot directly to /Water_Quality
+  if (WiFi.status() == WL_CONNECTED) {
+    fbPatchRoot(tdsVal, phVal, turbVal, lvlVal, temperature, humidity);
+  }
+
+  delay(1000); // ~10 s
+}
