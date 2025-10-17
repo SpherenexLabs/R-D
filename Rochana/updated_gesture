@@ -1,0 +1,364 @@
+/*********************************************************
+ * ESP8266 Wearable -> Firebase RTDB (Streams + MAX30102)
+ * - Streams: /Message, /Reply (tiny payloads → RAM safe)
+ * - Sensors active: MAX30102 (HR/SpO2), DHT11 (T/H),
+ *   optional MPU6050 (Angle)
+ * - Writes every 7 s to:
+ *   /20_KS5265_Gesture/1_Sensor_Data/{1_HR,2_SPO2,3_BP,4_T,5_H,6_Angle}
+ * Notes:
+ *  • MAX30102 wiring: 3V3, GND, SDA=D2, SCL=D1. No level shifter.
+ *  • If your MAX30102 doesn’t light, raise LED current (BRIGHT).
+ *  • BP from PPG alone is not medically reliable. Default = "120/80".
+ *********************************************************/
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// ------- Oximeter -------
+#include <MAX30105.h>          // works for MAX30102
+#include "spo2_algorithm.h"
+
+// ------- (Optional) IMU -------
+#define USE_MPU 1
+#if USE_MPU
+  #include <Adafruit_Sensor.h>
+  #include <Adafruit_MPU6050.h>
+  Adafruit_MPU6050 mpu;
+  bool mpu_ok = false;
+#endif
+
+/* ---------- User config ---------- */
+#define WIFI_SSID     "bms"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyD0_pLGXMh3fSPRjSEcaqSXxff42Udj8sM"
+#define DATABASE_URL  "https://self-balancing-7a9fe-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+/* ---------- Paths ---------- */
+#define FB_ROOT       "/20_KS5265_Gesture"
+#define FB_MSG        FB_ROOT "/Message"
+#define FB_REP        FB_ROOT "/Reply"
+#define FB_SENSORS    FB_ROOT "/1_Sensor_Data"
+#define FB_1_HR       FB_SENSORS "/1_HR"
+#define FB_2_SPO2     FB_SENSORS "/2_SPO2"
+#define FB_3_BP       FB_SENSORS "/3_BP"
+#define FB_4_T        FB_SENSORS "/4_T"
+#define FB_5_H        FB_SENSORS "/5_H"
+#define FB_6_ANGLE    FB_SENSORS "/6_Angle"
+
+/* ---------- OLED ---------- */
+#define OLED_ADDR 0x3C
+#define OLED_SDA  D2
+#define OLED_SCL  D1
+#define OLED_RST  -1
+Adafruit_SSD1306 oled(128, 64, &Wire, OLED_RST);
+
+/* ---------- DHT ---------- */
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/* ---------- Firebase client ---------- */
+FirebaseAuth    auth;
+FirebaseConfig  fcfg;
+FirebaseData    fbWrite;     // writes
+FirebaseData    fbMsg;       // stream for /Message
+FirebaseData    fbRep;       // stream for /Reply
+
+/* ---------- MAX30102 ---------- */
+MAX30105 mx;
+bool mx_ok = false;
+
+// Keep buffers SMALL to save RAM; 100 samples (1s at 100 Hz)
+#define BUF_LEN 100
+static uint32_t irBuf[BUF_LEN], redBuf[BUF_LEN];
+static int bufPos = 0;
+
+// EMA smoothing for stable readings
+static float hr_ema   = NAN;
+static float spo2_ema = NAN;
+#define HR_EMA_A      0.25f
+#define SPO2_EMA_A    0.20f
+
+// Basic finger detection thresholds (tune if needed)
+#define FINGER_DC_MIN 20000UL
+#define FINGER_AC_MIN 2500UL
+
+/* ---------- BP model (optional & NOT medical) ---------- */
+#define BP_FAKE_MODEL 0   // 0=use "120/80"; 1=rough estimate, labeled
+static String makeBP(int hr, int spo2){
+  #if BP_FAKE_MODEL
+    // ultra-coarse illustrative only
+    int sys = 118 + (hr - 70)/8 - (spo2 < 95 ? 2 : 0);
+    int dia = 78  + (hr - 70)/12 - (spo2 < 95 ? 2 : 0);
+    if (sys < 95) sys = 95; if (dia < 60) dia = 60;
+    if (sys > 140) sys = 140; if (dia > 95) dia = 95;
+    return String(sys) + "/" + String(dia) + " est";
+  #else
+    (void)hr; (void)spo2;
+    return String("120/80");
+  #endif
+}
+
+/* ---------- Timers ---------- */
+uint32_t t_disp=0, t_push=0, t_diag=0, t_stream=0, t_algo=0;
+const uint32_t DISP_MS   = 800;
+const uint32_t PUSH_MS   = 7000;
+const uint32_t DIAG_MS   = 15000;
+const uint32_t STREAM_MS = 7000;
+const uint32_t ALGO_MS   = 250;     // run HR/SpO2 calc ~4 Hz over the rolling 1 s window
+
+/* ---------- State ---------- */
+String lastMsg, lastRep;
+bool oledDirty = true;
+
+static inline bool validf(float x){ return !isnan(x) && isfinite(x); }
+
+static void wifiBegin(){
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setOutputPower(20.5f); // stronger TX → better RSSI
+  uint32_t t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && (millis()-t0)<20000){ delay(250); yield(); }
+}
+
+static void drawOLED(){
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setCursor(0, 0);  oled.print(F("Message:"));
+  oled.setCursor(0,12);  oled.print(lastMsg.length() ? lastMsg.c_str() : "--");
+
+  oled.setCursor(0,34);  oled.print(F("Reply:"));
+  oled.setCursor(0,46);  oled.print(lastRep.length() ? lastRep.c_str() : "--");
+  oled.display();
+}
+
+/* ---------- Stream callbacks ---------- */
+static void msgCb(FirebaseStream data){ lastMsg = data.stringData(); oledDirty = true; yield(); }
+static void repCb(FirebaseStream data){ lastRep = data.stringData(); oledDirty = true; yield(); }
+static void msgTO(bool timeout){
+  if(timeout){
+    Firebase.RTDB.endStream(&fbMsg);
+    Firebase.RTDB.beginStream(&fbMsg, FB_MSG);
+    Firebase.RTDB.setStreamCallback(&fbMsg, msgCb, msgTO);
+  }
+}
+static void repTO(bool timeout){
+  if(timeout){
+    Firebase.RTDB.endStream(&fbRep);
+    Firebase.RTDB.beginStream(&fbRep, FB_REP);
+    Firebase.RTDB.setStreamCallback(&fbRep, repCb, repTO);
+  }
+}
+
+/* ---------- MAX30102 config helper ---------- */
+static bool max30102_begin(){
+  // Try default addr with 400 kHz I2C already set on Wire
+  if (!mx.begin(Wire, 400000)) return false;
+
+  // LED current/brightness
+  // IR high, RED medium to reduce crosstalk; tweak if needed
+  const byte BRIGHT_IR  = 0x7F;  // 127
+  const byte BRIGHT_RED = 0x3F;  // 63
+
+  // Sample averaging 4; mode RED+IR; sampleRate 100 Hz; pulseWidth 411 us; adcRange 4096
+  mx.setup(60 /*ledBrightness*/, 4 /*sampleAverage*/, 2 /*ledMode=RED+IR*/,
+           100 /*sampleRate*/, 411 /*pulseWidth*/, 4096 /*adcRange*/);
+
+  mx.setPulseAmplitudeIR(BRIGHT_IR);
+  mx.setPulseAmplitudeRed(BRIGHT_RED);
+  mx.setPulseAmplitudeGreen(0);
+
+  mx.enableFIFORollover();  // keep latest samples
+  return true;
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(60);
+
+  wifiBegin();
+
+  // OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  oled.clearDisplay();
+  oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0,0); oled.println(F("Init...")); oled.display();
+
+  dht.begin();
+
+  // MAX30102
+  mx_ok = max30102_begin();
+  if(!mx_ok){
+    oled.setCursor(0,12); oled.println(F("MAX30102 fail")); oled.display();
+  } else {
+    oled.setCursor(0,12); oled.println(F("MAX30102 OK")); oled.display();
+  }
+
+  // MPU6050 (optional)
+#if USE_MPU
+  mpu_ok = mpu.begin();
+  if(mpu_ok){
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
+  }
+#endif
+
+  // Firebase (trimmed)
+  fcfg.api_key      = API_KEY;
+  fcfg.database_url = DATABASE_URL;
+  fcfg.cert.data    = nullptr;            // insecure → less RAM
+  fcfg.timeout.serverResponse = 7000;
+  fcfg.max_token_generation_retry = 1;
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&fcfg, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Smaller buffers: safe for leaf paths
+  fbWrite.setBSSLBufferSize(1536, 384);
+  fbWrite.setResponseSize(256);
+  fbMsg.setBSSLBufferSize(1536, 384);
+  fbMsg.setResponseSize(256);
+  fbRep.setBSSLBufferSize(1536, 384);
+  fbRep.setResponseSize(256);
+
+  // Narrow streams
+  if(Firebase.RTDB.beginStream(&fbMsg, FB_MSG)) Firebase.RTDB.setStreamCallback(&fbMsg, msgCb, msgTO);
+  if(Firebase.RTDB.beginStream(&fbRep, FB_REP)) Firebase.RTDB.setStreamCallback(&fbRep, repCb, repTO);
+
+  lastMsg.reserve(64);
+  lastRep.reserve(64);
+  oledDirty = true;
+}
+
+void loop(){
+  const uint32_t now = millis();
+
+  // -------- MAX30102 acquisition + algorithm (lightweight) --------
+  if (mx_ok){
+    mx.check();
+    while (mx.available()){
+      redBuf[bufPos] = mx.getFIFORed();
+      irBuf[bufPos]  = mx.getFIFOIR();
+      bufPos = (bufPos + 1) % BUF_LEN;
+      mx.nextSample();
+    }
+
+    if (now - t_algo >= ALGO_MS){
+      t_algo = now;
+
+      // Roll a contiguous copy of last BUF_LEN samples
+      static uint32_t irTmp[BUF_LEN], redTmp[BUF_LEN];
+      for (int i=0;i<BUF_LEN;i++){ int idx=(bufPos+i)%BUF_LEN; irTmp[i]=irBuf[idx]; redTmp[i]=redBuf[idx]; }
+
+      // Simple finger presence by IR DC and AC
+      uint64_t sum=0; uint32_t mn=0xFFFFFFFF, mxv=0;
+      for (int i=0;i<BUF_LEN;i++){ uint32_t v=irTmp[i]; sum+=v; if(v<mn) mn=v; if(v>mxv) mxv=v; }
+      uint32_t dc = (uint32_t)(sum / BUF_LEN);
+      uint32_t ac = (mxv>mn)?(mxv-mn):0;
+      bool finger = (dc >= FINGER_DC_MIN) && (ac >= FINGER_AC_MIN);
+
+      int32_t spo2_alg = 0, heart_alg = 0; int8_t spo2_valid = 0, hr_valid = 0;
+      maxim_heart_rate_and_oxygen_saturation(irTmp, BUF_LEN, redTmp,
+                                             &spo2_alg, &spo2_valid, &heart_alg, &hr_valid);
+
+      if (finger && hr_valid && heart_alg > 0)   hr_ema   = validf(hr_ema)   ? (HR_EMA_A*heart_alg + (1.0f-HR_EMA_A)*hr_ema)     : heart_alg;
+      else                                       hr_ema   = NAN;
+
+      if (finger && spo2_valid && spo2_alg > 0)  spo2_ema = validf(spo2_ema) ? (SPO2_EMA_A*spo2_alg + (1.0f-SPO2_EMA_A)*spo2_ema) : spo2_alg;
+      else                                       spo2_ema = NAN;
+    }
+  }
+
+  // -------- Quick sensors --------
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  float angle = NAN;
+#if USE_MPU
+  if(mpu_ok){
+    sensors_event_t a,g,tmp; mpu.getEvent(&a,&g,&tmp);
+    float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
+    float pitch = atan2f(ax, sqrtf(ay*ay+az*az))*180.0f/PI;
+    float roll  = atan2f(ay, az)*180.0f/PI;
+    angle = max(fabsf(pitch), fabsf(roll));
+  }
+#endif
+
+  // -------- OLED refresh --------
+  if (oledDirty || (now - t_disp >= DISP_MS)){
+    drawOLED();
+    oledDirty = false;
+    t_disp = now;
+  }
+
+  // -------- Batched writes every 7s --------
+  if (now - t_push >= PUSH_MS){
+    t_push = now;
+
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()){
+      // Defaults if no valid HR/SpO2
+      int hr_out   = validf(hr_ema)   ? (int)(hr_ema   + 0.5f) : 72;
+      int spo2_out = validf(spo2_ema) ? (int)(spo2_ema + 0.5f) : 90;
+      String bp = makeBP(hr_out, spo2_out);
+
+      Firebase.RTDB.setInt(&fbWrite,    FB_1_HR,    hr_out);   yield();
+      Firebase.RTDB.setInt(&fbWrite,    FB_2_SPO2,  spo2_out); yield();
+      Firebase.RTDB.setString(&fbWrite, FB_3_BP,    bp);       yield();
+
+      if (validf(t))  Firebase.RTDB.setFloat(&fbWrite, FB_4_T, t);
+      else            Firebase.RTDB.setString(&fbWrite, FB_4_T, "");  yield();
+
+      if (validf(h))  Firebase.RTDB.setFloat(&fbWrite, FB_5_H, h);
+      else            Firebase.RTDB.setString(&fbWrite, FB_5_H, "");  yield();
+
+#if USE_MPU
+      if (validf(angle)) Firebase.RTDB.setFloat(&fbWrite, FB_6_ANGLE, angle);
+      else               Firebase.RTDB.setString(&fbWrite, FB_6_ANGLE, "");
+#else
+      Firebase.RTDB.setString(&fbWrite, FB_6_ANGLE, "");
+#endif
+      yield();
+    }
+  }
+
+  // -------- Stream health check --------
+  if (now - t_stream >= STREAM_MS){
+    t_stream = now;
+    if (!fbMsg.httpConnected() || fbMsg.streamTimeout()){
+      Firebase.RTDB.endStream(&fbMsg);
+      Firebase.RTDB.beginStream(&fbMsg, FB_MSG);
+      Firebase.RTDB.setStreamCallback(&fbMsg, msgCb, msgTO);
+    }
+    if (!fbRep.httpConnected() || fbRep.streamTimeout()){
+      Firebase.RTDB.endStream(&fbRep);
+      Firebase.RTDB.beginStream(&fbRep, FB_REP);
+      Firebase.RTDB.setStreamCallback(&fbRep, repCb, repTO);
+    }
+  }
+
+  // sparse diag (comment out to save a bit)
+  if (now - t_diag >= DIAG_MS){
+    t_diag = now;
+    Serial.printf("WiFi:%d RSSI:%d heap:%u HR:%s SpO2:%s\n",
+                  WiFi.status(), WiFi.RSSI(), ESP.getFreeHeap(),
+                  validf(hr_ema)?"ok":"--", validf(spo2_ema)?"ok":"--");
+  }
+
+  yield();
+}
