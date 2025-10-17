@@ -1,0 +1,281 @@
+/***************************************************
+ * ESP8266 + AS7341 (0x39) + Gas(D5) + pH(A0)
+ * OLED (SSD1306 128x64 I2C) + Firebase RTDB
+ *
+ * Boot screen: SSID + "Connecting..."
+ * After WiFi:  shows IP briefly, then rotates 3 pages:
+ *   A) Gas, pH, Clear, NIR, R/G, B/G, NIR/Vis
+ *   B) F1..F4
+ *   C) F5..F8
+ *
+ * Logs to RTDB path: /11_Pesticide
+ ***************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// --- AS7341 ---
+#include <Adafruit_AS7341.h>
+
+// --- OLED ---
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// -------- Wi-Fi & Firebase config --------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+#define API_KEY       "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL  "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+#define FB_ROOT       "/11_Pesticide"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// -------- Sensors --------
+#define GAS_PIN   D5
+#define PH_PIN    A0
+
+const float ADC_REF_VOLT = 1.000f;  // ESP8266 A0 full-scale ~1.0V
+const int   ADC_RES      = 1024;    // 0..1023
+float PH_SLOPE  = -0.0170f;         // <-- set after your 2/3-point pH calibration
+float PH_OFFSET =  21.34f;
+
+// -------- AS7341 --------
+Adafruit_AS7341 as7341;
+enum Ch {F1_415, F2_445, F3_480, F4_515, F5_555, F6_590, F7_630, F8_680, CLEAR_CH, NIR_CH, NCH=10};
+uint16_t rawCh[NCH];
+
+// -------- OLED (128x64 I2C @ 0x3C typical) --------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---- helpers ----
+void fbSet(const String &path, float val) {
+  if (!Firebase.RTDB.setFloat(&fbdo, path, val)) {
+    Serial.print("FB Fail "); Serial.print(path);
+    Serial.print(" : "); Serial.println(fbdo.errorReason());
+  }
+}
+bool readAS7341(uint16_t out[NCH]) {
+  if (!as7341.readAllChannels()) return false;
+  out[F1_415]   = as7341.getChannel(AS7341_CHANNEL_415nm_F1);
+  out[F2_445]   = as7341.getChannel(AS7341_CHANNEL_445nm_F2);
+  out[F3_480]   = as7341.getChannel(AS7341_CHANNEL_480nm_F3);
+  out[F4_515]   = as7341.getChannel(AS7341_CHANNEL_515nm_F4);
+  out[F5_555]   = as7341.getChannel(AS7341_CHANNEL_555nm_F5);
+  out[F6_590]   = as7341.getChannel(AS7341_CHANNEL_590nm_F6);
+  out[F7_630]   = as7341.getChannel(AS7341_CHANNEL_630nm_F7);
+  out[F8_680]   = as7341.getChannel(AS7341_CHANNEL_680nm_F8);
+  out[CLEAR_CH] = as7341.getChannel(AS7341_CHANNEL_CLEAR);
+  out[NIR_CH]   = as7341.getChannel(AS7341_CHANNEL_NIR);
+  return true;
+}
+
+// ---- OLED pages ----
+void oledBoot(const char* ssid) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Pesticide Detection");
+  //display.println("Firebase Logger");
+  display.println("----------------");
+  display.print("SSID: ");
+  display.println(ssid);
+  display.println("Connecting...");
+  display.display();
+}
+
+void oledShowIP(const IPAddress &ip) {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.println("WiFi Connected");
+  display.print("IP: ");
+  display.println(ip);
+  display.display();
+}
+
+void oledPageSummary(int gas, float pH, const uint16_t ch[NCH],
+                     float rg, float bg, float nir_vis) {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.println("Pesticide Logger (A)");
+  display.print("Gas: "); display.println(gas);
+  display.print("pH : "); display.println(pH, 2);
+  display.print("Clr: "); display.println((int)ch[CLEAR_CH]);
+  display.print("NIR: "); display.println((int)ch[NIR_CH]);
+  display.print("R/G: "); display.print(rg,3);
+  display.print("  B/G: "); display.println(bg,3);
+  display.print("NIR/Vis: "); display.println(nir_vis,3);
+  display.display();
+}
+
+void oledPageF1toF4(const uint16_t ch[NCH]) {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.println("Spectrum (B) F1..F4");
+  display.print("F1 415: "); display.println((int)ch[F1_415]);
+  display.print("F2 445: "); display.println((int)ch[F2_445]);
+  display.print("F3 480: "); display.println((int)ch[F3_480]);
+  display.print("F4 515: "); display.println((int)ch[F4_515]);
+  display.display();
+}
+
+void oledPageF5toF8(const uint16_t ch[NCH]) {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.println("Spectrum (C) F5..F8");
+  display.print("F5 555: "); display.println((int)ch[F5_555]);
+  display.print("F6 590: "); display.println((int)ch[F6_590]);
+  display.print("F7 630: "); display.println((int)ch[F7_630]);
+  display.print("F8 680: "); display.println((int)ch[F8_680]);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // I2C
+  Wire.begin(D2, D1);         // SDA, SCL
+  Wire.setClock(100000);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    // If OLED init fails, continue headless but print warning
+    Serial.println("OLED not found at 0x3C, continuing without display.");
+  } else {
+    display.clearDisplay();
+    display.display();
+  }
+
+  // Show boot screen with SSID
+  if (display.width() > 0) {
+    oledBoot(WIFI_SSID);
+  }
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: ");
+  Serial.print(WIFI_SSID);
+  Serial.print(" connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWiFi connected.");
+  if (display.width() > 0) {
+    oledShowIP(WiFi.localIP());
+    delay(1200);
+  }
+
+  // Firebase
+  config.api_key = API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.database_url = DATABASE_URL;
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+
+  // AS7341
+  if (!as7341.begin()) {
+    Serial.println("AS7341 not found (0x39). Check wiring.");
+    if (display.width() > 0) {
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.setTextSize(1);
+      display.println("AS7341 NOT FOUND!");
+      display.display();
+    }
+    while (1) delay(1000);
+  }
+  as7341.setATIME(100);
+  as7341.setASTEP(999);
+  as7341.setGain(AS7341_GAIN_64X);
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+  // --- GAS ---
+  int gasDigital = digitalRead(GAS_PIN);
+  // If your board is active-LOW: 
+  gasDigital = !gasDigital;
+
+  // --- pH ---
+  int   adc = analogRead(PH_PIN);
+  float v   = (adc * ADC_REF_VOLT) / (ADC_RES - 1);
+  float mv  = v * 1000.0f;
+  float pH  = PH_SLOPE * mv + PH_OFFSET;
+
+  // --- AS7341 ---
+  bool ok = readAS7341(rawCh);
+
+  // --- Serial print + Firebase ---
+  if (ok) {
+    Serial.println("------------------------------");
+    Serial.printf("Gas:%d  pH:%.2f  Clear:%u  NIR:%u\n",
+                  gasDigital, pH, rawCh[CLEAR_CH], rawCh[NIR_CH]);
+    Serial.printf("F1=%u F2=%u F3=%u F4=%u F5=%u F6=%u F7=%u F8=%u\n",
+                  rawCh[F1_415], rawCh[F2_445], rawCh[F3_480], rawCh[F4_515],
+                  rawCh[F5_555], rawCh[F6_590], rawCh[F7_630], rawCh[F8_680]);
+
+    // Firebase (nodes are auto-created)
+    fbSet(String(FB_ROOT) + "/F1_415", rawCh[F1_415]);
+    fbSet(String(FB_ROOT) + "/F2_445", rawCh[F2_445]);
+    fbSet(String(FB_ROOT) + "/F3_480", rawCh[F3_480]);
+    fbSet(String(FB_ROOT) + "/F4_515", rawCh[F4_515]);
+    fbSet(String(FB_ROOT) + "/F5_555", rawCh[F5_555]);
+    fbSet(String(FB_ROOT) + "/F6_590", rawCh[F6_590]);
+    fbSet(String(FB_ROOT) + "/F7_630", rawCh[F7_630]);
+    fbSet(String(FB_ROOT) + "/F8_680", rawCh[F8_680]);
+    fbSet(String(FB_ROOT) + "/Clear",  rawCh[CLEAR_CH]);
+    fbSet(String(FB_ROOT) + "/NIR",    rawCh[NIR_CH]);
+    fbSet(String(FB_ROOT) + "/pH",     pH);
+    fbSet(String(FB_ROOT) + "/Gas",    gasDigital);
+  } else {
+    Serial.println("AS7341 read error");
+  }
+
+  // --- Indices for OLED summary ---
+  float rg = (rawCh[F5_555] > 0) ? (float)rawCh[F7_630] / (float)rawCh[F5_555] : 0;
+  float bg = (rawCh[F5_555] > 0) ? (float)rawCh[F2_445] / (float)rawCh[F5_555] : 0;
+  float visSum = (float)rawCh[F4_515] + rawCh[F5_555] + rawCh[F6_590] + rawCh[F7_630];
+  float nir_vis = (visSum > 0) ? (float)rawCh[NIR_CH] / visSum : 0;
+
+  // --- OLED page rotation ---
+  static uint8_t page = 0;
+  static uint32_t tLast = 0;
+  const uint32_t PAGE_MS = 1800;
+
+  if (display.width() > 0) {
+    if (millis() - tLast > PAGE_MS) {
+      tLast = millis();
+      page = (page + 1) % 3; // 0->1->2->0...
+    }
+    if (page == 0) {
+      oledPageSummary(gasDigital, pH, rawCh, rg, bg, nir_vis);
+    } else if (page == 1) {
+      oledPageF1toF4(rawCh);
+    } else {
+      oledPageF5toF8(rawCh);
+    }
+  }
+
+  delay(600);
+}
