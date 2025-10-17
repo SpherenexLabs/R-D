@@ -67,4 +67,104 @@ void loop() {
   delay(1000); // Read the sensor every second
 }
 
+/*
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+// ---------- Wi-Fi ----------
+#define WIFI_SSID      "animal"
+#define WIFI_PASSWORD  "123456789"
+// ---------- Firebase ----------
+#define API_KEY         "AIzaSyCM0tItu-glPhEllQZPz8h6_5ZsHTBiaMw"
+#define DATABASE_URL    "https://intel-gesture-default-rtdb.firebaseio.com"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ---------- Firebase path ----------
+#define FB_PATH "Plant_Detection3/HUMAN"
+
+// ---------- Buzzer ----------
+#define BUZZER_PIN D5   // choose your pin (e.g. D5=GPIO14)
+#define BEEP_MS    200  // beep duration
+
+FirebaseData fbdo;
+FirebaseData stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long buzzerOffTime = 0;
+
+void streamCallback(StreamData data) {
+  if (data.dataPath() == "/") {
+    String val = data.stringData();
+    Serial.printf("[Firebase] HUMAN changed: %s\n", val.c_str());
+    if (val == "1") {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerOffTime = millis() + BEEP_MS;
+    }
+  }
+}
+
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) {
+    Serial.println("Stream timeout, reconnecting...");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nWiFi connected!");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectNetwork(true);
+  Firebase.begin(&config, &auth);
+
+  Serial.println("Connecting to Firebase...");
+  while (!Firebase.ready()) {
+    delay(100);
+    Serial.print(".");
+  }
+  Serial.println("\nFirebase ready!");
+  // Begin stream on HUMAN path
+  if (Firebase.beginStream(stream, FB_PATH)) {
+    Firebase.setStreamCallback(stream, streamCallback, streamTimeoutCallback);
+    Serial.println("Stream started!");
+  } else {
+    Serial.printf("Stream failed: %s\n", stream.errorReason().c_str());
+  }
+}
+void loop() {
+  // keep stream alive
+  if (Firebase.ready()) {
+    Firebase.readStream(stream);
+  }
+
+  // stop buzzer after duration
+  if (buzzerOffTime && millis() > buzzerOffTime) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOffTime = 0;
+  }
+}
+
+
+
+
+
+*/
+
 
