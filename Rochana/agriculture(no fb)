@@ -39,7 +39,7 @@ void loop() {
   Serial.println();
   delay(5000); // Read sensors every 5 seconds
 }
-
+/*--------------------------------------------------------------------------------*/
 // Function to read a specific sensor channel from the multiplexer
 int readSensor(int channel) {
   // Select the channel using the select pins
@@ -66,7 +66,7 @@ void loop() {
   Serial.println(rawValue);
   delay(1000); // Read the sensor every second
 }
-
+/*--------------------------------------------------------------------------------*/
 /*
 #include <ESP8266WiFi.h>
 #include <FirebaseESP8266.h>
@@ -160,11 +160,224 @@ void loop() {
     buzzerOffTime = 0;
   }
 }
-
-
-
-
-
 */
+/*------------------------LATEST--------------------------*/
+/*
+  ESP8266 + Firebase
+  - pH sensor (analog A0)
+  - Soil sensor (digital)
+  - Simulated Temperature & Humidity
+  - Relay (pump) control: ON when soil is dry (soil==0), OFF when wet (soil==1)
+  - Firebase upload
+  - Buzzer beeps once when /Plant_Detection3/human = 1
+*/
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- Wi-Fi ----------
+#define WIFI_SSID      "smart"
+#define WIFI_PASSWORD  "123456789"
+
+// ---------- Firebase ----------
+#define API_KEY         "AIzaSyCM0tItu-glPhEllQZPz8h6_5ZsHTBiaMw"
+#define DATABASE_URL    "https://intel-gesture-default-rtdb.firebaseio.com/"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ---------- Firebase Paths ----------
+#define PATH_ROOT   "/Plant_Detection3"
+#define PATH_PH     PATH_ROOT "/ph_value"
+#define PATH_SOIL   PATH_ROOT "/soil"
+#define PATH_TEMP   PATH_ROOT "/temp"
+#define PATH_HUM    PATH_ROOT "/hum"
+#define PATH_HUMAN  PATH_ROOT "/human"
+#define PATH_PUMP   PATH_ROOT "/pump"   // (NEW)
+
+// ---------- Pins ----------
+#define PH_ADC_PIN   A0
+#define SOIL_PIN     D5
+#define BUZZER_PIN   D1
+#define RELAY_PIN    D6            // (NEW) Pump relay IN pin
+#define BEEP_MS      200
+
+// ---------- Logic Levels ----------
+#define SOIL_WET_ACTIVE LOW        // soil digital module output when WET
+#define RELAY_ACTIVE     LOW       // most relay boards are active-LOW; change to HIGH if needed
+
+// ---------- pH Calibration ----------
+float PH_SLOPE  = -5.70f;
+float PH_OFFSET = 21.34f;
+
+// ---------- ADC Scaling ----------
+float ADC_VREF = 1.000f;           // ESP8266 internal reference ~1.0V
+float FRONTEND_GAIN = 3.20f;       // NodeMCU analog divider ≈3.2
+
+// ---------- Globals ----------
+FirebaseData fbdo;
+FirebaseData stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastUpdate = 0;
+unsigned long buzzerOffAt = 0;
+const unsigned long INTERVAL_MS = 2000;
+
+// Fake DHT data
+float T = 28.5f;
+float H = 45.0f;
+
+// Pump state cache
+int pumpState = 0; // 0=OFF, 1=ON
+
+// ---------- Helpers ----------
+float readPH() {
+  const int N = 30;
+  uint32_t acc = 0;
+  for (int i = 0; i < N; i++) {
+    acc += analogRead(PH_ADC_PIN);
+    delayMicroseconds(1500);
+  }
+  float raw = (float)acc / N;
+  float v_adc = (raw / 1023.0f) * ADC_VREF;
+  float v_sensor = v_adc * FRONTEND_GAIN;
+  float ph = PH_SLOPE * v_sensor + PH_OFFSET;
+  return ph;
+}
+
+int readSoil01() {
+  int level = digitalRead(SOIL_PIN);
+  return (level == SOIL_WET_ACTIVE) ? 1 : 0; // 1=wet, 0=dry
+}
+
+void simulateDHT() {
+  T += (random(-5, 6) / 10.0f);
+  H += (random(-3, 4) / 10.0f);
+  if (T < 25) T = 25;
+  if (T > 35) T = 35;
+  if (H < 40) H = 40;
+  if (H > 55) H = 55;
+}
+
+// Relay control: soil==0 (dry) -> pump ON, soil==1 (wet) -> pump OFF
+void setPump(int on) { // on: 0/1
+  pumpState = on ? 1 : 0;
+  digitalWrite(RELAY_PIN, on ? RELAY_ACTIVE : !RELAY_ACTIVE);
+}
+
+void streamCallback(FirebaseStream data) {
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_integer ||
+      data.dataTypeEnum() == fb_esp_rtdb_data_type_float ||
+      data.dataTypeEnum() == fb_esp_rtdb_data_type_double ||
+      data.dataTypeEnum() == fb_esp_rtdb_data_type_string) {
+
+    int human = 0;
+    if (data.dataTypeEnum() == fb_esp_rtdb_data_type_string) {
+      String s = data.stringData();
+      human = (s == "1") ? 1 : 0;
+    } else {
+      human = data.intData();
+    }
+
+    Serial.printf("[STREAM] %s = %d\n", data.dataPath().c_str(), human);
+
+    if (human == 1) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerOffAt = millis() + BEEP_MS;
+    }
+  }
+}
+
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) Serial.println("[STREAM] Timeout, resuming…");
+}
+
+void ensurePaths() {
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_HUMAN))
+    Firebase.RTDB.setInt(&fbdo, PATH_HUMAN, 0);
+
+  // initialize first values
+  int soil = readSoil01();
+  float ph = readPH();
+  setPump(soil == 0 ? 1 : 0); // dry -> ON
+
+  Firebase.RTDB.setFloat(&fbdo, PATH_PH, ph);
+  Firebase.RTDB.setInt(&fbdo, PATH_SOIL, soil);
+  Firebase.RTDB.setFloat(&fbdo, PATH_TEMP, T);
+  Firebase.RTDB.setFloat(&fbdo, PATH_HUM, H);
+  Firebase.RTDB.setString(&fbdo, PATH_PUMP, pumpState ? "ON" : "OFF"); // (NEW)
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);            // (NEW)
+  digitalWrite(BUZZER_PIN, LOW);
+  // Ensure pump default OFF at boot
+  digitalWrite(RELAY_PIN, !RELAY_ACTIVE);// (NEW)
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(300); }
+  Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectNetwork(true);
+  Serial.print("Authenticating");
+  while (!Firebase.ready()) { Serial.print("."); delay(300); }
+  Serial.println("\nFirebase ready!");
+
+  ensurePaths();
+
+  if (!Firebase.RTDB.beginStream(&stream, PATH_HUMAN)) {
+    Serial.printf("Stream begin error: %s\n", stream.errorReason().c_str());
+  } else {
+    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+    Serial.println("Listening for /human changes...");
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (buzzerOffAt && now >= buzzerOffAt) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOffAt = 0;
+  }
+
+  if (Firebase.ready() && now - lastUpdate >= INTERVAL_MS) {
+    lastUpdate = now;
+
+    simulateDHT();
+    float ph = readPH();
+    int soil = readSoil01();
+
+    // Relay control based on soil dryness
+    int wantPump = (soil == 0) ? 1 : 0; // dry->1
+    if (wantPump != pumpState) {
+      setPump(wantPump);
+      Firebase.RTDB.setString(&fbdo, PATH_PUMP, pumpState ? "ON" : "OFF"); // update only on change
+    }
+
+    // Update main telemetry
+    Firebase.RTDB.setFloat(&fbdo, PATH_PH, ph);
+    Firebase.RTDB.setInt(&fbdo, PATH_SOIL, soil);
+    Firebase.RTDB.setFloat(&fbdo, PATH_TEMP, T);
+    Firebase.RTDB.setFloat(&fbdo, PATH_HUM, H);
+
+    Serial.printf("soil=%d  pump=%s  pH=%.2f  T=%.1fC  H=%.1f%%\n",
+                  soil, pumpState ? "ON" : "OFF", ph, T, H);
+  }
+}
+
 
 
