@@ -1,0 +1,304 @@
+/*
+  ESP8266 Telemetry -> Firebase RTDB + OLED
+  - Sends: Voltage (/dynamic2/Voltage), Current in A (/dynamic2/current), Power in W (/dynamic2/power)
+  - Fetches: balance (/dynamic2/balance), chargingCompleted (/dynamic2/chargingCompleted), soc (/dynamic2/soc)
+  - OLED shows V, I, P, SoC(FB), Balance, and "Charge: DONE" when chargingCompleted == 1
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- Wi-Fi ----------
+#define WIFI_SSID       "wcs"
+#define WIFI_PASSWORD   "123456789"
+
+// ---------- Firebase ----------
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ---------- RTDB paths ----------
+#define FB_ROOT     "/dynamic2"
+#define FB_V        FB_ROOT "/Voltage"
+#define FB_BATT     FB_ROOT "/battery"            // legacy path (we won't write now)
+#define FB_I        FB_ROOT "/current"
+#define FB_P        FB_ROOT "/power"
+#define FB_BAL      FB_ROOT "/balance"            // fetch only
+#define FB_CHG_DONE FB_ROOT "/chargingCompleted"  // fetch only
+#define FB_SOC      FB_ROOT "/soc"                // NEW: fetch SoC here (string or number)
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------- ADC / Divider (NodeMCU A0 -> ~0..3.2V) ----------
+#define ADC_PIN A0
+static const float ADC_A0_VMAX = 3.20f;
+static const float R1_TOP_OHMS = 32200.0f;
+static const float R2_BOT_OHMS = 7500.0f;
+
+// Optional linear calibration for voltage
+static const float VOLT_GAIN   = 1.0f;
+static const float VOLT_OFFSET = 0.0f;
+
+// Smoothing/averaging
+static const int   ADC_AVG_SAMPLES = 10;
+
+// ---------- Firebase ----------
+FirebaseData fbdo;        // writes
+FirebaseData fbget;       // reads
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------- Globals ----------
+float dividerRatio = 0.0f;
+float invDivider   = 0.0f;
+float voc_est_V    = NAN;             // kept (not displayed), harmless to leave
+
+const uint32_t PERIOD_MS = 1000;
+uint32_t t_last = 0;
+
+String balanceStr = "--";             // OLED balance display
+bool chargingCompleted = false;       // flag for OLED
+
+// SoC fetched from Firebase
+String socStr = "--";
+float  socValue = NAN;                // 0..100 when parsed
+
+uint32_t t_lastPoll = 0;
+const uint32_t POLL_MS = 2000;        // poll balance/chargeDone/SoC
+
+// --------- Simulated current window ---------
+static const float I_MIN_mA = 1000.0f; // 1.0 A
+static const float I_MAX_mA = 3000.0f; // 3.0 A
+static const float I_STEP_mA = 30.0f;  // max step per second
+static const float I_EMA_A   = 0.25f;  // smoothing
+float simI_mA  = 1500.0f;             // start mid
+float Ifilt_mA = simI_mA;
+
+// ---------- Helpers ----------
+int read_adc_avg(int N) {
+  long s = 0;
+  for (int i = 0; i < N; ++i) { s += analogRead(ADC_PIN); delay(2); }
+  return (int)(s / N);
+}
+
+float measure_pack_voltage() {
+  int   raw  = read_adc_avg(ADC_AVG_SAMPLES);        // 0..1023
+  float vA0  = (raw / 1023.0f) * ADC_A0_VMAX;        // at A0
+  float vBat = vA0 * (1.0f / (R2_BOT_OHMS / (R1_TOP_OHMS + R2_BOT_OHMS)));
+  return vBat * VOLT_GAIN + VOLT_OFFSET;
+}
+
+// simple retry for RTDB writes
+template<typename T>
+bool fb_set(const char* path, T val) {
+  for (int i=0; i<3; ++i) {
+    if (Firebase.ready() && Firebase.RTDB.set(&fbdo, path, val)) return true;
+    delay(150);
+  }
+  Serial.printf("RTDB write fail [%s]: %s\n", path, fbdo.errorReason().c_str());
+  return false;
+}
+
+float nextSimCurrent_mA() {
+  float step = ((float)random(-1000, 1001) / 1000.0f) * I_STEP_mA;
+  simI_mA += step;
+  if (simI_mA < I_MIN_mA) simI_mA = I_MIN_mA + (I_MIN_mA - simI_mA) * 0.3f;
+  if (simI_mA > I_MAX_mA) simI_mA = I_MAX_mA - (simI_mA - I_MAX_mA) * 0.3f;
+  Ifilt_mA = I_EMA_A * simI_mA + (1.0f - I_EMA_A) * Ifilt_mA;
+  return Ifilt_mA;
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(D2, D1);             // I2C on NodeMCU (SDA=D2, SCL=D1)
+  randomSeed(analogRead(A0));     // seed RNG for current walk
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED init failed")); while (1) {}
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Booting...");
+  display.display();
+
+  // Divider math
+  dividerRatio = R2_BOT_OHMS / (R1_TOP_OHMS + R2_BOT_OHMS);
+  invDivider   = 1.0f / dividerRatio;
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.print("Firebase");
+  while (!Firebase.ready()) { delay(200); Serial.print("."); }
+  Serial.println(" ready");
+
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("Init OK");
+  display.display();
+}
+
+// ---------- Loop ----------
+void loop() {
+  const uint32_t now = millis();
+
+  // 1 Hz telemetry & OLED
+  if (now - t_last >= PERIOD_MS) {
+    t_last = now;
+
+    float Vpack = measure_pack_voltage();
+
+    // keep a slowly-tracked "voc" (not used for display)
+    if (isnan(voc_est_V)) voc_est_V = Vpack;
+    if (Vpack > voc_est_V) voc_est_V += 0.20f * (Vpack - voc_est_V);
+    else                   voc_est_V += 0.005f * (Vpack - voc_est_V);
+
+    float I_mA = nextSimCurrent_mA();
+    float I_A  = I_mA / 1000.0f;
+    float P_w  = Vpack * I_A;
+
+    // ---------- OLED ----------
+    display.clearDisplay();
+    display.setCursor(0, 0);  display.printf("V=%.2f V",  Vpack);
+    display.setCursor(0, 12); display.printf("I=%.0f mA", I_mA);
+    display.setCursor(0, 24); display.printf("P=%.2f W",  P_w);
+
+    // SoC from Firebase (/dynamic2/soc)
+    display.setCursor(0, 36);
+    display.print("SoC=");
+    if (!isnan(socValue) && socValue >= 0.0f && socValue <= 100.0f) {
+      display.printf("%.2f %%", socValue);          // e.g., 94.17 %
+    } else {
+      display.print(socStr);                        // fallback string
+      if (socStr.indexOf('%') < 0) display.print(" %");
+    }
+
+    display.setCursor(0, 48); display.print("Bal: "); display.print(balanceStr);
+
+    // 6th line – charge state
+    if (chargingCompleted) {
+      display.setCursor(0, 56);
+      display.print("Charge: DONE");
+    }
+    display.display();
+
+    // ---------- Firebase writes ----------
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      fb_set(FB_V, Vpack);
+      // Do NOT overwrite SoC here (comes from /soc now)
+      // fb_set(FB_BATT, SoC_local);
+      fb_set(FB_I, I_A);
+      fb_set(FB_P, P_w);
+    } else {
+      Serial.println("Skip: WiFi/Firebase not ready");
+    }
+
+    // Debug
+    Serial.printf("V=%.2fV  I=%.0fmA  P=%.2fW  SoC(FB)=%s  Bal=%s  ChgDone=%d\n",
+                  Vpack, I_mA, P_w,
+                  (!isnan(socValue) ? String(socValue, 2).c_str() : socStr.c_str()),
+                  balanceStr.c_str(), chargingCompleted ? 1 : 0);
+  }
+
+  // Poll balance, chargingCompleted, and SoC every POLL_MS
+  if (now - t_lastPoll >= POLL_MS) {
+    t_lastPoll = now;
+
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+
+      // balance (string/number)
+      if (Firebase.RTDB.get(&fbget, FB_BAL)) {
+        if (fbget.dataTypeEnum() == fb_esp_rtdb_data_type_integer) {
+          balanceStr = String(fbget.intData());
+        } else if (fbget.dataTypeEnum() == fb_esp_rtdb_data_type_float ||
+                   fbget.dataTypeEnum() == fb_esp_rtdb_data_type_double) {
+          balanceStr = String(fbget.floatData(), 2);
+        } else if (fbget.dataTypeEnum() == fb_esp_rtdb_data_type_string) {
+          balanceStr = fbget.stringData();
+        } else {
+          balanceStr = "--";
+        }
+      } else {
+        Serial.printf("Balance read error: %s\n", fbget.errorReason().c_str());
+      }
+
+      // chargingCompleted (int/bool/string)
+      if (Firebase.RTDB.get(&fbget, FB_CHG_DONE)) {
+        switch (fbget.dataTypeEnum()) {
+          case fb_esp_rtdb_data_type_boolean:
+            chargingCompleted = fbget.boolData();
+            break;
+          case fb_esp_rtdb_data_type_integer:
+            chargingCompleted = (fbget.intData() != 0);
+            break;
+          case fb_esp_rtdb_data_type_float:
+          case fb_esp_rtdb_data_type_double:
+            chargingCompleted = (fbget.floatData() >= 0.5f);
+            break;
+          case fb_esp_rtdb_data_type_string: {
+            String s = fbget.stringData(); s.toLowerCase();
+            chargingCompleted = (s == "1" || s == "true" || s == "yes" || s == "done");
+          } break;
+          default:
+            break;
+        }
+      } else {
+        Serial.printf("chargingCompleted read error: %s\n", fbget.errorReason().c_str());
+      }
+
+      // SoC (/dynamic2/soc) as string or number
+      if (Firebase.RTDB.get(&fbget, FB_SOC)) {
+        switch (fbget.dataTypeEnum()) {
+          case fb_esp_rtdb_data_type_integer:
+            socValue = (float)fbget.intData();
+            socStr = String((int)socValue);
+            break;
+          case fb_esp_rtdb_data_type_float:
+          case fb_esp_rtdb_data_type_double:
+            socValue = fbget.floatData();
+            socStr = String(socValue, 2);
+            break;
+          case fb_esp_rtdb_data_type_string: {
+            socStr = fbget.stringData();           // e.g., "94.17"
+            socValue = socStr.toFloat();           // parse numeric if possible
+            // keep socStr for OLED even if non-numeric
+          } break;
+          default:
+            // leave previous values
+            break;
+        }
+      } else {
+        Serial.printf("SoC (/soc) read error: %s\n", fbget.errorReason().c_str());
+      }
+    }
+  }
+}
