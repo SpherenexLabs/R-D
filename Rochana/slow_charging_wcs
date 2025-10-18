@@ -24,8 +24,8 @@
 #define FB_BATT   FB_ROOT "/battery"
 #define FB_I      FB_ROOT "/current"
 #define FB_P      FB_ROOT "/power"
-#define FB_BAL    FB_ROOT "/balance"             // fetch only
-#define FB_CHG_DONE FB_ROOT "/chargingCompleted" // NEW: fetch only
+#define FB_BAL    FB_ROOT "/balance"             //fetch only
+#define FB_CHG_DONE FB_ROOT "/chargingCompleted" //fetch only
 
 // ---------- OLED ----------
 #define SCREEN_WIDTH 128
@@ -119,8 +119,7 @@ bool fb_set(const char* path, T val) {
   return false;
 }
 
-/* --------- Simulated current: 200..600 mA (never 0) --------- */
-static const float I_MIN_mA = 700.0f;
+static const float I_MIN_mA = 700.0f;//adjust these to display current 
 static const float I_MAX_mA = 950.0f;
 static const float I_STEP_mA = 30.0f;   // max step per second
 static const float I_EMA_A   = 0.25f;   // smoothing
