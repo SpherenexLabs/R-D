@@ -1,0 +1,220 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+// ===== Wi-Fi & Firebase =====
+#define WIFI_SSID      "wcs"
+#define WIFI_PASSWORD  "123456789"
+
+#define API_KEY        "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL   "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL     "spherenexgpt@gmail.com"
+#define USER_PASSWORD  "Spherenex@123"
+
+#define FB_ROOT        "/dynamic2"
+const String FB_STATION = String(FB_ROOT) + "/1_Station";
+
+// ===== Pins =====
+#define RELAY_ACTIVE_LOW   1
+const int PIN_RELAY_SOURCE = D3;  // source Grid/Solar
+const int PIN_RELAY_MODE   = D4;  // mode Slow/Fast
+const int PIN_SERVO        = D7;  // arm servo
+const int PIN_ADC_VBAT     = A0;  // battery divider
+
+// ===== OLED =====
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_ADDR     0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ===== Battery calibration =====
+#define ADC_REF_V        1.000
+#define ADC_MAX_COUNTS   1023
+#define USE_DIRECT_KDIV      1
+#define K_DIV_MEASURED   (12.40 / 0.500)   // measure once and replace
+#define R1_OHMS 220000.0
+#define R2_OHMS  68000.0
+#define CAL_K       1.00
+
+#define VBAT_3S_EMPTY   9.00
+#define VBAT_3S_FULL   12.60
+#define VBAT_SAMPLES     16
+#define VBAT_EMA_ALPHA 0.20f
+
+// ===== Mode/state =====
+enum SourceSel  { SRC_GRID = 0, SRC_SOLAR = 1 };
+enum ChargeMode { MODE_SLOW = 0, MODE_FAST  = 1 };
+volatile SourceSel  sourceSel  = SRC_GRID;
+volatile ChargeMode chargeMode = MODE_SLOW;
+
+Servo armServo;
+int   armState = 0;
+int   chargingFlag = 0;
+
+// ===== Firebase =====
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== Helpers =====
+inline void relayWrite(int pin, bool on) {
+#if RELAY_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+float vbat_ema = 0.0f;
+float readADCavg() {
+  long acc = 0;
+  for (int i=0;i<VBAT_SAMPLES;i++) acc += analogRead(PIN_ADC_VBAT);
+  return (float)acc / (float)VBAT_SAMPLES;
+}
+float rawToVa0(float raw) { return (raw / ADC_MAX_COUNTS) * ADC_REF_V; }
+float va0ToVbat(float va0) {
+#if USE_DIRECT_KDIV
+  return va0 * K_DIV_MEASURED;
+#else
+  float v = va0 * ((R1_OHMS + R2_OHMS) / R2_OHMS);
+  return v * CAL_K;
+#endif
+}
+float readVbatFiltered() {
+  float raw = readADCavg();
+  float va0 = rawToVa0(raw);
+  float vbat = va0ToVbat(va0);
+  if (vbat_ema < 0.01f) vbat_ema = vbat;
+  else vbat_ema = VBAT_EMA_ALPHA*vbat + (1.0f-VBAT_EMA_ALPHA)*vbat_ema;
+  return vbat_ema;
+}
+int socPercentFromVbat(float vbat) {
+  float pct = 100.0f*(vbat-VBAT_3S_EMPTY)/(VBAT_3S_FULL-VBAT_3S_EMPTY);
+  if (pct<0) pct=0; if(pct>100)pct=100; return (int)(pct+0.5f);
+}
+float randomFloat(float a,float b){return a+(b-a)*(float)random(0,1001)/1000.0f;}
+void getModeElectrical(float &V,float &I,float &P){
+  if(chargeMode==MODE_FAST){V=12.0f;I=randomFloat(1.5f,2.0f);}
+  else{V=5.0f;I=randomFloat(0.8f,1.0f);}
+  P=V*I;
+}
+bool fbGetString(const String &path,String &out){
+  if(Firebase.RTDB.getString(&fbdo,path.c_str())){out=fbdo.stringData();return true;}
+  return false;
+}
+bool fbSet(const String &path,const String &val){
+  return Firebase.RTDB.setString(&fbdo,path.c_str(),val);
+}
+
+// ===== OLED display (vertical layout) =====
+void oledShowVertical(const char* srcTxt,const char* modeTxt,
+                      float V,float I,float W,int soc,const char* chgTxt){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  int y=0;
+  display.setCursor(0,y);   display.print("Src: ");display.println(srcTxt); y+=10;
+  display.setCursor(0,y);   display.print("Mode: ");display.println(modeTxt); y+=10;
+  display.setCursor(0,y);   display.print("V: ");display.print(V,2);display.println("V"); y+=10;
+  display.setCursor(0,y);   display.print("I: ");display.print(I,2);display.println("A"); y+=10;
+  display.setCursor(0,y);   display.print("W: ");display.print(W,2);display.println("W"); y+=10;
+  display.setCursor(0,y);   display.print("SoC: ");display.print(soc);display.print("% ");
+  display.print("Chg: ");display.println(chgTxt);
+  display.display();
+}
+
+// ===== Setup =====
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(PIN_RELAY_SOURCE,OUTPUT);
+  pinMode(PIN_RELAY_MODE,OUTPUT);
+#if RELAY_ACTIVE_LOW
+  digitalWrite(PIN_RELAY_SOURCE,HIGH);
+  digitalWrite(PIN_RELAY_MODE,HIGH);
+#else
+  digitalWrite(PIN_RELAY_SOURCE,LOW);
+  digitalWrite(PIN_RELAY_MODE,LOW);
+#endif
+
+  armServo.attach(PIN_SERVO);
+  armServo.write(0);
+
+  Wire.begin(); // SDA=D2, SCL=D1
+  display.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR);
+  display.clearDisplay();
+  display.setTextSize(1);display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);display.print("Connecting WiFi...");
+  display.display();
+
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  Serial.print("WiFi:");
+  while(WiFi.status()!=WL_CONNECTED){delay(300);Serial.print(".");}
+  Serial.println(" connected");
+
+  config.api_key=API_KEY;
+  config.database_url=DATABASE_URL;
+  auth.user.email=USER_EMAIL;
+  auth.user.password=USER_PASSWORD;
+  config.token_status_callback=tokenStatusCallback;
+  Firebase.begin(&config,&auth);
+  Firebase.reconnectWiFi(true);
+  randomSeed(analogRead(A0));
+
+  oledShowVertical("Grid","Slow",5.0,0.8,4.0,50,"OFF");
+  Serial.println("Ready. OLED vertical layout active.");
+}
+
+// ===== Loop =====
+unsigned long t_last=0;
+void loop(){
+  unsigned long now=millis();
+  if(now-t_last>=1000){
+    t_last=now;
+    String s;
+
+    // Fetch control fields
+    if(fbGetString(FB_STATION+"/1_Sorce",s))
+      sourceSel=(s=="1")?SRC_SOLAR:SRC_GRID;
+    if(fbGetString(FB_STATION+"/2_Mode",s))
+      chargeMode=((s=="F")||(s=="f"))?MODE_FAST:MODE_SLOW;
+    if(fbGetString(FB_STATION+"/7_ARM",s)){
+      int want=(s=="1")?1:0;
+      if(want!=armState){armState=want;armServo.write(armState?180:0);}
+    }
+    if(fbGetString(FB_STATION+"/8_Charging",s))
+      chargingFlag=(s=="1")?1:0;
+
+    // Apply relays
+    relayWrite(PIN_RELAY_SOURCE,(sourceSel==SRC_SOLAR));
+    relayWrite(PIN_RELAY_MODE,(chargeMode==MODE_FAST));
+
+    // Sensor readings
+    float V,I,W;getModeElectrical(V,I,W);
+    float vbat=readVbatFiltered();
+    int soc=socPercentFromVbat(vbat);
+
+    // Upload only sensor data
+    fbSet(FB_STATION+"/3_V",String((int)roundf(V)));
+    fbSet(FB_STATION+"/4_I",String(I,2));
+    fbSet(FB_STATION+"/5_W",String(W,2));
+    fbSet(FB_STATION+"/6_SOC",String(soc));
+
+    // OLED
+    const char* srcTxt=(sourceSel==SRC_SOLAR)?"Solar":"Grid";
+    const char* modeTxt=(chargeMode==MODE_FAST)?"Fast":"Slow";
+    const char* chgTxt=chargingFlag?"ON":"OFF";
+    oledShowVertical(srcTxt,modeTxt,V,I,W,soc,chgTxt);
+
+    // Serial monitor
+    Serial.printf("Src=%s  Mode=%s  V=%.2f  I=%.2f  W=%.2f  SoC=%d%%  Charging=%s  ARM=%d\n",
+                  srcTxt,modeTxt,V,I,W,soc,chgTxt,armState?180:0);
+  }
+}
