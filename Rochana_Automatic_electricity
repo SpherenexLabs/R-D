@@ -1,0 +1,124 @@
+// UNO: Voltage → Relay + OLED
+// A0: voltage divider input
+// D3: relay IN1
+// OLED: SSD1306 I2C (0x3C): SDA=A4, SCL=A5
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- Pins ----------
+const int RELAY_PIN = 3;     // Relay IN1 on D3
+const int VOLT_PIN  = A0;    // Voltage sense via divider into A0
+
+// ---------- Relay logic ----------
+const bool RELAY_ACTIVE_LOW = true; // set false if your relay is active-HIGH
+
+inline void relayWrite(bool on) {
+  // on=true means "energize relay"
+  if (RELAY_ACTIVE_LOW) digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  else                   digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+}
+
+// ---------- Divider + ADC ----------
+const float R1 = 37000.0;
+const float R2 = 8000.0;
+const float SCALE = (R1 + R2) / R2;
+
+const float ADC_REF = 5.0;   // keep for now
+const int   ADC_MAX = 1023;
+
+// ADD THIS:
+const float CAL = 0.830;     // from (multimeter true) / (printed value)
+
+// ---------- Thresholds ----------
+const float CUTOFF_V     = 5.00; // at/above this → relay OFF, OLED "Cutoff"
+const float HYSTERESIS_V = 0.10; // prevents chatter
+const float TURN_ON_THRESHOLD  = CUTOFF_V - HYSTERESIS_V; // go back to ON below this
+const float TURN_OFF_THRESHOLD = CUTOFF_V;                // turn OFF at/above this
+
+// ---------- State ----------
+bool relayOn = true; // default state: relay ON (Normal)
+unsigned long lastUI = 0;
+
+float readVinAveraged(uint8_t samples = 10) {
+  long acc = 0;
+  for (uint8_t i = 0; i < samples; i++) { acc += analogRead(A0); delay(3); }
+  float raw  = acc / (float)samples;
+  float vadc = (raw * ADC_REF) / ADC_MAX;
+  float vin  = vadc * SCALE;
+  return vin * CAL;  // <-- apply calibration
+}
+
+
+void showOLED(float vin, const char* status) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Voltage Monitor");
+  display.println("----------------");
+
+  display.print("Vin: ");
+  display.print(vin, 2);
+  display.println(" V");
+
+  display.println();
+  display.print("Relay: ");
+  display.println(relayOn ? "ON" : "OFF");
+
+  display.setTextSize(2);
+  display.setCursor(0, 44);
+  display.println(status); // "Normal" or "Cutoff"
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  relayWrite(relayOn); // start ON
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 not found");
+    while (1) {}
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  float vin = readVinAveraged(12);
+
+  // Hysteresis control
+  if (vin >= TURN_OFF_THRESHOLD && relayOn) {
+    relayOn = false;
+    relayWrite(false);
+  } else if (vin <= TURN_ON_THRESHOLD && !relayOn) {
+    relayOn = true;
+    relayWrite(true);
+  }
+
+  // OLED + Serial
+  const char* status = relayOn ? "Normal" : "Cutoff";
+  if (millis() - lastUI > 200) {
+    lastUI = millis();
+    showOLED(vin, status);
+  }
+
+  Serial.print("Vin=");
+  Serial.print(vin, 3);
+  Serial.print(" V  Relay=");
+  Serial.print(relayOn ? "ON" : "OFF");
+  Serial.print("  Status=");
+  Serial.println(status);
+
+  delay(100);
+}
