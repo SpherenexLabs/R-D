@@ -1,0 +1,224 @@
+/*
+  ESP32 Dual Voltage Monitor (Buck & Boost) -> OLED + Firebase RTDB
+  - ADC1 GPIO34 = Buck sensor "S"
+  - ADC1 GPIO35 = Boost sensor "S"
+  - OLED SSD1306 I2C on GPIO21 (SDA), GPIO22 (SCL)
+  - RTDB paths:
+      /Voltage/Buck
+      /Voltage/Boost
+
+  Notes:
+  - Default assumes ~5:1 "0–25V" sensor boards (Vin = Vout * 5.0).
+  - With ADC_11db attenuation, ESP32 reads ~0–3.3V. Keep sensor output ≤ 3.3V.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- USER CONFIG: Wi-Fi & Firebase ----------
+#define WIFI_SSID       "voltage"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ---------- Pins ----------
+#define OLED_SDA  21
+#define OLED_SCL  22
+
+#define ADC_BUCK_PIN   34   // ADC1_CH6, input-only
+#define ADC_BOOST_PIN  35   // ADC1_CH7, input-only
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- ADC / Scaling ----------
+/*
+  ESP32 default ADC width is 12 bits (0..4095).
+  With ADC_11db attenuation, full-scale ~3.3V (practically ~3.2–3.3V).
+*/
+static const int   ADC_MAX        = 4095;
+static const float ADC_FS_VOLTS   = 3.30f;   // adjust if you calibrate
+static const float BUCK_FACTOR    = 5.00f;   // Vin = Vadc * 5.00  (calibrate as needed)
+static const float BOOST_FACTOR   = 5.00f;
+static const float BUCK_OFFSET    = 0.00f;   // volts after scaling (fine trim)
+static const float BOOST_OFFSET   = 0.00f;
+
+static const uint8_t SAMPLES = 16;           // oversampling for noise reduction
+
+// ---------- Firebase ----------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastPushMs = 0;
+const unsigned long PUSH_INTERVAL_MS = 1000;
+
+// ---------- Helpers ----------
+float readVoltageADC(uint8_t pin, float factor, float offset) {
+  analogSetPinAttenuation(pin, ADC_11db); // ≈ 0–3.3V range
+
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < SAMPLES; i++) {
+    acc += analogRead(pin);
+    delayMicroseconds(800);
+  }
+  float raw = (float)acc / (float)SAMPLES;
+
+  float v_adc = (raw / ADC_MAX) * ADC_FS_VOLTS; // volts at ESP32 pin
+  float v_in  = v_adc * factor + offset;        // reconstructed input volts
+  return v_in;
+}
+
+// Draws a big number with a small "V" unit tightly to its right
+void drawBigValueWithSmallV(int x, int y, float value) {
+  // Prepare numeric text at 2 decimals
+  char num[16];
+  snprintf(num, sizeof(num), "%.2f", value);
+
+  // Big number
+  display.setTextSize(2); // 12x16 px per char
+  display.setCursor(x, y);
+  display.print(num);
+
+  // Compute where the big number ended: each char at size=2 is 12 px wide
+  int numLen = strlen(num);
+  int xAfterNum = x + numLen * 12 + 2; // +2px spacing
+
+  // Small unit
+  display.setTextSize(1); // 6x8 px per char
+  // Vertically, place the 'V' slightly down so it sits mid-height next to the big digits
+  display.setCursor(xAfterNum, y + 4);
+  display.print("V");
+}
+
+void drawScreen(float vBuck, float vBoost) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Title
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Voltage");
+
+  // Labels
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.print("Buck:");
+
+  display.setCursor(0, 40);
+  display.print("Boost:");
+
+  // Values (big numbers, small 'V')
+  drawBigValueWithSmallV(60, 20, vBuck);   // y aligned with "Buck:"
+  drawBigValueWithSmallV(60, 36, vBoost);  // y aligned with "Boost:"
+
+  display.display();
+}
+
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  uint16_t tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 60) {
+    delay(250);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+}
+
+void firebaseInit() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectNetwork(true);
+  fbdo.setResponseSize(4096);
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.setDoubleDigits(3);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // I2C for OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000); // faster I2C for smoother refresh
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 init failed");
+    while (true) { delay(1); }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Booting...");
+  display.display();
+
+  // Configure ADC width globally (12-bit)
+  analogReadResolution(12);
+
+  // Wi-Fi + Firebase
+  wifiConnect();
+  firebaseInit();
+
+  display.setCursor(0, 10);
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  display.display();
+}
+
+// ---------- Loop ----------
+void loop() {
+  // Read voltages
+  float vBuck  = readVoltageADC(ADC_BUCK_PIN,  BUCK_FACTOR,  BUCK_OFFSET);
+  float vBoost = readVoltageADC(ADC_BOOST_PIN, BOOST_FACTOR, BOOST_OFFSET);
+
+  // OLED
+  drawScreen(vBuck, vBoost);
+
+  // Push to Firebase once per second
+  unsigned long now = millis();
+  if (now - lastPushMs >= PUSH_INTERVAL_MS) {
+    lastPushMs = now;
+
+    if (Firebase.ready()) {
+      bool ok1 = Firebase.RTDB.setFloat(&fbdo, "/Voltage/Buck",  vBuck);
+      bool ok2 = Firebase.RTDB.setFloat(&fbdo, "/Voltage/Boost", vBoost);
+
+      if (!ok1 || !ok2) {
+        Serial.printf("RTDB error: %s\n", fbdo.errorReason().c_str());
+      } else {
+        Serial.printf("Uploaded Buck=%.3f V  Boost=%.3f V\n", vBuck, vBoost);
+      }
+    } else {
+      Serial.println("Firebase not ready...");
+    }
+  }
+
+  delay(20);
+}
