@@ -1,0 +1,485 @@
+/*
+ * ESP32 Vehicle Safety Core + Firebase Uplink + Status LEDs
+ *
+ * Sensors:
+ *  - MQ-3 alcohol sensor (analog baseline + alert voting)
+ *  - Flame sensor (digital active-LOW)
+ *  - MPU6050 accel -> crash detection using jerk + |a| delta
+ *  - SSD1306 OLED status
+ *
+ * Cloud:
+ *  - WiFi + Firebase Realtime Database
+ *  - Writes to:
+ *      carmonitor/alcohol_level    (0.0 .. 1.0 scaled from sensor index)
+ *      carmonitor/alcohol_flag     (0/1)
+ *      carmonitor/crash_flag       (0/1)
+ *      carmonitor/flame_flag       (0/1)
+ *      carmonitor/speed            (estimated m/s from IMU accel integration)
+ *
+ * LEDs (traffic light board):
+ *  - GREEN (GPIO13): System alive
+ *        HIGH solid = WiFi+Firebase OK
+ *        BLINK      = not connected
+ *  - YELLOW (GPIO12): GPS+SD status
+ *        For now always HIGH (we'll refine when GPS/SD added)
+ *  - RED (GPIO14): Alert activity pulse
+ *        Brief HIGH when alcohol_alert OR flame_alert OR crash_now becomes true
+ *
+ * Buzzer:
+ *  - Single chirp when any alert first goes active (alcohol/flame/crash).
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- WiFi creds ----------
+#define WIFI_SSID      "line"
+#define WIFI_PASSWORD  "123456789"
+
+// ---------- Firebase creds ----------
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+FirebaseData    fbdo;
+FirebaseAuth    auth;
+FirebaseConfig  config;
+
+// ---------- Pins ----------
+#define PIN_MQ3_A        34    // MQ-3 analog AOUT -> ADC1 (3.3V max to ESP32!!!)
+#define PIN_FLAME_D      25    // Flame D0 (active-LOW)
+#define PIN_BUZZ         27    // Buzzer / alert LED
+#define PIN_RESET_BTN    26    // GND this pin to force-clear crash window (optional)
+
+// Status LED module (R/Y/G)
+#define LED_RED_PIN      14    // RED alert pulse
+#define LED_YEL_PIN      12    // YELLOW SD/GPS (always ON for now)
+#define LED_GRN_PIN      13    // GREEN system health WiFi/Firebase
+
+// ---------- OLED ----------
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+// ---------- MPU6050 ----------
+Adafruit_MPU6050 mpu;
+
+// ---------- MQ-3 parameters ----------
+#define MQ3_AVG_N              16
+#define MQ3_BASELINE_MS        30000   // ~30 s warm-up/learn window
+#define MQ3_ALERT_HYST         20
+#define MQ3_SLOW_TRACK_LEEWAY  20      // baseline drifts only if index < this
+#define MQ3_BASELINE_SLOW_W    128     // EWMA denominator for slow drift follow
+int   MQ3_THRESH_INDEX        = 120;   // index must exceed this to "arm" alcohol
+#define ALCOHOL_VOTE_N         5       // need N consecutive "high index" samples
+
+int   mq_buf[MQ3_AVG_N];
+int   mq_i = 0;
+long  mq_sum = 0;
+int   mq_baseline_raw = 0;
+bool  mq_baseline_locked = false;    // becomes true after MQ3_BASELINE_MS
+uint32_t mq_t0 = 0;
+int   alcohol_vote = 0;
+bool  alcohol_alert = false;
+
+// ---------- Crash detection parameters ----------
+const uint32_t IMU_ARM_MS       = 2000;   // ignore crash detection for 2s after boot
+const float    MAG_DELTA_G_THR  = 0.60f;  // require |a|-1g >= 0.60 g
+const float    JERK_THR_GPS     = 2.00f;  // jerk threshold (g/s)
+const int      CRASH_VOTE_N     = 3;      // need 3 consecutive "hit" samples
+const uint32_t CRASH_HOLD_MS    = 2000;   // Crash=YES window length (ms) after trigger
+
+float ax_g=0, ay_g=0, az_g=0;
+float amag_g=0;
+float prev_amag_g=1.0f;
+float jerk_gps=0;
+uint32_t prev_imu_ms=0;
+uint32_t boot_ms=0;
+int crash_vote=0;
+uint32_t crash_until_ms = 0;          // millis() deadline while crash is active
+
+bool flame_alert=false;
+
+// alert state memory for buzzer and red LED pulse
+bool prev_alcohol_alert = false;
+bool prev_flame_alert   = false;
+bool prev_crash_now     = false;
+
+// red LED pulse timing
+uint32_t redPulseUntil = 0;
+const uint32_t RED_PULSE_MS = 200;
+
+// "speed" estimation from IMU
+// We'll integrate forward acceleration (above gravity) to get a rough motion metric.
+// It's NOT GPS-accurate speed, but it's useful until GPS is added.
+float est_speed_mps = 0.0f;  // estimated speed magnitude (m/s)
+
+// Firebase push timing
+uint32_t lastFirebasePush = 0;
+const uint32_t FIREBASE_PUSH_PERIOD_MS = 1000;  // push to cloud every 1s
+
+// green LED blink timing (when offline)
+uint32_t lastGreenToggle = 0;
+bool greenBlinkState = false;
+
+// ---------- Helpers ----------
+int mqMovingAvg(int raw){
+  mq_sum -= mq_buf[mq_i];
+  mq_buf[mq_i] = raw;
+  mq_sum += raw;
+  mq_i = (mq_i+1) % MQ3_AVG_N;
+  return (int)(mq_sum / MQ3_AVG_N);
+}
+
+void beep(uint16_t ms=60){
+  digitalWrite(PIN_BUZZ, HIGH);
+  delay(ms);
+  digitalWrite(PIN_BUZZ, LOW);
+}
+
+bool crashActiveNow() {
+  return (millis() < crash_until_ms);
+}
+
+// draw current system state to OLED
+void drawOLED_Minimal(bool crash_now, int alc_idx, float volts){
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0,0);
+  display.print("ALC:");
+  display.print(alcohol_alert ? "YES" : "NO ");
+
+  display.setCursor(0,22);
+  display.print("FLM:");
+  display.print(flame_alert ? "YES" : "NO ");
+
+  display.setCursor(0,44);
+  display.print("CRS:");
+  display.print(crash_now ? "YES" : "NO ");
+
+  // debug overlay (index, volts, est speed)
+  display.setTextSize(1);
+  display.setCursor(78,0);
+  display.printf("Idx=%d", alc_idx);
+  display.setCursor(78,10);
+  display.printf("V=%.2f", volts);
+  display.setCursor(78,20);
+  display.printf("Spd=%.2f", est_speed_mps);
+
+  display.display();
+}
+
+// push current values to Firebase
+void pushToFirebase(int   alc_index,
+                    bool  alc_flag,
+                    bool  flm_flag,
+                    bool  crash_flag,
+                    float speed_mps) {
+  if (!Firebase.ready()) return;
+
+  // Scale alcohol reading to 0.0 .. 1.0
+  float alcohol_level_0to1 = (float)alc_index / 4095.0f;
+  if (alcohol_level_0to1 < 0) alcohol_level_0to1 = 0;
+  if (alcohol_level_0to1 > 1) alcohol_level_0to1 = 1;
+
+  // Write to RTDB
+  Firebase.RTDB.setFloat(&fbdo, "carmonitor/alcohol_level", alcohol_level_0to1);
+  Firebase.RTDB.setInt  (&fbdo, "carmonitor/alcohol_flag",  alc_flag   ? 1 : 0);
+  Firebase.RTDB.setInt  (&fbdo, "carmonitor/crash_flag",    crash_flag ? 1 : 0);
+  Firebase.RTDB.setInt  (&fbdo, "carmonitor/flame_flag",    flm_flag   ? 1 : 0);
+
+  // speed from IMU integration (placeholder until GPS speed is added)
+  Firebase.RTDB.setFloat(&fbdo, "carmonitor/speed",         speed_mps);
+}
+
+// ---------- Status LED management ----------
+void updateStatusLEDs(bool crash_now) {
+  // YELLOW LED: always ON for now (will change later when we add GPS+SD health)
+  digitalWrite(LED_YEL_PIN, HIGH);
+
+  // RED LED: pulse HIGH briefly on new alert transitions,
+  // then keep it LOW otherwise.
+
+  // If we're still inside the red pulse window, keep RED on
+  if (millis() < redPulseUntil) {
+    digitalWrite(LED_RED_PIN, HIGH);
+  } else {
+    digitalWrite(LED_RED_PIN, LOW);
+  }
+
+  // GREEN LED:
+  // - If WiFi+Firebase connected => solid ON
+  // - Else blink ~2Hz (toggle every 250ms)
+  bool connected = (WiFi.status() == WL_CONNECTED) && Firebase.ready();
+
+  if (connected) {
+    digitalWrite(LED_GRN_PIN, HIGH);
+  } else {
+    if (millis() - lastGreenToggle >= 250) {
+      lastGreenToggle = millis();
+      greenBlinkState = !greenBlinkState;
+    }
+    digitalWrite(LED_GRN_PIN, greenBlinkState ? HIGH : LOW);
+  }
+}
+
+// ---------- setup() ----------
+void setup() {
+  Serial.begin(115200);
+
+  // IO setup
+  pinMode(PIN_FLAME_D, INPUT_PULLUP);
+  pinMode(PIN_BUZZ, OUTPUT);
+  digitalWrite(PIN_BUZZ, LOW);
+
+  pinMode(PIN_RESET_BTN, INPUT_PULLUP);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_YEL_PIN, OUTPUT);
+  pinMode(LED_GRN_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, LOW);
+  digitalWrite(LED_YEL_PIN, LOW);
+  digitalWrite(LED_GRN_PIN, LOW);
+
+  analogReadResolution(12);           // ESP32 ADC: 0..4095
+  analogSetAttenuation(ADC_11db);     // ~0..3.3 V range
+
+  // I2C on ESP32: SDA=21, SCL=22
+  Wire.begin(21, 22, 400000);
+
+  // OLED init (non-fatal if missing)
+  (void)display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  display.clearDisplay();
+  display.display();
+
+  // Connect WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi OK, IP=");
+  Serial.println(WiFi.localIP());
+
+  // Firebase setup
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.reconnectNetwork(true);
+  Firebase.begin(&config, &auth);
+  Firebase.setDoubleDigits(5); // float precision
+
+  // MPU6050 init (non-fatal if missing)
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("MPU6050 not found at 0x68; if AD0=Vcc, try 0x69.");
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("MPU6050 OK.");
+  }
+
+  // MQ-3 filter prefill
+  mq_sum = 0;
+  for(int i=0;i<MQ3_AVG_N;i++){
+    int v = analogRead(PIN_MQ3_A);
+    mq_buf[i] = v;
+    mq_sum += v;
+    delay(5);
+  }
+  mq_baseline_raw = (int)(mq_sum / MQ3_AVG_N);  // seed
+  mq_t0 = millis();
+
+  boot_ms      = millis();
+  prev_imu_ms  = boot_ms;
+  prev_amag_g  = 1.0f;  // assume ~1g at rest
+  est_speed_mps = 0.0f;
+}
+
+// ---------- loop() ----------
+void loop() {
+  // ----- manual crash clear via button or serial 'Z' -----
+  if (Serial.available()) {
+    int c = Serial.read();
+    if (c=='Z' || c=='z') {
+      crash_until_ms = 0;
+      beep(120); // manual clear feedback
+    }
+  }
+  if (digitalRead(PIN_RESET_BTN) == LOW) {
+    crash_until_ms = 0;
+    beep(120); // button clear feedback
+  }
+
+  // ----- MQ-3 alcohol processing -----
+  int raw   = analogRead(PIN_MQ3_A);
+  int filt  = mqMovingAvg(raw);
+  float v3  = (filt/4095.0f)*3.3f;
+
+  // lock baseline after warmup, then only slow-drift it
+  uint32_t elapsed = millis() - mq_t0;
+  if (!mq_baseline_locked && elapsed >= MQ3_BASELINE_MS) {
+    mq_baseline_locked = true;
+    Serial.printf("[MQ3] Baseline locked at raw=%d (%.2f V)\n",
+                  mq_baseline_raw,
+                  (mq_baseline_raw/4095.0f)*3.3f);
+  }
+
+  if (!mq_baseline_locked) {
+    // warm-up phase: exponential settle
+    mq_baseline_raw = (mq_baseline_raw*15 + filt) / 16;
+  } else {
+    // after lock: creep baseline SLOWLY if air is "clean"
+    int tmp_index = max(0, filt - mq_baseline_raw);
+    if (tmp_index < MQ3_SLOW_TRACK_LEEWAY) {
+      mq_baseline_raw =
+        ( (mq_baseline_raw*(MQ3_BASELINE_SLOW_W-1)) + filt ) / MQ3_BASELINE_SLOW_W;
+    }
+  }
+
+  int alc_index = max(0, filt - mq_baseline_raw);
+
+  // alcohol vote logic (temporal filter)
+  int on_th  = MQ3_THRESH_INDEX;
+  int off_th = max(0, MQ3_THRESH_INDEX - MQ3_ALERT_HYST);
+
+  if (alc_index >= on_th) {
+    if (alcohol_vote < ALCOHOL_VOTE_N) alcohol_vote++;
+  } else if (alc_index <= off_th) {
+    if (alcohol_vote > 0) alcohol_vote--;
+  }
+
+  alcohol_alert = (alcohol_vote >= ALCOHOL_VOTE_N);
+
+  // ----- Flame sensor -----
+  flame_alert = (digitalRead(PIN_FLAME_D) == LOW);
+
+  // ----- MPU6050 reading, jerk, crash detection, speed est -----
+  sensors_event_t a,g,t;
+  if (mpu.getEvent(&a, &g, &t)) {
+    const float gconv = 1.0f/9.80665f;
+    ax_g = a.acceleration.x * gconv;
+    ay_g = a.acceleration.y * gconv;
+    az_g = a.acceleration.z * gconv;
+
+    amag_g = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+
+    uint32_t now = millis();
+    float dt = (now - prev_imu_ms)/1000.0f;
+    if (dt < 0.002f || dt > 0.2f) dt = 0.02f;  // clamp dt if weird
+
+    jerk_gps = (amag_g - prev_amag_g) / dt;
+    prev_amag_g = amag_g;
+    prev_imu_ms = now;
+
+    // rough speed integration:
+    // take forward-ish acceleration above 1g baseline, convert to m/s^2,
+    // integrate, then apply damping to avoid runaway.
+    float mag_delta_g = amag_g - 1.0f;
+    if (mag_delta_g < 0) mag_delta_g = 0; // ignore decel (simple)
+    float lin_acc_ms2 = mag_delta_g * 9.80665f; // g -> m/s^2
+    est_speed_mps += lin_acc_ms2 * dt;
+    // damping to limit drift
+    est_speed_mps *= 0.98f;
+    if (est_speed_mps < 0) est_speed_mps = 0;
+
+    // Crash logic
+    bool armed = (now - boot_ms) >= IMU_ARM_MS;
+    float mag_delta_abs = fabs(amag_g - 1.0f);
+
+    bool hit = armed &&
+               (mag_delta_abs >= MAG_DELTA_G_THR) &&
+               (fabs(jerk_gps) >= JERK_THR_GPS);
+
+    if (hit) {
+      if (crash_vote < CRASH_VOTE_N) crash_vote++;
+    } else {
+      if (crash_vote > 0) crash_vote--;
+    }
+
+    if (crash_vote >= CRASH_VOTE_N) {
+      crash_until_ms = millis() + CRASH_HOLD_MS;
+      crash_vote = 0; // don't spam
+    }
+  }
+
+  bool crash_now = crashActiveNow();
+
+  // ----- Alert buzzer + RED LED pulse on NEW alerts -----
+  bool newAlertEdge =
+    ((!prev_alcohol_alert && alcohol_alert) ||
+     (!prev_flame_alert   && flame_alert)   ||
+     (!prev_crash_now     && crash_now));
+
+  if (newAlertEdge) {
+    beep(180);
+    redPulseUntil = millis() + RED_PULSE_MS; // pulse red LED HIGH
+  }
+
+  prev_alcohol_alert = alcohol_alert;
+  prev_flame_alert   = flame_alert;
+  prev_crash_now     = crash_now;
+
+  // ----- Firebase push (periodic) -----
+  if (millis() - lastFirebasePush >= FIREBASE_PUSH_PERIOD_MS) {
+    lastFirebasePush = millis();
+
+    bool alc_flag   = alcohol_alert;
+    bool flm_flag   = flame_alert;
+    bool crash_flag = crash_now;
+
+    pushToFirebase(
+      alc_index,
+      alc_flag,
+      flm_flag,
+      crash_flag,
+      est_speed_mps   // send current "speed" estimate
+    );
+  }
+
+  // ----- Serial debug (~4 Hz) -----
+  static uint32_t lastPrint=0;
+  if (millis()-lastPrint > 250) {
+    lastPrint = millis();
+    Serial.printf(
+      "Alc V=%.2f Idx=%d vote=%d ALC=%s | "
+      "Flame=%s | "
+      "|a|=%.2f jerk=%.2f estSpd=%.2f -> Crash=%s (hold %lu ms left)\n",
+      (float)( (mqMovingAvg(analogRead(PIN_MQ3_A))/4095.0f)*3.3f ),
+      // ^^ just for log readability we recalc quick (not critical)
+      alc_index, alcohol_vote, alcohol_alert?"YES":"no ",
+      flame_alert?"YES":"no ",
+      amag_g, jerk_gps, est_speed_mps,
+      crash_now?"YES":"no ",
+      (crash_now ? (crash_until_ms - millis()) : 0)
+    );
+  }
+
+  // ----- OLED (~10 Hz) -----
+  static uint32_t lastOLED=0;
+  if (display.width() && (millis()-lastOLED>100)) {
+    lastOLED=millis();
+    drawOLED_Minimal(crash_now, alc_index, (filt/4095.0f)*3.3f);
+  }
+
+  // ----- Status LEDs -----
+  updateStatusLEDs(crash_now);
+
+  delay(5);
+}
