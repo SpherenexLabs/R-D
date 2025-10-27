@@ -1,0 +1,325 @@
+/*
+  KS5908 – ESP8266 + CD74HC4067 + SSD1306 + Firebase RTDB
+  Adds SAFE/UNSAFE verdict & Reason to RTDB:
+    /Water_filter/Ph
+    /Water_filter/TDS
+    /Water_filter/Turb
+    /Water_filter/Gas
+    /Water_filter/Safe    (bool)
+    /Water_filter/Reason  (string)
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// -------------------- USER CONFIG --------------------
+#define WIFI_SSID       "water"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY         "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL    "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+// ----------------------------------------------------
+
+// -------- OLED --------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool OLED_OK = false;
+
+// -------- I2C pins ----
+const uint8_t I2C_SDA = 4;  // D2
+const uint8_t I2C_SCL = 5;  // D1
+
+// -------- MUX pins ----
+#define MUX_S0 14  // D5
+#define MUX_S1 12  // D6
+#define MUX_S2 13  // D7
+#define MUX_S3 15  // D8 (keep LOW at boot)
+const uint8_t MUX_CH_PH    = 0;  // C0
+const uint8_t MUX_CH_TDS   = 1;  // C1
+const uint8_t MUX_CH_TURB  = 2;  // C2
+const uint8_t MUX_CH_GAS   = 3;  // C3
+
+// -------- ADC & timing ----
+const float   ADC_FULL_SCALE_V = 3.20f; // NodeMCU/D1 mini A0 ~ 0..3.2 V
+const uint8_t SAMPLES          = 10;
+const uint16_t READ_MS         = 1000;  // 1 Hz
+
+// -------- Potability thresholds (tune) ----
+const float PH_MIN_GOOD       = 6.5f;
+const float PH_MAX_GOOD       = 8.5f;
+const float TDS_MAX_GOOD_PPM  = 300.0f;   // strict; many use 500
+const float TURB_MAX_GOOD_NTU = 1.0f;     // potable-grade target
+const float GAS_MAX_GOOD_V    = 2.50f;    // relaxed start; tune for your MQ-135
+
+// -------- Conversions (CALIBRATE!) -----
+float PH_V_AT_7   = 3.203f;  // your pH=7.00 voltage
+float PH_SLOPE    = -0.18f;  // adjust with pH 4/10 buffers
+inline float voltageToPH(float v) {
+  return 7.0f + (v - PH_V_AT_7) * PH_SLOPE;
+}
+
+const float TDS_FULL_SCALE_V   = 2.30f;    // approx 1000 ppm at this V
+const float TDS_FULL_SCALE_PPM = 1000.0f;
+inline float voltageToTDSppm(float v) {
+  if (v <= 0) return 0;
+  if (v >= TDS_FULL_SCALE_V) return TDS_FULL_SCALE_PPM;
+  return (v / TDS_FULL_SCALE_V) * TDS_FULL_SCALE_PPM;
+}
+
+// Turbidity: simple heuristic (calibrate yours)
+inline float turbidityVoltageToNTU(float v) {
+  if (v <= 0.1f) return 300.0f;          // often air/not immersed
+  float ntu = 150.0f / v - 40.0f;        // placeholder curve
+  if (ntu < 0) ntu = 0;
+  if (ntu > 300) ntu = 300;
+  return ntu;
+}
+
+inline float gasVoltageScore(float v) { return v; }
+
+// -------- Firebase objects -----------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// -------------- helpers --------------
+void muxInit() {
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+  // default to channel 0 (all LOW) to keep D8 low at boot
+  digitalWrite(MUX_S0, LOW);
+  digitalWrite(MUX_S1, LOW);
+  digitalWrite(MUX_S2, LOW);
+  digitalWrite(MUX_S3, LOW);
+}
+
+inline void muxSelect(uint8_t ch) {
+  digitalWrite(MUX_S0, (ch & 0x01) ? HIGH : LOW);
+  digitalWrite(MUX_S1, (ch & 0x02) ? HIGH : LOW);
+  digitalWrite(MUX_S2, (ch & 0x04) ? HIGH : LOW);
+  digitalWrite(MUX_S3, (ch & 0x08) ? HIGH : LOW);
+  delayMicroseconds(150);
+}
+
+float readMuxAveragedVoltage(uint8_t muxCh) {
+  muxSelect(muxCh);
+  long sum = 0;
+  for (uint8_t i = 0; i < SAMPLES; i++) {
+    int raw = analogRead(A0); // 0..1023
+    sum += raw;
+    delay(5);
+  }
+  float avgRaw = (float)sum / (float)SAMPLES;
+  return (avgRaw / 1023.0f) * ADC_FULL_SCALE_V;
+}
+
+void drawCentered(const String& s, int16_t y, uint8_t textSize=1) {
+  if (!OLED_OK) return;
+  display.setTextSize(textSize);
+  display.setTextColor(SSD1306_WHITE);
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(s, 0, y, &x1,&y1,&w,&h);
+  int16_t x = (SCREEN_WIDTH - w)/2;
+  display.setCursor(x, y);
+  display.print(s);
+}
+
+void i2cScan() {
+  Serial.println("I2C scan:");
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.print("  Found 0x"); Serial.println(addr, HEX);
+      found++;
+    }
+  }
+  if (found == 0) Serial.println("  No I2C devices found.");
+}
+
+void showLine(const String& s, int y) {
+  if (!OLED_OK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, y);
+  display.print(s);
+  display.display();
+}
+
+// Truncate helper for OLED (size=1: ~21 chars/line on 128px width)
+String truncateForOLED(const String& s, uint8_t maxChars = 21) {
+  if ((int)s.length() <= maxChars) return s;
+  return s.substring(0, maxChars - 3) + "...";
+}
+
+// -------------- setup --------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  muxInit();
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Try OLED @ 0x3C then 0x3D
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    OLED_OK = true;
+  } else if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    OLED_OK = true;
+  } else {
+    Serial.println("OLED not found at 0x3C/0x3D. Scanning I2C...");
+    i2cScan();
+  }
+
+  // -------- WiFi ----------
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: connecting");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK, IP: "); Serial.println(WiFi.localIP());
+    if (OLED_OK) {
+      display.clearDisplay();
+      drawCentered("WiFi OK", 8, 2);
+      display.setTextSize(1);
+      display.setCursor(0, 50);
+      display.print("IP: "); display.print(WiFi.localIP());
+      display.display();
+      delay(700);
+    }
+  } else {
+    Serial.println("WiFi FAILED.");
+    if (OLED_OK) { showLine("WiFi FAIL", 24); delay(700); }
+  }
+
+  // -------- Firebase (Email/Password auth) ----------
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // Optional: token status logs
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Wait briefly until client is ready (token acquired)
+  uint32_t fbStart = millis();
+  while (!Firebase.ready() && (millis() - fbStart) < 10000) {
+    delay(100);
+  }
+  Serial.println("Firebase init done (email/password).");
+
+  if (OLED_OK) {
+    if (Firebase.ready()) {
+      display.clearDisplay();
+      drawCentered("Firebase OK", 20, 2);
+      display.display();
+      delay(700);
+    } else {
+      showLine("Firebase not ready", 24);
+      delay(700);
+    }
+  }
+}
+
+// -------------- loop --------------
+void loop() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < READ_MS) return;
+  last = now;
+
+  // Read sensors via MUX → A0
+  float vPH   = readMuxAveragedVoltage(MUX_CH_PH);
+  float vTDS  = readMuxAveragedVoltage(MUX_CH_TDS);
+  float vTurb = readMuxAveragedVoltage(MUX_CH_TURB);
+  float vGas  = readMuxAveragedVoltage(MUX_CH_GAS);
+
+  // Convert
+  float ph     = voltageToPH(vPH);
+  float tdsPPM = voltageToTDSppm(vTDS);
+  float ntu    = turbidityVoltageToNTU(vTurb);
+  float gasV   = gasVoltageScore(vGas);
+
+  // SAFE / UNSAFE logic + Reason string
+  bool phOK    = (ph >= PH_MIN_GOOD && ph <= PH_MAX_GOOD);
+  bool tdsOK   = (tdsPPM <= TDS_MAX_GOOD_PPM);
+  bool turbOK  = (ntu <  TURB_MAX_GOOD_NTU);
+  bool gasOK   = (gasV <= GAS_MAX_GOOD_V);
+
+  bool waterSAFE = phOK && tdsOK && turbOK && gasOK;
+
+  String reason = "";
+  if (!phOK)   reason += (reason.length() ? "; " : "") + String("pH out of range");
+  if (!tdsOK)  reason += (reason.length() ? "; " : "") + String("TDS high");
+  if (!turbOK) reason += (reason.length() ? "; " : "") + String("Turbidity high");
+  if (!gasOK)  reason += (reason.length() ? "; " : "") + String("Gas high");
+  if (waterSAFE) reason = "All parameters within limits";
+
+  // Serial
+  Serial.print("vPH="); Serial.print(vPH,3);
+  Serial.print(" ph="); Serial.print(ph,2);
+  Serial.print("  vTDS="); Serial.print(vTDS,3);
+  Serial.print(" tds="); Serial.print(tdsPPM,0); Serial.print("ppm");
+  Serial.print("  vTurb="); Serial.print(vTurb,3);
+  Serial.print(" NTU="); Serial.print(ntu,2);
+  Serial.print("  vGas="); Serial.print(gasV,3);
+  Serial.print("  => "); Serial.print(waterSAFE ? "SAFE" : "UNSAFE");
+  Serial.print("  ["); Serial.print(reason); Serial.println("]");
+
+  // OLED — smaller header + reason line
+  if (OLED_OK) {
+    display.clearDisplay();
+    drawCentered(waterSAFE ? "WATER: SAFE" : "WATER: UNSAFE", 0, 1); // small header
+    display.setTextSize(1);
+    display.setCursor(0, 12); display.print("pH: ");  display.print(ph,2);     display.print(phOK ? " OK":" !!");
+    display.setCursor(0, 22); display.print("TDS: "); display.print(tdsPPM,0); display.print("ppm"); display.print(tdsOK ? " OK":" !!");
+    display.setCursor(0, 32); display.print("NTU: "); display.print(ntu,2);    display.print(turbOK ? " OK":" !!");
+    display.setCursor(0, 42); display.print("Gas: "); display.print(gasV,2);   display.print(gasOK ? " OK":" !!");
+    // Reason (truncate to fit one line at font size 1)
+    display.setCursor(0, 52);
+    display.print("R: ");
+    display.print(truncateForOLED(reason, 21 - 3)); // 21 chars line; "R: " uses 3
+    display.display();
+  }
+
+  // Firebase RTDB writes
+  if (Firebase.ready()) {
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Water_filter/Ph",   ph))
+      Serial.printf("FB Ph err: %s\n", fbdo.errorReason().c_str());
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Water_filter/TDS",  tdsPPM))
+      Serial.printf("FB TDS err: %s\n", fbdo.errorReason().c_str());
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Water_filter/Turb", ntu))
+      Serial.printf("FB Turb err: %s\n", fbdo.errorReason().c_str());
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Water_filter/Gas",  gasV))
+      Serial.printf("FB Gas err: %s\n", fbdo.errorReason().c_str());
+
+    // verdict & reason
+    if (!Firebase.RTDB.setBool (&fbdo, "/Water_filter/Safe", waterSAFE))
+      Serial.printf("FB Safe err: %s\n", fbdo.errorReason().c_str());
+    if (!Firebase.RTDB.setString(&fbdo, "/Water_filter/Reason", reason))
+      Serial.printf("FB Reason err: %s\n", fbdo.errorReason().c_str());
+  }
+}
