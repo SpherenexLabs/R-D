@@ -1,0 +1,318 @@
+/*
+  ESP8266 + L293D + VL53L0X + 128x64 SSD1306 OLED + Voltage sensor + Firebase RTDB
+
+  RTDB paths:
+    /Aeroplane/Direction   -> "F" | "B" | "L" | "R" (streamed)
+    /Aeroplane/Obstacle    -> 1 (blocked <=15 cm) | 0
+    /Aeroplane/Voltage     -> float volts
+    /Aeroplane/Current     -> float amps (0.98..1.00 when V>1.0, else 0.0)
+    /Aeroplane/F_Electric  -> float (Voltage - 0.5)
+
+  Wiring (NodeMCU-style labels):
+    I2C (OLED + VL53L0X): SDA=D2 (GPIO4), SCL=D1 (GPIO5), 3V3, GND
+    L293D (ENA/ENB tied HIGH in hardware):
+      R_IN1 = D5 (GPIO14)
+      R_IN2 = D6 (GPIO12)
+      L_IN3 = D7 (GPIO13)
+      L_IN4 = D8 (GPIO15)  // OK after boot (GPIO15 must be LOW at boot)
+    Voltage sensor: OUT -> A0  (update DIVIDER_RATIO if your divider differs)
+
+  Libraries:
+    - Firebase Arduino Client Library for ESP8266 and ESP32 (by mobizt)
+    - Adafruit_VL53L0X
+    - Adafruit_GFX
+    - Adafruit_SSD1306
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* ------------ USER CONFIG ------------ */
+#define WIFI_SSID       "aero"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY         "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL    "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+/* ------------ PINS ------------ */
+// L293D (ENA/ENB must be HIGH via jumpers or wire to 5V)
+const uint8_t R_IN1 = D5;  // GPIO14
+const uint8_t R_IN2 = D6;  // GPIO12
+const uint8_t L_IN3 = D7;  // GPIO13
+const uint8_t L_IN4 = D8;  // GPIO15  (GPIO15 must be LOW at boot; fine as output later)
+
+// I2C bus (OLED + VL53L0X share)
+const uint8_t I2C_SDA = D2;  // GPIO4
+const uint8_t I2C_SCL = D1;  // GPIO5
+
+// Voltage sensor on A0
+const uint8_t VOLTAGE_ADC_PIN = A0;
+// If your ESP8266 board exposes A0 as 0–1V (typical NodeMCU), keep these:
+const float   ADC_REF_VOLT  = 3.3f;   // internal reference scaling used by core
+const int     ADC_RES       = 1023;
+// Change to match your divider (typical external "voltage sensor" boards ~1:11)
+const float   DIVIDER_RATIO = 11.0f;
+
+/* ------------ LOGIC CONSTANTS ------------ */
+const uint16_t OBSTACLE_STOP_CM = 15;       // stop when <= 15 cm
+const uint32_t TELEMETRY_MS     = 1000;     // 1 Hz updates
+
+/* ------------ GLOBALS ------------ */
+FirebaseData   fbdo;
+FirebaseData   stream;
+FirebaseAuth   auth;
+FirebaseConfig config;
+
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+
+/* OLED */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+String   lastDirection = "";
+bool     obstacleNow   = false;
+uint32_t lastTelemetry = 0;
+
+/* ------------ MOTOR HELPERS ------------ */
+void motorsStop() {
+  digitalWrite(R_IN1, LOW);  digitalWrite(R_IN2, LOW);
+  digitalWrite(L_IN3, LOW);  digitalWrite(L_IN4, LOW);
+}
+
+void motorsForward() {
+  digitalWrite(R_IN1, HIGH); digitalWrite(R_IN2, LOW);
+  digitalWrite(L_IN3, HIGH); digitalWrite(L_IN4, LOW);
+}
+
+void motorsBackward() {
+  digitalWrite(R_IN1, LOW);  digitalWrite(R_IN2, HIGH);
+  digitalWrite(L_IN3, LOW);  digitalWrite(L_IN4, HIGH);
+}
+
+void motorsLeft() {   // pivot left
+  digitalWrite(R_IN1, HIGH); digitalWrite(R_IN2, LOW);
+  digitalWrite(L_IN3, LOW);  digitalWrite(L_IN4, HIGH);
+}
+
+void motorsRight() {  // pivot right
+  digitalWrite(R_IN1, LOW);  digitalWrite(R_IN2, HIGH);
+  digitalWrite(L_IN3, HIGH); digitalWrite(L_IN4, LOW);
+}
+
+void applyDirection(const String& dir) {
+  if (obstacleNow) { motorsStop(); return; } // safety override
+  if      (dir == "F") motorsForward();
+  else if (dir == "B") motorsBackward();
+  else if (dir == "L") motorsLeft();
+  else if (dir == "R") motorsRight();
+  else                 motorsStop();
+}
+
+/* ------------ SENSORS ------------ */
+float readVoltage() {
+  int raw = analogRead(VOLTAGE_ADC_PIN);
+  float vAdc = raw * (ADC_REF_VOLT / ADC_RES);  // voltage at A0 (0..~1V typical)
+  float vIn  = vAdc * DIVIDER_RATIO;            // undo divider
+  return vIn;
+}
+
+float randomCurrentForVoltage(float v) {
+  if (v <= 1.0f) return 0.0f;
+  // 0.98..1.00 A in 0.001 steps
+  long r = random(0, 21); // 0..20
+  return 0.98f + (r * 0.001f);
+}
+
+/* ------------ OLED ------------ */
+// Slightly tighter line spacing so we can add "Fissio electricity"
+void renderOLED(uint16_t distMm, bool obstacle, float v, float i, float f_electric, const String& dir) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  int y = 0;
+  const int dy = 9; // 9 px step fits 7 lines in 64 px
+
+  display.setCursor(0, y);           y += dy;
+  display.print("Dir: ");
+  display.print(dir.length() ? dir : "-");
+
+  display.setCursor(0, y);           y += dy;
+  if (distMm == 0xFFFF) {
+    display.print("Dist: -- cm");
+  } else {
+    display.print("Dist: ");
+    display.print(distMm / 10);
+    display.print(" cm");
+  }
+
+  display.setCursor(0, y);           y += dy;
+  display.print("Obs: ");
+  display.print(obstacle ? "1 STOP" : "0");
+
+  display.setCursor(0, y);           y += dy;
+  display.print("Volt: ");
+  display.print(v, 2);
+  display.print(" V");
+
+  display.setCursor(0, y);           y += dy;
+  display.print("Curr: ");
+  display.print(i, 3);
+  display.print(" A");
+
+  // New line: Fissio electricity (= Voltage - 0.5)
+  display.setCursor(0, y);           y += dy;
+  display.print("Fissio elec: ");
+  display.print(f_electric, 2);
+  display.print(" V");
+
+  display.setCursor(0, y);
+  display.print(WiFi.isConnected() ? "WiFi OK" : "WiFi...");
+  display.display();
+}
+
+/* ------------ FIREBASE STREAM ------------ */
+void streamCallback(FirebaseStream data) {
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_string) {
+    String dir = data.to<String>(); dir.trim();
+    lastDirection = dir;
+    applyDirection(lastDirection);
+    Serial.printf("[STREAM] Direction: %s\n", lastDirection.c_str());
+  } else {
+    Serial.printf("[STREAM] Non-string at %s\n", data.dataPath().c_str());
+  }
+}
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) Serial.println("[STREAM] Timeout, resuming...");
+}
+
+/* ------------ WIFI ------------ */
+void waitForWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Connecting WiFi: %s", WIFI_SSID);
+  uint8_t dot = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+    if (++dot % 15 == 0) Serial.println();
+  }
+  Serial.printf("\nWiFi OK, IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+/* ------------ SETUP ------------ */
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(R_IN1, OUTPUT); pinMode(R_IN2, OUTPUT);
+  pinMode(L_IN3, OUTPUT); pinMode(L_IN4, OUTPUT);
+  motorsStop();
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 init FAILED");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("OLED OK");
+    display.display();
+  }
+
+  // VL53L0X
+  if (!lox.begin()) {
+    Serial.println("VL53L0X not found!");
+  } else {
+    Serial.println("VL53L0X OK");
+  }
+
+  // WiFi
+  waitForWiFi();
+
+  // Firebase config/auth
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(2048);
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Serial.println("Firebase initialized.");
+
+  // Start Direction stream
+  if (!Firebase.RTDB.beginStream(&stream, "/Aeroplane/Direction")) {
+    Serial.printf("Stream begin error: %s\n", stream.errorReason().c_str());
+  } else {
+    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+    Serial.println("Streaming /Aeroplane/Direction");
+  }
+
+  // RNG seed for simulated current
+  randomSeed(analogRead(A0));
+}
+
+/* ------------ LOOP ------------ */
+void loop() {
+  // Read distance
+  VL53L0X_RangingMeasurementData_t measure;
+  uint16_t distMm = 0xFFFF;
+  lox.rangingTest(&measure, false);
+  if (measure.RangeStatus == 0) {
+    distMm = measure.RangeMilliMeter;
+  }
+
+  bool obstacle = false;
+  if (distMm != 0xFFFF && distMm > 0) {
+    uint16_t distCm = distMm / 10;
+    obstacle = (distCm <= OBSTACLE_STOP_CM);
+  }
+
+  if (obstacle != obstacleNow) {
+    obstacleNow = obstacle;
+    if (obstacleNow) motorsStop(); else applyDirection(lastDirection);
+  }
+
+  // Periodic telemetry + OLED
+  uint32_t now = millis();
+  if (now - lastTelemetry >= TELEMETRY_MS) {
+    lastTelemetry = now;
+
+    float v = readVoltage();
+    float i = randomCurrentForVoltage(v);
+    float f_electric = v - 0.5f;  // NEW: F_Electric value
+
+    if (Firebase.ready()) {
+      Firebase.RTDB.setInt(&fbdo,   "/Aeroplane/Obstacle", obstacleNow ? 1 : 0);
+      Firebase.RTDB.setFloat(&fbdo, "/Aeroplane/Voltage",  v);
+      Firebase.RTDB.setFloat(&fbdo, "/Aeroplane/Current",  i);
+      Firebase.RTDB.setFloat(&fbdo, "/Aeroplane/F_Electric", f_electric); // NEW upload
+    }
+
+    renderOLED(distMm, obstacleNow, v, i, f_electric, lastDirection);
+
+    Serial.printf("Dist:%u mm | Obs:%d | V=%.2f V | I=%.3f A | F_Electric=%.2f V | Dir=%s\n",
+                  distMm, obstacleNow, v, i, f_electric, lastDirection.c_str());
+  }
+}
