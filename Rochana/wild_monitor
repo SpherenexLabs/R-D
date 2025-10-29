@@ -1,0 +1,347 @@
+/************************************************************
+ * esp32_wildlife_monitor_firebase_minserial.ino
+ *
+ *  - Warmup (first 10s) -> gather stable values
+ *  - After warmup -> push vitals to Firebase every ~1s
+ *  - Serial monitor prints ONLY "1" every 10s. No other text.
+ *
+ * Sensors:
+ *   MAX30102  -> HR, SpO2
+ *   MPU6050   -> Motion magnitude + struggle flag
+ *   DHT11     -> Surroundings temp/humidity
+ *   DS18B20   -> Core body temp drift model
+ *
+ * Clamping rules:
+ *   - HR <= 130 bpm
+ *   - SpO2 >= 90%
+ *   - BP fixed as 120/80 (we just upload sys=120, dia=80)
+ *
+ * Firebase paths:
+ *   /animal_monitor/hr_bpm
+ *   /animal_monitor/spo2_pct
+ *   /animal_monitor/bp_sys
+ *   /animal_monitor/bp_dia
+ *   /animal_monitor/tsurr_c
+ *   /animal_monitor/hsurr_pct
+ *   /animal_monitor/tcore_c
+ *   /animal_monitor/motion_mps2
+ *   /animal_monitor/struggle_flag
+ ************************************************************/
+#include <Arduino.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "DHT.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+#include <WiFi.h>
+
+/* ---------- Firebase Client ---------- */
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+FirebaseData    fbdo;
+FirebaseAuth    auth;
+FirebaseConfig  config;
+
+/* ---------------- PIN MAP ---------------- */
+#define SDA_PIN        21
+#define SCL_PIN        22
+
+#define DHTPIN         4
+#define DHTTYPE        DHT11
+
+#define ONE_WIRE_PIN   5   // DS18B20 data pin (4.7k pull-up to 3.3V)
+
+/* ---------------- WIFI / FIREBASE CREDS ---------------- */
+#define WIFI_SSID       "animal"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+/* ---------------- OBJECTS ---------------- */
+MAX30105 maxSensor;
+Adafruit_MPU6050 mpu;
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+/* ---------------- FLAGS ---------------- */
+bool max_ok = false;
+bool mpu_ok = false;
+bool dht_ok = false;
+bool ds_ok  = false;
+
+/* ---------------- CORE TEMP MODEL ---------------- */
+float coreTempC_est        = 37.2f;
+const float CORE_MIN_C     = 36.0f;
+const float CORE_MAX_C     = 39.5f;
+const unsigned long CORE_UPDATE_MS = 5000UL;
+unsigned long lastCoreUpdate       = 0;
+const float DRIFT_STEP_MIN = -0.02f;
+const float DRIFT_STEP_MAX =  0.02f;
+
+float tinyRand(float a, float b) {
+  static uint32_t seed = 123456789;
+  seed = 1664525UL * seed + 1013904223UL;
+  float r01 = (seed & 0xFFFF) / 65535.0f;
+  return a + (b - a) * r01;
+}
+
+void updateCoreTempModel() {
+  unsigned long now = millis();
+  if (now - lastCoreUpdate >= CORE_UPDATE_MS) {
+    lastCoreUpdate = now;
+
+    ds18b20.requestTemperatures();
+    float realTempC = ds18b20.getTempCByIndex(0);
+
+    bool ds_valid = true;
+    if (realTempC == DEVICE_DISCONNECTED_C)          ds_valid = false;
+    else if (isnan(realTempC))                       ds_valid = false;
+    else if (realTempC < 20.0f || realTempC > 50.0f) ds_valid = false;
+
+    // slow biology-like drift
+    float drift = tinyRand(DRIFT_STEP_MIN, DRIFT_STEP_MAX);
+    coreTempC_est += drift;
+
+    // nudge toward sensor if sane
+    if (ds_valid) {
+      coreTempC_est = 0.9f * coreTempC_est + 0.1f * realTempC;
+    }
+
+    // clamp realistic band
+    if (coreTempC_est < CORE_MIN_C) coreTempC_est = CORE_MIN_C;
+    if (coreTempC_est > CORE_MAX_C) coreTempC_est = CORE_MAX_C;
+  }
+}
+
+/* ---------------- MOTION HELPERS ---------------- */
+float accelMagnitude(const sensors_event_t &a) {
+  float x2 = a.acceleration.x * a.acceleration.x;
+  float y2 = a.acceleration.y * a.acceleration.y;
+  float z2 = a.acceleration.z * a.acceleration.z;
+  return sqrtf(x2 + y2 + z2);
+}
+
+int struggleFlag(float g_total) {
+  if (g_total > 15.0f) return 1; // high acceleration = possible struggle
+  return 0;
+}
+
+/* ---------------- MAX30102 BUFFER / VITALS ---------------- */
+#define SAMPLE_BUF_LEN 100
+uint32_t irBuffer[SAMPLE_BUF_LEN];
+uint32_t redBuffer[SAMPLE_BUF_LEN];
+int writeIndex = 0;
+bool bufferFilledOnce = false;
+
+// computed from algorithm
+int32_t spo2     = -1;
+int8_t  spo2Valid= 0;
+int32_t heartRate= -1;
+int8_t  hrValid  = 0;
+
+// last stable values we expose
+int lastHR   = 80;  // default
+int lastSpO2 = 96;  // default
+
+void pushSampleToBuffer(uint32_t irVal, uint32_t redVal) {
+  irBuffer[writeIndex]  = irVal;
+  redBuffer[writeIndex] = redVal;
+  writeIndex++;
+  if (writeIndex >= SAMPLE_BUF_LEN) {
+    writeIndex = 0;
+    bufferFilledOnce = true;
+  }
+}
+
+void computeVitalsFromBuffer() {
+  if (!bufferFilledOnce) return;
+
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer,
+    SAMPLE_BUF_LEN,
+    redBuffer,
+    &spo2,
+    &spo2Valid,
+    &heartRate,
+    &hrValid
+  );
+
+  // heart rate sanity and clamp
+  if (hrValid && heartRate > 20 && heartRate < 300) {
+    lastHR = heartRate;
+  }
+  if (lastHR > 130) lastHR = 130; // clamp HR max
+
+  // SpO2 sanity and clamp
+  if (spo2Valid && spo2 > 60 && spo2 <= 100) {
+    lastSpO2 = spo2;
+  }
+  if (lastSpO2 < 90)  lastSpO2 = 90;   // clamp SpO2 min
+  if (lastSpO2 > 100) lastSpO2 = 100;
+}
+
+/* ---------------- WARMUP HANDLING ----------------
+   warmupCount < 10  -> no Firebase upload
+   warmupCount >=10  -> upload once per second
+*/
+int warmupCount = 0;
+
+/* ---------------- TIMERS ----------------
+   telemetryTimer: 1 Hz Firebase push
+   heartbeatTimer: 10 s Serial.println("1")
+*/
+unsigned long lastTelemetryMs = 0;
+const unsigned long TELEMETRY_PERIOD_MS = 1000UL;
+
+unsigned long lastHeartbeatMs = 0;
+const unsigned long HEARTBEAT_PERIOD_MS = 10000UL;
+
+/* ====================== SETUP ====================== */
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(50);
+
+  // MAX30102
+  if (maxSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    max_ok = true;
+    maxSensor.setup();
+    maxSensor.setPulseAmplitudeRed(0x1F);
+    maxSensor.setPulseAmplitudeIR(0x1F);
+    maxSensor.setPulseAmplitudeGreen(0x00);
+  }
+
+  // MPU6050
+  if (mpu.begin()) {
+    mpu_ok = true;
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // DHT11
+  dht.begin();
+  dht_ok = true;
+
+  // DS18B20
+  ds18b20.begin();
+  if (ds18b20.getDeviceCount() > 0) {
+    ds_ok = true;
+    ds18b20.setResolution(12);
+    ds18b20.requestTemperatures();
+    float initT = ds18b20.getTempCByIndex(0);
+    if (initT != DEVICE_DISCONNECTED_C && !isnan(initT) &&
+        initT > 20.0f && initT < 50.0f) {
+      coreTempC_est = initT;
+    } else {
+      coreTempC_est = 37.2f;
+    }
+  } else {
+    coreTempC_est = 37.2f;
+  }
+
+  // WiFi connect
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+  }
+
+  // Firebase init
+  config.api_key      = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectNetwork(true);
+
+  warmupCount      = 0;
+  lastTelemetryMs  = millis();
+  lastHeartbeatMs  = millis();
+}
+
+/* ======================= LOOP ======================= */
+void loop() {
+
+  unsigned long now = millis();
+
+  /* 1. Update slow core temp model */
+  updateCoreTempModel();
+  float TcoreC = coreTempC_est;
+
+  /* 2. Ambient from DHT11 */
+  float TsurrC = dht.readTemperature(); // may be NaN
+  float Hsurr  = dht.readHumidity();    // may be NaN
+  if (isnan(TsurrC)) TsurrC = 0.0f;
+  if (isnan(Hsurr))  Hsurr  = 0.0f;
+
+  /* 3. Motion / struggle from MPU6050 */
+  float motion_mps2 = 0.0f;
+  int struggle = 0;
+  if (mpu_ok) {
+    sensors_event_t a, g, tIMU;
+    mpu.getEvent(&a, &g, &tIMU);
+    motion_mps2 = accelMagnitude(a);
+    struggle    = struggleFlag(motion_mps2);
+  }
+
+  /* 4. Push MAX30102 samples */
+  if (max_ok) {
+    for (int k = 0; k < 10; k++) {
+      uint32_t irVal  = (uint32_t)maxSensor.getIR();
+      uint32_t redVal = (uint32_t)maxSensor.getRed();
+      pushSampleToBuffer(irVal, redVal);
+    }
+  }
+
+  /* 5. Update HR / SpO2 estimates */
+  computeVitalsFromBuffer();
+
+  /* 6. 1 Hz Firebase publish (silent, no Serial) */
+  if (now - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
+    lastTelemetryMs = now;
+
+    if (warmupCount < 10) {
+      // just count down warmup, do not upload junk yet
+      warmupCount++;
+    } else {
+      // after warmup: upload clamped values
+      if (Firebase.ready()) {
+        Firebase.RTDB.setInt  (&fbdo, "/animal_monitor/hr_bpm",        lastHR);
+        Firebase.RTDB.setInt  (&fbdo, "/animal_monitor/spo2_pct",      lastSpO2);
+        Firebase.RTDB.setInt  (&fbdo, "/animal_monitor/bp_sys",        120);
+        Firebase.RTDB.setInt  (&fbdo, "/animal_monitor/bp_dia",        80);
+        Firebase.RTDB.setInt  (&fbdo, "/animal_monitor/struggle_flag", struggle);
+
+        Firebase.RTDB.setFloat(&fbdo, "/animal_monitor/tsurr_c",       TsurrC);
+        Firebase.RTDB.setFloat(&fbdo, "/animal_monitor/hsurr_pct",     Hsurr);
+        Firebase.RTDB.setFloat(&fbdo, "/animal_monitor/tcore_c",       TcoreC);
+        Firebase.RTDB.setFloat(&fbdo, "/animal_monitor/motion_mps2",   motion_mps2);
+      }
+    }
+  }
+
+  /* 7. 10 s heartbeat -> ONLY thing printed to Serial */
+  if (now - lastHeartbeatMs >= HEARTBEAT_PERIOD_MS) {
+    lastHeartbeatMs = now;
+    Serial.println("1");
+  }
+
+  // no blocking delay, loop runs fast
+}
