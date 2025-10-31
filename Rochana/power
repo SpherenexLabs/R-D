@@ -1,0 +1,216 @@
+/**************************************************************
+ * ESP8266 Voltage/Current/Power + Firebase RTDB Uplink
+ * - Voltage from A0 via divider
+ * - Current SIMULATED (0.20..1.50 A) mapped from 1..12 V
+ * - Power = V * I
+ * - "Current distribution" flag with 6 V hysteresis (OFF <= 5.80, ON >= 6.20)
+ * - RTDB structure auto-created under FB_ROOT
+ * Requires:
+ *   - Firebase_ESP_Client
+ *   - ESP8266 core
+ **************************************************************/
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"   // Optional: debug token prints
+#include "addons/RTDBHelper.h"    // Optional: RTDB debug prints
+
+/************** WIFI & FIREBASE CREDENTIALS **************/
+#define WIFI_SSID     "power"
+#define WIFI_PASSWORD "123456789"
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+#define FB_ROOT       "/30_KS5306_Neural_Power" 
+const float ADC_VREF = 3.3f;  // if your board routes A0 to 0..3.3 V; set 1.0f for bare 0..1.0 V ADC
+const int   ADC_RES  = 1023;
+
+// Voltage divider: scale from line voltage to A0 pin
+const float VOLTAGE_DIVIDER = 5.0f;  // e.g., 25 V → 5:1 → 5.0; adjust to your module
+
+// Simulated current mapping vs. voltage
+const float MIN_VOLTAGE = 1.0f;    // map start (V)
+const float MAX_VOLTAGE = 12.0f;   // map end   (V)
+const float MIN_CURRENT_A = 0.20f; // 0.20 A at MIN_VOLTAGE
+const float MAX_CURRENT_A = 1.50f; // 1.50 A at MAX_VOLTAGE
+
+// Distribution threshold with hysteresis
+const float TH_ON_V  = 6.20f;  // ON at/above this
+const float TH_OFF_V = 5.80f;  // OFF at/below this
+
+/******************** UPLINK SETTINGS *********************/
+const uint32_t SAMPLE_PERIOD_MS = 1000;   // 1 Hz
+const bool     PUSH_HISTORY      = true;  // push each sample under /history
+/**********************************************************/
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// State
+static bool distributionOn = false;
+static uint32_t t_last = 0;
+
+/*********************** PROTOTYPES ***********************/
+float readVoltage();
+float mapVoltageToCurrent(float v);
+void  updateDistributionState(float v);
+void  firebaseInitTreeOnce();
+void  sendLiveToFirebase(float v, float i, float p, bool onFlag);
+void  pushHistoryToFirebase(float v, float i, float p, bool onFlag);
+
+/*********************** SETUP ****************************/
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println(F("ESP8266 V/I/P + Firebase RTDB"));
+
+  // ---- WiFi ----
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print(F("WiFi: connecting"));
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.print(F("\nWiFi connected, IP: ")); Serial.println(WiFi.localIP());
+
+  // ---- Firebase ----
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // Optional: token status debug
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Create / initialize tree
+  firebaseInitTreeOnce();
+
+  Serial.println(F("Init done. Logging at 1 Hz..."));
+}
+
+/************************ LOOP ****************************/
+void loop() {
+  uint32_t now = millis();
+  if (now - t_last < SAMPLE_PERIOD_MS) return;
+  t_last = now;
+
+  // --- Measure ---
+  float voltage = readVoltage();
+  updateDistributionState(voltage);
+  float current = mapVoltageToCurrent(voltage);
+  float power   = voltage * current;
+
+  // --- Serial monitor ---
+  Serial.print(F("Voltage: ")); Serial.print(voltage, 2); Serial.print(F(" V,  "));
+  Serial.print(F("Current: ")); Serial.print(current, 3); Serial.print(F(" A,  "));
+  Serial.print(F("Power: "));   Serial.print(power, 2);   Serial.print(F(" W,  "));
+  Serial.print(F("Current distribution: "));
+  Serial.println(distributionOn ? F("ON") : F("OFF"));
+
+  // --- Firebase ---
+  if (Firebase.ready()) {
+    sendLiveToFirebase(voltage, current, power, distributionOn);
+    if (PUSH_HISTORY) pushHistoryToFirebase(voltage, current, power, distributionOn);
+  }
+}
+
+/******************** IMPLEMENTATION **********************/
+float readVoltage() {
+  int raw = analogRead(A0);
+  float a0_v = (raw * ADC_VREF) / ADC_RES;   // volts seen at A0
+  return a0_v * VOLTAGE_DIVIDER;             // scaled to line voltage
+}
+
+float mapVoltageToCurrent(float v) {
+  // Clamp to expected mapping range
+  if (v < MIN_VOLTAGE) v = MIN_VOLTAGE;
+  if (v > MAX_VOLTAGE) v = MAX_VOLTAGE;
+  float ratio = (v - MIN_VOLTAGE) / (MAX_VOLTAGE - MIN_VOLTAGE);
+  return MIN_CURRENT_A + ratio * (MAX_CURRENT_A - MIN_CURRENT_A);
+}
+
+void updateDistributionState(float v) {
+  if (!distributionOn && v >= TH_ON_V)       distributionOn = true;
+  else if (distributionOn && v <= TH_OFF_V)  distributionOn = false;
+}
+
+// Create the tree if missing, and write a metadata block once.
+void firebaseInitTreeOnce() {
+  FirebaseJson meta, live, root;
+
+  // /meta
+  meta.set("device", "ESP8266");
+  meta.set("model",  "V/I/P simulated current");
+  meta.set("units.voltage", "V");
+  meta.set("units.current", "A");
+  meta.set("units.power",   "W");
+  meta.set("threshold.on_v",  TH_ON_V);
+  meta.set("threshold.off_v", TH_OFF_V);
+
+  // /live (prime zeros so your dashboard sees keys)
+  live.set("voltage_v", 0.0);
+  live.set("current_a", 0.0);
+  live.set("power_w",   0.0);
+  live.set("distribution_on", 0);
+  live.set("ts", 0);
+
+  // Write meta and live (updateNode creates if missing)
+  String metaPath = String(FB_ROOT) + "/meta";
+  String livePath = String(FB_ROOT) + "/live";
+  Firebase.RTDB.updateNode(&fbdo, metaPath, &meta);
+  Firebase.RTDB.updateNode(&fbdo, livePath, &live);
+
+  // Ensure /history exists (no write needed; pushes will create children)
+}
+
+// Update /live atomically in one call and set server timestamp
+void sendLiveToFirebase(float v, float i, float p, bool onFlag) {
+  String livePath = String(FB_ROOT) + "/live";
+  FirebaseJson live;
+  live.set("voltage_v", v);
+  live.set("current_a", i);
+  live.set("power_w",   p);
+  live.set("distribution_on", onFlag ? 1 : 0);
+
+  // First update numeric fields
+  if (!Firebase.RTDB.updateNode(&fbdo, livePath, &live)) {
+    Serial.print(F("live update error: ")); Serial.println(fbdo.errorReason());
+  }
+
+  // Then set server timestamp at /live/ts
+  String tsPath = livePath + "/ts";
+  if (!Firebase.RTDB.setTimestamp(&fbdo, tsPath)) {
+    // Fallback: write millis if server timestamp fails
+    Firebase.RTDB.setInt(&fbdo, tsPath, (int)millis());
+  }
+}
+
+// Push each sample as a new history child with server timestamp
+void pushHistoryToFirebase(float v, float i, float p, bool onFlag) {
+  String histPath = String(FB_ROOT) + "/history";
+  FirebaseJson rec;
+  rec.set("voltage_v", v);
+  rec.set("current_a", i);
+  rec.set("power_w",   p);
+  rec.set("distribution_on", onFlag ? 1 : 0);
+  rec.set("ts", 0);  // will overwrite with server ts below
+
+  // Push JSON -> get unique key path
+  if (Firebase.RTDB.pushJSON(&fbdo, histPath, &rec)) {
+    // Set server timestamp in the pushed record's /ts
+    String pushed = fbdo.dataPath();  // e.g., /30_.../history/-NxAbCdEf
+    String tsp = String(FB_ROOT) + "/history" + pushed.substring(histPath.length()) + "/ts";
+    if (!Firebase.RTDB.setTimestamp(&fbdo, tsp)) {
+      // fallback to millis
+      Firebase.RTDB.setInt(&fbdo, tsp, (int)millis());
+    }
+  } else {
+    Serial.print(F("history push error: ")); Serial.println(fbdo.errorReason());
+  }
+}
