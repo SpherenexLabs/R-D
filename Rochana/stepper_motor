@@ -1,0 +1,92 @@
+/**************************************************************
+ * File: stepper_28BYJ48_test_180.ino (FIXED)
+ * Board: ESP8266 (NodeMCU / Wemos D1 Mini)
+ * Driver: ULN2003
+ * Motor: 28BYJ-48 (5V, 4-phase, geared)
+ * Motion: 180° CW → 180° CCW (continuous)
+ **************************************************************/
+
+// ---- Pin map (change safely here) ----
+const uint8_t COIL[4] = { D5, D6, D7, D8 }; 
+// If the motor turns the wrong way with "direction = +1", either:
+//  (A) swap CW/CCW by flipping direction sign below, or
+//  (B) reorder coils e.g. { D5, D7, D6, D8 } depending on your ULN2003 labeling.
+
+// ---- Half-step sequence (8 states) ----
+const uint8_t HALFSTEP[8][4] = {
+  {1,0,0,0},
+  {1,1,0,0},
+  {0,1,0,0},
+  {0,1,1,0},
+  {0,0,1,0},
+  {0,0,1,1},
+  {0,0,0,1},
+  {1,0,0,1}
+};
+
+// ---- Motor parameters ----
+#define STEPS_PER_REV   4096     // typical for 28BYJ-48 in half-steps (1/64 gear)
+#define STEP_DELAY_US   2000     // 2 ms per half-step; lower = faster (try 1500..3000)
+
+// ---- Motion control ----
+static const long HALF_TURN_STEPS = STEPS_PER_REV / 2;  // 180°
+volatile long stepCount = 0;
+int direction = +1;           // +1 = CW, -1 = CCW
+uint8_t stepIndex = 0;        // 0..7
+unsigned long lastStepMicros = 0;
+
+void setStep(uint8_t idx) {
+  // write the four coils for the current step index
+  for (uint8_t c = 0; c < 4; c++) {
+    digitalWrite(COIL[c], HALFSTEP[idx][c] ? HIGH : LOW);
+  }
+}
+
+void allCoilsOff() {
+  for (uint8_t c = 0; c < 4; c++) digitalWrite(COIL[c], LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nStepper 180° CW / CCW continuous test (fixed pin writes)");
+
+  for (uint8_t c = 0; c < 4; c++) {
+    pinMode(COIL[c], OUTPUT);
+    digitalWrite(COIL[c], LOW);
+  }
+
+  // Optional: small delay at start to avoid D8 (GPIO15) boot-strap quirks
+  delay(200);
+  Serial.println("→ Rotating CW 180°");
+}
+
+void loop() {
+  unsigned long now = micros();
+  if ((unsigned long)(now - lastStepMicros) >= STEP_DELAY_US) {
+    lastStepMicros = now;
+
+    // energize coils for current step
+    setStep(stepIndex);
+
+    // advance step index in desired direction
+    if (direction > 0) {
+      stepIndex = (stepIndex + 1) & 0x07;  // 0..7 wrap
+    } else {
+      stepIndex = (stepIndex + 7) & 0x07;  // -1 modulo 8
+    }
+
+    // count executed half-steps
+    stepCount++;
+    if (stepCount >= HALF_TURN_STEPS) {
+      // reached 180° → reverse
+      direction = -direction;
+      stepCount = 0;
+
+      // brief settle
+      allCoilsOff();
+      delay(300);
+
+      Serial.println(direction > 0 ? "→ Rotating CW 180°" : "← Rotating CCW 180°");
+    }
+  }
+}
