@@ -1,0 +1,118 @@
+// Pins
+const int trigPin = 9;
+const int echoPin = 8;
+const int buzzerPin = 6;
+const int buttonPin = 7;
+const int waterSensorPin = 5;
+// Thresholds
+const int distanceThreshold = 30; // cm
+// Add your timing variables here if needed for buzzer control
+void setup() {
+  Serial.begin(9600);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(waterSensorPin, INPUT);
+  //Serial.println("Sensor Alert System Ready!");
+  
+  // Ready beep
+  digitalWrite(buzzerPin, HIGH);
+  delay(200);
+  digitalWrite(buzzerPin, LOW);
+  
+  delay(1000);
+}
+void loop() {
+  bool objectDetected = false;
+  bool waterDetected = false;
+  bool panicPressed = false;
+  // === Ultrasonic Distance Sensor ===
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH);
+  int distance = duration * 0.034 / 2;
+  
+  if (distance > 0 && distance < distanceThreshold) {
+    //Serial.print("PROXIMITY ALERT: ");
+    //Serial.print(distance);
+    //Serial.println(" cm");
+    objectDetected = true;
+  }
+  // === Water Sensor ===
+  if (digitalRead(waterSensorPin) == LOW) {
+    //Serial.println("WATER DETECTED!");
+    waterDetected = true;
+  }
+  // === Emergency Button ===
+  if (digitalRead(buttonPin) == LOW) {
+    //Serial.println("EMERGENCY BUTTON PRESSED!");
+    panicPressed = true;
+  }
+  // === Sensor Status for Buzzer Control ===
+  // You can use these boolean flags to control your buzzer logic
+  if (panicPressed) 
+  {
+    //Serial.println("STATUS: PANIC_BUTTON");
+    digitalWrite(buzzerPin, HIGH);
+    delay(500);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+    digitalWrite(buzzerPin, HIGH);
+    delay(500);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+    digitalWrite(buzzerPin, HIGH);
+    delay(500);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+  } 
+  else if (objectDetected) 
+  {
+    //Serial.println("STATUS: OBJECT_DETECTED");
+    digitalWrite(buzzerPin, HIGH);
+    delay(3000);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+  } 
+  else if (waterDetected) 
+  {
+    //Serial.println("STATUS: WATER_DETECTED");
+    //Serial.println("STATUS: OBJECT_DETECTED");
+    digitalWrite(buzzerPin, HIGH);
+    delay(1000);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+    digitalWrite(buzzerPin, HIGH);
+    delay(1000);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+    digitalWrite(buzzerPin, HIGH);
+    delay(1000);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+  } 
+  else 
+  {
+    //Serial.println("STATUS: ALL_CLEAR");
+  }
+  // === Your Buzzer Control Section ===
+  // Add your buzzer control logic here based on the sensor states:
+  // if (panicPressed) { /* your panic buzzer code */ }
+  // else if (objectDetected) { /* your object detection buzzer code */ }
+  // else if (waterDetected) { /* your water detection buzzer code */ }
+  // else { /* buzzer off */ }
+  // === Serial Output ===
+  if (objectDetected || waterDetected || panicPressed) 
+  {
+    Serial.println("1"); // Alert active
+  } 
+  else 
+  {
+    Serial.println("0"); // No alert
+  }
+  delay(100); // Fast response time
+}
