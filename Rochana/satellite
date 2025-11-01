@@ -1,0 +1,200 @@
+/**************************************************************
+ * File: env_motion_stepper_firebase_esp8266.ino
+ * Board: ESP8266 (NodeMCU / Wemos D1 Mini)
+ * Sensors: DHT11 (D4), MPU6050 (I2C: SDA=D2, SCL=D1)
+ * Display: SSD1306 128x64 I2C (0x3C)
+ * Stepper: 28BYJ-48 + ULN2003 (D5..D8), 180° CW/CCW continuous
+ * Cloud:  Firebase RTDB -> /satellite/{temp,humidity,pressure,angle,x_axis,y_axis}
+ **************************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/************ WIFI & FIREBASE (as provided) ************/
+#define WIFI_SSID     "animal"
+#define WIFI_PASSWORD "123456789"
+#define API_KEY       "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL  "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/************ I2C & OLED ************/
+#define I2C_SDA_PIN     D2
+#define I2C_SCL_PIN     D1
+#define OLED_ADDR       0x3C
+#define OLED_W          128
+#define OLED_H          64
+#define OLED_RST        -1
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RST);
+
+/************ DHT11 ************/
+#define PIN_DHT   D4
+#define DHT_TYPE  DHT11
+DHT dht(PIN_DHT, DHT_TYPE);
+
+/************ MPU6050 ************/
+Adafruit_MPU6050 mpu;
+
+/************ Stepper (merged “FIXED” version) ************/
+// Pin map (ULN2003 IN1..IN4)
+const uint8_t COIL[4] = { D5, D6, D7, D8 };
+
+// Half-step sequence
+const uint8_t HALFSTEP[8][4] = {
+  {1,0,0,0},
+  {1,1,0,0},
+  {0,1,0,0},
+  {0,1,1,0},
+  {0,0,1,0},
+  {0,0,1,1},
+  {0,0,0,1},
+  {1,0,0,1}
+};
+
+#define STEPS_PER_REV   4096      // typical for 28BYJ-48 half-step
+#define STEP_DELAY_US   2000      // speed (smaller=faster)
+
+static const long HALF_TURN_STEPS = STEPS_PER_REV / 2;  // 180°
+volatile long stepCount = 0;
+int direction = +1;           // +1=CW, -1=CCW
+uint8_t stepIndex = 0;        // 0..7
+unsigned long lastStepMicros = 0;
+
+void setStep(uint8_t idx) {
+  for (uint8_t c = 0; c < 4; c++) {
+    digitalWrite(COIL[c], HALFSTEP[idx][c] ? HIGH : LOW);
+  }
+}
+void allCoilsOff() { for (uint8_t c=0;c<4;c++) digitalWrite(COIL[c], LOW); }
+
+/************ Smoothing & timing ************/
+const float ALPHA = 0.25f;                   // accel low-pass
+static inline float lp(float prev, float in, float a){ return prev + a*(in - prev); }
+const float g0 = 9.80665f;                   // m/s^2
+unsigned long lastOLED = 0, lastFB = 0;
+const unsigned long OLED_MS = 200;           // refresh
+const unsigned long FB_MS   = 3000;          // upload
+
+/************ Live state ************/
+float filt_ax=0, filt_ay=0, filt_az=0;
+float last_temp=NAN, last_hum=NAN;
+
+/******************** SETUP ********************/
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // Stepper pins
+  for (uint8_t c=0;c<4;c++){ pinMode(COIL[c], OUTPUT); digitalWrite(COIL[c], LOW); }
+  delay(200); // D8 bootstrap quirk guard
+  Serial.println("\nStepper: starting → CW 180°");
+
+  // I2C + OLED
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) Serial.println(F("SSD1306 not found"));
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0); display.println("Booting..."); display.display();
+
+  // Sensors
+  dht.begin();
+  if(!mpu.begin()) Serial.println(F("MPU6050 not found at 0x68"));
+  else{
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  display.setCursor(0,12); display.print("WiFi");
+  while(WiFi.status()!=WL_CONNECTED){ display.print("."); display.display(); delay(300); }
+  display.println(" ok"); display.display();
+
+  // Firebase
+  config.api_key       = API_KEY;
+  config.database_url  = DATABASE_URL;
+  auth.user.email      = USER_EMAIL;
+  auth.user.password   = USER_PASSWORD;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  display.setCursor(0,24); display.println("Firebase ok"); display.display();
+  delay(600);
+}
+
+/******************** LOOP ********************/
+void loop() {
+  // ---- Stepper: 180° CW/CCW continuous (non-blocking) ----
+  unsigned long nowMicros = micros();
+  if ((unsigned long)(nowMicros - lastStepMicros) >= STEP_DELAY_US) {
+    lastStepMicros = nowMicros;
+
+    setStep(stepIndex);
+    stepIndex = (direction > 0) ? ((stepIndex + 1) & 0x07) : ((stepIndex + 7) & 0x07);
+
+    stepCount++;
+    if (stepCount >= HALF_TURN_STEPS) {
+      direction = -direction;
+      stepCount = 0;
+      allCoilsOff();
+      delay(300);
+      Serial.println(direction>0 ? "→ Rotating CW 180°" : "← Rotating CCW 180°");
+    }
+  }
+
+  // ---- Sensors ----
+  float tC = dht.readTemperature();
+  float hR = dht.readHumidity();
+  if(!isnan(tC)) last_temp = tC;
+  if(!isnan(hR)) last_hum  = hR;
+
+  sensors_event_t a, g, temp;
+  if (mpu.getEvent(&a, &g, &temp)) {
+    filt_ax = lp(filt_ax, a.acceleration.x, ALPHA);
+    filt_ay = lp(filt_ay, a.acceleration.y, ALPHA);
+    filt_az = lp(filt_az, a.acceleration.z, ALPHA);
+  }
+  float mag_ms2 = sqrtf(filt_ax*filt_ax + filt_ay*filt_ay + filt_az*filt_az);
+  float press_g = mag_ms2 / g0;
+  float pitch_deg = atan2f(-filt_ax, sqrtf(filt_ay*filt_ay + filt_az*filt_az)) * 180.0f / PI;
+
+  // ---- OLED (compact) ----
+  unsigned long now = millis();
+  if (now - lastOLED >= OLED_MS) {
+    lastOLED = now;
+    display.clearDisplay();
+    display.setCursor(0,0);  display.print("T:"); display.print(last_temp,1); display.print("C  ");
+                             display.print("H:"); display.print(last_hum,0);  display.println("%");
+    display.setCursor(0,12); display.print("Ax:"); display.print(filt_ax,2);
+    display.setCursor(64,12);display.print("Ay:"); display.print(filt_ay,2);
+    display.setCursor(0,24); display.print("Press(g):"); display.print(press_g,3);
+    display.setCursor(0,36); display.print("Angle: ");  display.print(pitch_deg,1); display.println(" deg");
+    display.setCursor(0,52); display.print("Step "); display.print(direction>0?"CW ":"CCW");
+                              display.print(" rem ~"); display.print((HALF_TURN_STEPS - stepCount));
+    display.display();
+  }
+
+  // ---- Firebase upload ----
+  if (Firebase.ready() && (now - lastFB >= FB_MS)) {
+    lastFB = now;
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/temp",     last_temp);
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/humidity", last_hum);
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/pressure", press_g);
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/angle",    pitch_deg);
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/x_axis",   filt_ax);
+    Firebase.RTDB.setFloat(&fbdo, "/satellite/y_axis",   filt_ay);
+    // (Optional) check fbdo.errorReason() if needed
+  }
+}
