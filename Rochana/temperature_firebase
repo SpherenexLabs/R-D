@@ -1,0 +1,170 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <Firebase_ESP_Client.h>
+
+// ====== USER CONFIG ======
+#define WIFI_SSID       "power"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// DHT11 on NodeMCU D4 (GPIO2)
+#define DHTPIN    D4
+#define DHTTYPE   DHT11
+
+// OLED (I2C SSD1306 @ 0x3C), NodeMCU defaults: SDA=D2, SCL=D1
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR     0x3C
+#define OLED_RESET    -1
+
+const uint32_t SAMPLE_MS = 2000;   // read/publish every 2s
+#define VALUE_TEXT_SIZE 1           // smaller text
+
+// ====== GLOBALS ======
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+DHT dht(DHTPIN, DHTTYPE);
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastSample = 0;
+
+// --------- UI helpers ----------
+void drawCentered(const String &l1, const String &l2, uint8_t s1, uint8_t s2) {
+  display.clearDisplay();
+
+  // Header
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("DHT11 Monitor");
+
+  // Line 1
+  display.setTextSize(s1);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(l1, 0, 0, &x1, &y1, &w, &h);
+  int16_t cx = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(cx, 20);
+  display.print(l1);
+
+  // Line 2
+  display.setTextSize(s2);
+  display.getTextBounds(l2, 0, 0, &x1, &y1, &w, &h);
+  cx = (SCREEN_WIDTH - w) / 2;
+  int16_t y = (s1 == 1 && s2 == 1) ? 36 : 44;
+  display.setCursor(cx, y);
+  display.print(l2);
+
+  display.display();
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi OK, IP: "); Serial.println(WiFi.localIP());
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  // If you want token status logs, include addons/TokenHelper.h and set:
+  // config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);   // returns void in new versions
+  Serial.println("Firebase.begin() called");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // I2C + OLED
+  Wire.begin(); // ESP8266 default SDA=D2, SCL=D1
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 allocation failed");
+    while (true) { delay(10); }
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // DHT
+  dht.begin();
+
+  // WiFi + Firebase
+  connectWiFi();
+  setupFirebase();
+
+  drawCentered("Starting", "DHT11...", 1, 1);
+}
+
+void publishToFirebase(float tC, float h) {
+  // numeric writes (no quotes)
+  if (!Firebase.RTDB.setFloat(&fbdo, "/dht/temp", tC)) {
+    Serial.print("set /dht/temp failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+  if (!Firebase.RTDB.setFloat(&fbdo, "/dht/humidity", h)) {
+    Serial.print("set /dht/humidity failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void loop() {
+  // Optional guard: wait until Firebase client is ready (token acquired)
+  if (!Firebase.ready()) {
+    // This will be brief after boot; avoids early write errors.
+    delay(100);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature(); // °C
+
+    if (isnan(h) || isnan(t)) {
+      Serial.println("DHT read failed");
+      drawCentered("Sensor", "Read Error", 1, 1);
+      return;
+    }
+
+    // Show on OLED (smaller font)
+    char l1[24], l2[24];
+    snprintf(l1, sizeof(l1), "Temp: %.1f C", t);
+    snprintf(l2, sizeof(l2), "Hum : %.1f %%", h);
+    drawCentered(String(l1), String(l2), VALUE_TEXT_SIZE, VALUE_TEXT_SIZE);
+
+    Serial.print("T="); Serial.print(t, 1);
+    Serial.print("C  H="); Serial.print(h, 1);
+    Serial.println("%");
+
+    // Push to RTDB
+    publishToFirebase(t, h);
+  }
+}
