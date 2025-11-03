@@ -1,0 +1,160 @@
+/**************************************************************
+ * RX (Dock) — Relay + OLED  (FIXED callback signature)
+ * - Streams /Charging
+ *   Charging=0 → Relay ON  (motor powered)
+ *   Charging=1 → Relay OFF (motor stopped)
+ * - Shows Car_2 {V,I,P,SOC} + Charging on OLED
+ **************************************************************/
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===== WIFI & FIREBASE =====
+#define WIFI_SSID     "solar"
+#define WIFI_PASSWORD "123456789"
+#define API_KEY       "AIzaSyBzXzocbdytn4N8vLrT-V2JYZ8pgqWrbC0"
+#define DATABASE_URL  "https://self-balancing-7a9fe-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===== PATHS =====
+#define FB_ROOT       "/28_KS5165_Vehicle_monitoring_Controlling"
+#define CHARGING_PATH FB_ROOT "/Charging"
+#define CAR2_PATH     FB_ROOT "/Car_2"
+
+// ===== OLED =====
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===== RELAY =====
+const int  RELAY_PIN = D5;
+const bool RELAY_ACTIVE_LOW = true; // LOW energizes typical relay module
+
+FirebaseData fbdo, stream;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+String v_str="--", i_str="--", p_str="--", soc_str="--";
+volatile int charging_state = -1;
+
+void setRelayMotorEnable(bool enableMotor){
+  bool level = RELAY_ACTIVE_LOW ? !enableMotor : enableMotor;
+  digitalWrite(RELAY_PIN, level);
+}
+
+void oledInit(){
+  Wire.begin(D2, D1); // SDA, SCL
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // If your OLED is 0x3D, change address above.
+  }
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0); display.println("Dock RX + OLED");
+  display.display();
+}
+
+void oledShow(){
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0,0);  display.print("Charging: ");
+  if (charging_state<0) display.print("—");
+  else display.print(charging_state ? "1 (Docked)" : "0 (Free)");
+
+  display.setCursor(0,16); display.print("V: "); display.print(v_str); display.println(" V");
+  display.setCursor(0,28); display.print("I: "); display.print(i_str); display.println(" A");
+  display.setCursor(0,40); display.print("P: "); display.print(p_str); display.println(" W");
+  display.setCursor(0,52); display.print("SOC: "); display.print(soc_str); display.println(" %");
+
+  display.display();
+}
+
+// ==== FIXED SIGNATURE: by-value FirebaseStream ====
+void streamCallback(FirebaseStream data){
+  int val = -1;
+
+  auto dtype = data.dataTypeEnum();
+  if (dtype == fb_esp_rtdb_data_type_integer)        val = data.intData();
+  else if (dtype == fb_esp_rtdb_data_type_boolean)    val = data.boolData() ? 1 : 0;
+  else if (dtype == fb_esp_rtdb_data_type_string)     val = (data.stringData() == "1") ? 1 : 0;
+
+  if (val != -1){
+    charging_state = val;
+    bool enable = (val == 0); // 0 → ON, 1 → OFF
+    setRelayMotorEnable(enable);
+    Serial.printf("[RX] Charging=%d → Motor %s\n", val, enable ? "ON" : "OFF");
+  }
+}
+
+void streamTimeoutCallback(bool timeout){
+  if (timeout){
+    Serial.println("[RX] Stream timeout → Motor OFF (safety)");
+    setRelayMotorEnable(false);
+    charging_state = -1;
+  }
+}
+
+void fetchCar2(){
+  if (Firebase.RTDB.getString(&fbdo, String(CAR2_PATH)+"/V"))   v_str   = fbdo.stringData(); else v_str="--";
+  if (Firebase.RTDB.getString(&fbdo, String(CAR2_PATH)+"/I"))   i_str   = fbdo.stringData(); else i_str="--";
+  if (Firebase.RTDB.getString(&fbdo, String(CAR2_PATH)+"/P"))   p_str   = fbdo.stringData(); else p_str="--";
+  if (Firebase.RTDB.getString(&fbdo, String(CAR2_PATH)+"/SOC")) soc_str = fbdo.stringData(); else soc_str="--";
+}
+
+void setup(){
+  pinMode(RELAY_PIN, OUTPUT);
+  setRelayMotorEnable(false); // safe default
+
+  Serial.begin(115200);
+  oledInit();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+  Serial.printf("\nWiFi OK %s\n", WiFi.localIP().toString().c_str());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  while (!Firebase.ready()){ delay(200); Serial.print("."); }
+  Serial.println("\nFirebase ready.");
+
+  // Start stream on /Charging
+  if (!Firebase.RTDB.beginStream(&stream, CHARGING_PATH))
+    Serial.printf("Stream begin fail: %s\n", stream.errorReason().c_str());
+
+  // Set callbacks (signatures now match the library)
+  Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+
+  // Initialize relay according to current Charging
+  if (Firebase.RTDB.getInt(&fbdo, CHARGING_PATH)){
+    charging_state = fbdo.intData();
+    setRelayMotorEnable(charging_state == 0);
+  } else {
+    Serial.printf("Initial Charging read fail: %s\n", fbdo.errorReason().c_str());
+  }
+
+  fetchCar2();
+  oledShow();
+}
+
+void loop(){
+  static unsigned long t=0;
+  if (millis()-t >= 1000){
+    t = millis();
+    fetchCar2();
+    oledShow();
+    Serial.printf("[RX] CHG=%d V=%s I=%s P=%s SOC=%s\n",
+                  charging_state, v_str.c_str(), i_str.c_str(),
+                  p_str.c_str(), soc_str.c_str());
+  }
+}
