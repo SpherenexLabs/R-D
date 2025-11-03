@@ -1,0 +1,246 @@
+/*******************************************************
+ * ESP8266 + L298N (no ENA control) + Servo + 128x64 I2C OLED + 3× HC-SR04
+ * Firebase RTDB:
+ *   Triggers:
+ *     /Waste_Management/Bio_Degradable == 1  -> Motor FORWARD
+ *     /Waste_Management/Non_Recyclable == 2 -> Motor BACKWARD
+ *     /Waste_Management/E_Waste == 3        -> Servo 180° + Motor FORWARD
+ *   Writes current motion to:
+ *     /Waste_Management/Direction  ("F","B","S","SVF")
+ *   Ultrasonic distances:
+ *     /Waste_Management/ultra_Bio, ultra_Non, ultra_Ew
+ *   Seeds all nodes on boot if missing.
+ *******************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+// --------- YOUR SETTINGS ----------
+#define WIFI_SSID     "waste"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+// ----------------------------------
+
+// === Servo direction invert ===
+// 1 = invert (opposite direction), 0 = normal direction
+#define SERVO_INVERT 1
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// L298N (ENA jumper ON)
+const int PIN_IN1 = D6; // GPIO12
+const int PIN_IN2 = D7; // GPIO13
+
+// Servo
+const int PIN_SERVO = D4; // GPIO2
+Servo servo1;
+
+// Ultrasonic pins (ECHO via divider!)
+#define TRIG_BIO  D0   // GPIO16
+#define ECHO_BIO  D5   // GPIO14
+#define TRIG_NON  D10  // GPIO1  (TX0)
+#define ECHO_NON  D8   // GPIO15
+#define TRIG_EW   D3   // GPIO0
+#define ECHO_EW   D9   // GPIO3  (RX0)
+
+// Other settings
+const unsigned long US_POLL_INTERVAL_MS = 200;
+const float SOUND_SPEED_CM_PER_US = 0.0343f / 2.0f;
+const int MAX_CM = 400;
+const int INIT_DISTANCE = 100;
+
+// Firebase
+FirebaseData stream;
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Cache
+int bio_val = 0, nonrec_val = 0, ew_val = 0;
+int lastBioCm = INIT_DISTANCE, lastNonCm = INIT_DISTANCE, lastEwCm = INIT_DISTANCE;
+unsigned long lastUSRead = 0;
+
+void showOLED(const String& l1, const String& l2 = "", const String& l3 = "") {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Waste Management");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+  display.setCursor(0, 16); display.println(l1);
+  display.setCursor(0, 28); display.println(l2);
+  display.setCursor(0, 40); display.println(l3);
+  display.display();
+}
+
+// Motor/servo
+void motorStop()     { digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW); }
+void motorForward()  { digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW); }
+void motorBackward() { digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH); }
+
+// Unified angle writer with optional inversion
+void setServoAngle(int deg) {
+  deg = constrain(deg, 0, 180);
+  if (SERVO_INVERT) deg = 180 - deg;   // <<< Opposite direction here
+  servo1.write(deg);
+}
+
+void setDirection(const char* d) {
+  Firebase.RTDB.setString(&fbdo, "/Waste_Management/Direction", d);
+}
+
+void applyLogic() {
+  if (ew_val == 3) {
+    // E_Waste=3 -> servo 180 + motor forward
+    setServoAngle(180);
+    motorForward();
+    setDirection("SVF");
+    showOLED("E_Waste", "-> Servo 180 + FWD");
+  } else if (bio_val == 1) {
+    setServoAngle(0);
+    motorForward();
+    setDirection("F");
+    showOLED("Bio_Degradable", "-> Motor FORWARD");
+  } else if (nonrec_val == 2) {
+    setServoAngle(0);
+    motorBackward();
+    setDirection("B");
+    showOLED("Non_Recyclable", "-> Motor BACKWARD");
+  } else {
+    motorStop();
+    setServoAngle(0);
+    setDirection("S");
+    showOLED("Idle", "Waiting for command...");
+  }
+}
+
+// Ultrasonic helpers
+long measureEchoUS(int trigPin, int echoPin) {
+  pinMode(trigPin, OUTPUT);
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  pinMode(echoPin, INPUT);
+  return pulseIn(echoPin, HIGH, 30000UL); // 30 ms timeout
+}
+
+int measureDistanceCm(int trigPin, int echoPin) {
+  long us = measureEchoUS(trigPin, echoPin);
+  if (us <= 0) return MAX_CM;
+  float cm = us * SOUND_SPEED_CM_PER_US;
+  if (cm < 2) cm = 2; if (cm > MAX_CM) cm = MAX_CM;
+  return (int)round(cm);
+}
+
+void publishIfChanged(const char* path, int &cache, int value) {
+  static unsigned long lastForce = 0;
+  bool force = (millis() - lastForce) > 3000;
+  if (abs(value - cache) >= 1 || force) {
+    Firebase.RTDB.setInt(&fbdo, path, value);
+    cache = value;
+    if (force) lastForce = millis();
+  }
+}
+
+void pollUltrasonics() {
+  if (millis() - lastUSRead < US_POLL_INTERVAL_MS) return;
+  lastUSRead = millis();
+  int bioCm = measureDistanceCm(TRIG_BIO, ECHO_BIO);
+  int nonCm = measureDistanceCm(TRIG_NON, ECHO_NON);
+  int ewCm  = measureDistanceCm(TRIG_EW,  ECHO_EW);
+  publishIfChanged("/Waste_Management/ultra_Bio", lastBioCm, bioCm);
+  publishIfChanged("/Waste_Management/ultra_Non", lastNonCm, nonCm);
+  publishIfChanged("/Waste_Management/ultra_Ew",  lastEwCm,  ewCm);
+}
+
+// Seed RTDB
+void seedWasteNodes() {
+  FirebaseJson j;
+  j.set("Bio_Degradable", 0);
+  j.set("Non_Recyclable", 0);
+  j.set("E_Waste", 0);
+  j.set("Direction", "S");
+  j.set("ultra_Bio", INIT_DISTANCE);
+  j.set("ultra_Non", INIT_DISTANCE);
+  j.set("ultra_Ew", INIT_DISTANCE);
+  Firebase.RTDB.updateNode(&fbdo, "/Waste_Management", &j); // pointer form
+}
+
+// Stream
+void streamCallback(FirebaseStream data) {
+  if (data.dataTypeEnum() == fb_esp_rtdb_data_type_json) {
+    FirebaseJson* json = data.to<FirebaseJson*>();
+    FirebaseJsonData jd;
+    if (json->get(jd, "Bio_Degradable")) bio_val = jd.intValue;
+    if (json->get(jd, "Non_Recyclable")) nonrec_val = jd.intValue;
+    if (json->get(jd, "E_Waste"))        ew_val = jd.intValue;
+  } else if (data.dataTypeEnum() == fb_esp_rtdb_data_type_integer ||
+             data.dataTypeEnum() == fb_esp_rtdb_data_type_float ||
+             data.dataTypeEnum() == fb_esp_rtdb_data_type_double) {
+    String p = data.dataPath(); int v = data.intData();
+    if      (p.endsWith("/Bio_Degradable") || p == "/Bio_Degradable") bio_val = v;
+    else if (p.endsWith("/Non_Recyclable") || p == "/Non_Recyclable") nonrec_val = v;
+    else if (p.endsWith("/E_Waste")        || p == "/E_Waste")        ew_val = v;
+  }
+  applyLogic();
+}
+
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) showOLED("Stream timeout", "Reconnecting...");
+}
+
+void setup() {
+  // Keep Serial closed if using RX/TX as GPIO for ultrasonics
+  // Serial.end();
+
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  motorStop();
+
+  servo1.attach(PIN_SERVO);
+  setServoAngle(0);
+
+  Wire.begin(); // SDA=D2, SCL=D1
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay(); display.display();
+  showOLED("Booting...", "Connecting Wi-Fi");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 20000) delay(300);
+  showOLED("Wi-Fi", WiFi.isConnected() ? "Connected" : "Not connected", WiFi.localIP().toString());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  config.timeout.serverResponse = 10000;
+
+  seedWasteNodes();
+
+  if (!Firebase.RTDB.beginStream(&stream, "/Waste_Management")) {
+    showOLED("Stream error", stream.errorReason());
+  } else {
+    Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
+    showOLED("Ready", "Listening:", "/Waste_Management");
+  }
+}
+
+void loop() {
+  pollUltrasonics();
+}
