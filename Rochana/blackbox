@@ -43,7 +43,7 @@
 #include "addons/RTDBHelper.h"
 
 // ---------- WiFi creds ----------
-#define WIFI_SSID      "line"
+#define WIFI_SSID      "android"
 #define WIFI_PASSWORD  "123456789"
 
 // ---------- Firebase creds ----------
