@@ -1,0 +1,158 @@
+// UNO: MPU6050 + HW-484 Sound (AO->A0) + HC-05 (D0/D1) @ 9600
+// IMMEDIATE trigger: print "1" as soon as EITHER AngleX or Sound increases by 5..10.
+// - Only increases are considered (delta > 0).
+// - Fast loop (~5-8 ms).
+// - Light EMA on sound for responsiveness with a bit of smoothing.
+// - LED blinks briefly on trigger to aid visual debugging.
+// - Optional DEBUG prints (see DEBUG flag).
+//
+// Wiring:
+//   MPU6050: VCC->3.3V/5V (per board), GND->GND, SDA->A4, SCL->A5 (I2C @0x68 typical)
+//   HW-484:  AO->A0 (UNO 0..5V ADC), VCC->5V, GND->GND
+//   HC-05:   (optional) shares Serial on D0/D1; disconnect during sketch upload
+
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <math.h>
+
+// ===== USER OPTIONS =====
+#define DEBUG 0                  // 0=only "1" on trigger, 1=also print live values
+const float ANGLE_MIN_INC = 5.0f;   // lower bound for angle increase (deg)
+const float ANGLE_MAX_INC = 10.0f;  // upper bound for angle increase (deg)
+const float SOUND_MIN_INC = 5.0f;   // lower bound for sound increase (ADC counts)
+const float SOUND_MAX_INC = 10.0f;  // upper bound for sound increase (ADC counts)
+
+// EMA smoothing for sound (0..1). Higher = more responsive, lower = smoother.
+const float SOUND_EMA_ALPHA = 0.6f; // try 0.5..0.8
+
+// Cooldown to avoid flooding multiple prints for the same burst (ms)
+const uint16_t TRIGGER_COOLDOWN_MS = 50;
+
+// Optional: after long inactivity, softly re-baseline sound to track slow drift
+const uint32_t REBASELINE_MS = 3000;
+// ========================
+
+MPU6050 mpu(Wire);
+const uint8_t PIN_SOUND = A0;
+
+bool   mpuReady      = false;
+float  prevAngle     = 0.0f;   // previous angle for increase check
+float  prevSoundEMA  = 0.0f;   // previous EMA sound for increase check
+bool   soundInit     = false;
+
+uint32_t lastTriggerMs   = 0;
+uint32_t lastChangeMs    = 0;   // for optional re-baselining
+
+// Simple LED pulse on trigger (built-in LED = D13 on UNO)
+void pulseLED(uint16_t ms = 20) {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(ms);
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // Hardware UART on pins 0/1 (shared with USB & HC-05)
+  Serial.begin(9600);
+
+  // Sound input
+  pinMode(PIN_SOUND, INPUT);
+
+  // I2C + MPU6050
+  Wire.begin();                 // UNO: SDA=A4, SCL=A5
+  byte err = mpu.begin();       // expects address 0x68 (AD0 low)
+  if (err == 0) {
+    // Give sensor time to settle, then calibrate
+    delay(800);                 // keep still for calibration
+    mpu.calcOffsets(true, true);// calibrate gyro + accel
+
+    // small filter warm-up
+    for (int i = 0; i < 150; i++) { mpu.update(); delay(2); }
+    mpuReady = true;
+    prevAngle = mpu.getAngleX();
+  } else {
+#if DEBUG
+    Serial.print(F("MPU begin error: ")); Serial.println(err);
+#endif
+    mpuReady = false; // sound path will still work
+  }
+
+  // Seed EMA with first few readings so it doesn't lag on startup
+  long seed = 0;
+  for (int i = 0; i < 8; i++) { seed += analogRead(PIN_SOUND); delay(2); }
+  prevSoundEMA = seed / 8.0f;
+  soundInit    = true;
+
+  lastChangeMs = millis();
+
+#if DEBUG
+  Serial.println(F("READY"));
+#endif
+}
+
+void loop() {
+  // Update IMU as fast as possible
+  if (mpuReady) mpu.update();
+
+  // Current readings
+  float angleNow = mpuReady ? mpu.getAngleX() : 0.0f;
+
+  // Sound with EMA for responsiveness
+  int   soundRaw = analogRead(PIN_SOUND); // 0..1023
+  float soundEMA = soundInit
+                   ? (prevSoundEMA + SOUND_EMA_ALPHA * (soundRaw - prevSoundEMA))
+                   : (float)soundRaw;
+
+  soundInit = true;
+
+  // Compute increases (only positive deltas)
+  float dAngleInc = angleNow - prevAngle;      // increase-only check below
+  float dSoundInc = soundEMA - prevSoundEMA;   // increase-only check below
+
+  // Optional slow re-baseline for sound EMA to follow long-term drift
+  uint32_t now = millis();
+  if (fabs(dSoundInc) > 0.5f || fabs(dAngleInc) > 0.02f) {
+    lastChangeMs = now;
+  } else if ((now - lastChangeMs) > REBASELINE_MS) {
+    // Nudge baseline toward current raw to keep windows meaningful over time
+    prevSoundEMA = prevSoundEMA * 0.98f + soundRaw * 0.02f;
+    lastChangeMs = now;
+  }
+
+  // Immediate trigger if either increase falls in its 5..10 window
+  bool cooldownOK = (uint16_t)(now - lastTriggerMs) >= TRIGGER_COOLDOWN_MS;
+
+  bool angleHit = (dAngleInc >= ANGLE_MIN_INC && dAngleInc <= ANGLE_MAX_INC);
+  bool soundHit = (dSoundInc >= SOUND_MIN_INC && dSoundInc <= SOUND_MAX_INC);
+
+#if DEBUG
+  static uint32_t lastDbg = 0;
+  if (now - lastDbg >= 100) { // print at ~10 Hz to keep serial light
+    Serial.print(F("AX="));   Serial.print(angleNow, 2);
+    Serial.print(F(" dAX=")); Serial.print(dAngleInc, 2);
+    Serial.print(F(" SR="));  Serial.print(soundRaw);
+    Serial.print(F(" EMA=")); Serial.print(soundEMA, 1);
+    Serial.print(F(" dS="));  Serial.print(dSoundInc, 1);
+    Serial.print(F(" AHit="));Serial.print(angleHit);
+    Serial.print(F(" SHit="));Serial.print(soundHit);
+    Serial.print(F(" CD="));  Serial.print(cooldownOK);
+    Serial.println();
+    lastDbg = now;
+  }
+#endif
+
+  if (cooldownOK && (angleHit || soundHit)) {
+    Serial.println(F("1"));       // goes to both USB and HC-05 on pins 0/1
+    pulseLED(15);                 // quick visual cue
+    lastTriggerMs = now;
+  }
+
+  // Update previous values for next iteration
+  prevAngle    = angleNow;
+  prevSoundEMA = soundEMA;
+
+  // Short loop delay (~5 ms) keeps CPU usage modest but remains very responsive
+  delay(5);
+}
