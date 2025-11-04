@@ -1,0 +1,148 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+const char* AP_SSID = "ESP32_A_AP";
+const char* AP_PASS = "12345678";
+
+const int BTN1 = 12;
+const int BTN2 = 13;
+const int BTN3 = 14;
+const int BTN4 = 27;
+
+WiFiUDP udp;
+const uint16_t UDP_PORT = 5555;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+const uint32_t DEBOUNCE_MS = 30;
+
+struct BtnState {
+  int pin;
+  int id;                 // <-- numeric code to print on Serial
+  bool lastStable;
+  bool lastRead;
+  uint32_t lastChangeMs;
+  const char* message;    // payload text to send via UDP + show on OLED
+};
+
+BtnState btns[] = {
+  {BTN1, 1, true, true, 0, "HI"},
+  {BTN2, 2, true, true, 0, "HELLO"},
+  {BTN3, 3, true, true, 0, "HOW ARE YOU"},
+  {BTN4, 4, true, true, 0, "I AM GOOD"}
+};
+
+char lastTx[48] = "-";
+char lastRx[48] = "-";
+
+IPAddress getBroadcastIP() {
+  IPAddress ip = WiFi.softAPIP();
+  IPAddress mask = WiFi.subnetMask();
+  IPAddress bcast;
+  for (int i = 0; i < 4; ++i) bcast[i] = (ip[i] & mask[i]) | (~mask[i]);
+  return bcast;
+}
+
+void drawOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print("ESP32_A");
+  //display.print(WiFi.channel());
+
+  display.drawLine(0, 22, 127, 22, SSD1306_WHITE);
+
+  display.setCursor(0, 32);
+  display.print("TX: ");
+  display.println(lastTx);
+
+  display.setCursor(0, 48);
+  display.print("RX: ");
+  display.println(lastRx);
+
+  display.display();
+}
+
+void setupButton(int pin) { pinMode(pin, INPUT_PULLUP); }
+
+void sendMessage(int id, const char* msg) {
+  IPAddress bcast = getBroadcastIP();
+
+  // Send full text over UDP (unchanged behavior)
+  udp.beginPacket(bcast, UDP_PORT);
+  udp.write((const uint8_t*)msg, strlen(msg));
+  udp.endPacket();
+
+  // Serial: print ONLY the number (no labels, no extra text)
+  Serial.println(id);
+
+  // OLED: show the text as before
+  strlcpy(lastTx, msg, sizeof(lastTx));
+  drawOLED();
+}
+
+void setup() {
+  Serial.begin(9600);
+  delay(200);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    // continue without OLED
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Booting...");
+    display.display();
+  }
+
+  for (auto &b : btns) {
+    setupButton(b.pin);
+    b.lastStable = digitalRead(b.pin);
+    b.lastRead   = b.lastStable;
+    b.lastChangeMs = millis();
+  }
+
+  WiFi.softAP(AP_SSID, AP_PASS, 6, 0, 4);
+  delay(200);
+  udp.begin(UDP_PORT);
+
+  drawOLED();
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  // Receive (changed: Serial.print commented out)
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char buf[256];
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len > 0) buf[len] = 0;
+    //Serial.printf("%s\n", buf);               // RX: print text (not numbers)
+    strlcpy(lastRx, buf, sizeof(lastRx));
+    drawOLED();
+  }
+
+  // Buttons (debounced)
+  for (auto &b : btns) {
+    bool val = digitalRead(b.pin); // HIGH=idle, LOW=pressed
+    if (val != b.lastRead) { b.lastRead = val; b.lastChangeMs = now; }
+    if ((now - b.lastChangeMs) >= DEBOUNCE_MS) {
+      if (b.lastStable != b.lastRead) {
+        b.lastStable = b.lastRead;
+        if (b.lastStable == LOW) sendMessage(b.id, b.message);
+      }
+    }
+  }
+
+  static uint32_t lastRefresh = 0;
+  if (now - lastRefresh > 2000) { lastRefresh = now; drawOLED(); }
+}
