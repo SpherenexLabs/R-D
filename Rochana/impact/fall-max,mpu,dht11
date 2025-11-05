@@ -1,0 +1,303 @@
+// -----------------------------------------------------------------------------
+// health_monitor.ino  (ESP8266 NodeMCU)
+// Sensors: MPU6050 (angle + impact), MAX30105 (HR via PBA), DHT (Temp/Hum)
+// OLED: SSD1306 128x32 @ 0x3C  | I2C: SDA=D2 (GPIO4), SCL=D1 (GPIO5)
+// DHT on D5 (GPIO14)
+// HR clamped 70..140, SpO2 realistic >=90 (sim), BP realistic ~120/80 (sim)
+// Firebase RTDB path: /fall_detection
+// Serial prints a single "1" when EITHER: impact is detected OR D6 button is pressed.
+// -----------------------------------------------------------------------------
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+// ---- OLED ----
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---- MPU6050 ----
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MPU6050.h>
+
+// ---- MAX30105 (HR PBA) ----
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// ---- DHT ----
+#include <DHT.h>
+
+// ---- WiFi + Firebase ----
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ------------------------ WiFi / Firebase ------------------------
+#define WIFI_SSID       "coffee"
+#define WIFI_PASSWORD   "123456789"
+
+#define API_KEY         "AIzaSyAhLCi6JBT5ELkAFxTplKBBDdRdpATzQxI"
+#define DATABASE_URL    "https://smart-medicine-vending-machine-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+const String FB_ROOT = "/fall_detection";
+
+// ------------------------ Pin / Config ------------------------
+#define OLED_ADDR         0x3C
+#define OLED_W            128
+#define OLED_H            32
+
+#define DHT_PIN           D5      // GPIO14
+#define DHT_TYPE          DHT11   // change to DHT22 if used
+
+#define BTN_PIN           D6      // GPIO12, active-LOW with internal pullup
+
+const byte  RATE_SIZE = 4;                 // HR moving average length
+const float IMPACT_DELTA_THRESH = 5.0f;    // m/s^2 delta |a| threshold
+const uint32_t IMPACT_HOLD_MS    = 1200;   // keep impact 'true' for 1.2s after a hit
+const uint32_t UPLOAD_INTERVAL_MS = 100;   // ~10 Hz Firebase snapshot
+
+// ------------------------ Globals -----------------------------
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire);
+Adafruit_MPU6050 mpu;
+MAX30105 particleSensor;
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Firebase
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// HR state
+byte  rates[RATE_SIZE] = {0};
+byte  rateSpot = 0;
+long  lastBeat = 0;
+float bpm = 0.0f;
+int   bpmAvg = 0;
+int   lastGoodBpm = 0;
+
+// SpO2 & BP simulation
+float spo2Sim = 97.0f;
+int   bpSys   = 120;
+int   bpDia   = 80;
+
+// Impact state
+float    lastAccelMag = 0.0f;
+bool     impact       = false;
+bool     impactPrev   = false;    // edge detect
+uint32_t impactHoldUntil = 0;
+
+// Button (debounce + edge)
+bool     btnArmed = true;         // one print per press
+uint32_t btnLastMs = 0;           // debounce timestamp
+
+// Timers
+uint32_t lastUpload = 0;
+uint32_t lastPhysioUpdate = 0;
+
+// ------------------------ Helpers -----------------------------
+template<typename T>
+T clampT(T v, T lo, T hi) { return (v < lo) ? lo : (v > hi ? hi : v); }
+
+static float pitchDeg(const sensors_event_t& a) {
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+  return atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / PI;
+}
+
+static float noise(float amp) {
+  float u = (float)random(0, 10001) / 10000.0f;
+  float v = (float)random(0, 10001) / 10000.0f;
+  return (u - v) * amp;
+}
+
+static void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) <= 15000) {
+    delay(250);
+  }
+}
+
+// ------------------------ Setup -------------------------------
+void setup() {
+  Serial.begin(9600); // Only prints "1" on either event
+  delay(10);
+
+  Wire.begin(D2, D1); // SDA, SCL
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) { while (1) yield(); }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setRotation(0);
+  display.setCursor(0, 0);
+  display.println(F("Initializing..."));
+  display.display();
+
+  // MPU6050
+  if (!mpu.begin()) { while (1) yield(); }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // MAX30105
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) { while (1) yield(); }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0x00);
+
+  // DHT
+  dht.begin();
+
+  // WiFi
+  display.clearDisplay(); display.setCursor(0,0);
+  display.println(F("WiFi..."));
+  display.display();
+  connectWiFi();
+
+  // Firebase
+  config.api_key = API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.database_url = DATABASE_URL;
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+
+  // Splash
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(F("Sensors Ready"));
+  display.println(F("Place finger on MAX"));
+  display.display();
+
+  randomSeed(ESP.getChipId());
+}
+
+// ------------------------ Loop --------------------------------
+void loop() {
+  bool printedThisLoop = false;   // prevent multiple "1"s in a single iteration
+
+  // --- Read sensors ---
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float pitch = pitchDeg(a);
+
+  // Impact detection with hold window + edge detect
+  float accelMag = sqrtf(a.acceleration.x*a.acceleration.x +
+                         a.acceleration.y*a.acceleration.y +
+                         a.acceleration.z*a.acceleration.z);
+  bool impactNow = (fabsf(accelMag - lastAccelMag) > IMPACT_DELTA_THRESH);
+  lastAccelMag = accelMag;
+  if (impactNow) {
+    impactHoldUntil = millis() + IMPACT_HOLD_MS;  // extend window on each hit
+  }
+  bool impactWindow = (millis() < impactHoldUntil);
+  impact = impactWindow;
+
+  // --- IMPACT EDGE: print once when impact transitions false->true ---
+  if (!impactPrev && impact && !printedThisLoop) {
+    Serial.println("1");
+    Firebase.RTDB.setInt(&fbdo, (FB_ROOT + "/alert").c_str(), 1);
+    printedThisLoop = true;
+  }
+  impactPrev = impact;
+
+  // DHT read
+  float h  = dht.readHumidity();
+  float tc = dht.readTemperature(); // Celsius
+  bool dhtOK = !(isnan(h) || isnan(tc));
+
+  // MAX30105 HR PBA
+  long ir = particleSensor.getIR();
+  if (checkForBeat(ir)) {
+    long now = millis();
+    long dt  = now - lastBeat;
+    lastBeat = now;
+    float instBpm = 60.0f / (dt / 1000.0f);
+    if (instBpm > 20 && instBpm < 255) {
+      rates[rateSpot++] = (byte)instBpm;
+      rateSpot %= RATE_SIZE;
+      int sum = 0; for (byte i = 0; i < RATE_SIZE; i++) sum += rates[i];
+      bpmAvg = sum / RATE_SIZE;
+      bpm    = instBpm;
+      bpmAvg = clampT(bpmAvg, 70, 140);
+      bpm    = clampT(bpm,    70.0f, 140.0f);
+      lastGoodBpm = bpmAvg;
+    }
+  }
+  bool finger = (ir >= 50000);
+  if (!finger) bpmAvg = lastGoodBpm;
+
+  // Slow drift for simulated vitals (~1 Hz)
+  if (millis() - lastPhysioUpdate >= 1000) {
+    lastPhysioUpdate = millis();
+    spo2Sim += noise(0.6f);
+    spo2Sim  = clampT(spo2Sim, 94.0f, 99.0f);
+    if (!finger) spo2Sim = clampT(spo2Sim, 90.0f, 97.0f);
+    bpSys = (int)clampT(120 + noise(4.0f), 105.0f, 135.0f);
+    bpDia = (int)clampT(80  + noise(3.0f),  65.0f,  90.0f);
+  }
+  int dispSpo2 = (int)max(90.0f, spo2Sim);
+
+  // --- BUTTON EDGE: print once when pressed (regardless of impact) ---
+  bool pressed = (digitalRead(BTN_PIN) == LOW); // active-LOW
+  uint32_t ms = millis();
+  if (ms - btnLastMs >= 30) { // debounce
+    btnLastMs = ms;
+
+    if (!pressed) {
+      btnArmed = true; // re-arm on release
+    }
+    if (pressed && btnArmed && !printedThisLoop) {
+      Serial.println("1");
+      Firebase.RTDB.setInt(&fbdo, (FB_ROOT + "/alert").c_str(), 1);
+      btnArmed = false;
+      printedThisLoop = true;
+    }
+  }
+
+  // --- OLED ---
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("Ang:")); display.print(pitch, 0);
+  display.print(F("  Imp:")); display.print(impact ? F("Y") : F("n"));
+
+  display.setCursor(0, 8);
+  display.print(F("HR:")); if (bpmAvg > 0) display.print(bpmAvg); else display.print(F("72"));
+  display.print(F("  SpO2:")); display.print(dispSpo2); display.print(F("%"));
+
+  display.setCursor(0, 16);
+  display.print(F("T:")); if (!dhtOK) display.print(F("--")); else display.print(tc, 1);
+  display.print(F("C H:")); if (!dhtOK) display.print(F("--")); else display.print((int)h); display.print(F("%"));
+
+  display.setCursor(0, 24);
+  display.print(F("BP: ")); display.print(bpSys); display.print(F("/")); display.print(bpDia);
+  display.display();
+
+  // --- Firebase snapshot (silent) ---
+  if (millis() - lastUpload >= UPLOAD_INTERVAL_MS) {
+    lastUpload = millis();
+    FirebaseJson json;
+    json.set("angle_pitch_deg", pitch);
+    json.set("impact", impact);
+    json.set("hr_bpm", bpmAvg);
+    json.set("spo2_pct", dispSpo2);
+    json.set("bp_sys", bpSys);
+    json.set("bp_dia", bpDia);
+    if (dhtOK) {
+      json.set("temp_c", tc);
+      json.set("hum_pct", (int)h);
+    }
+    Firebase.RTDB.setJSON(&fbdo, (FB_ROOT + "/snapshot").c_str(), &json);
+  }
+
+  delay(50); // ~20 Hz loop; uploads ~10 Hz
+}
