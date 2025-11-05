@@ -1,0 +1,418 @@
+/************************************************************
+ * Minimal Power Bank Controller (ESP8266 + Firebase RTDB)
+ * + Voltage Sensor on A0 -> OLED + Firebase
+ * + Simulated Current derived from Voltage (randomized)
+ *
+ * RTDB paths used:
+ *   /Power_bank/Servo
+ *   /Power_bank/Voltage   (float, V)
+ *   /Power_bank/Current   (float, mA)
+ *
+ * Commands:
+ *   1 -> Servo 180°, OLED: "Please take your charger" (stays at 180°)
+ *   2 -> OLED: "Please put your charger" 10 s, then Servo 0°
+ *   3 -> Relay ON,  OLED: "Relay ON"
+ *   4 -> Relay OFF, OLED: "Relay OFF"
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Servo.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "power"
+#define WIFI_PASSWORD "123456789"
+
+// IMPORTANT: no trailing slash in DATABASE_URL
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// RTDB paths — ONLY these will be touched
+static const char* CMD_PATH   = "/Power_bank/Servo";
+static const char* VOLT_PATH  = "/Power_bank/Voltage";
+static const char* CURR_PATH  = "/Power_bank/Current";
+
+// ---------- Pins ----------
+#define SERVO_PIN   D5    // GPIO14
+#define RELAY_PIN   D6    // GPIO12
+#define I2C_SDA     D2    // GPIO4
+#define I2C_SCL     D1    // GPIO5
+
+// If your relay is ACTIVE LOW, set true; if ACTIVE HIGH, set false.
+const bool RELAY_ACTIVE_LOW = true;
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR_1  0x3C
+#define OLED_ADDR_2  0x3D
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+uint8_t g_oled_addr = 0;   // will be detected
+
+// ---------- Voltage Sensor on A0 (CALIBRATION) ----------
+// If your NodeMCU A0 pad tolerates ~3.2V (onboard divider), keep true.
+// If bare 0–1.0V ADC input on your board, set false.
+const bool NODEMCU_A0_3V3 = true;
+
+// A0 pad full-scale voltage
+const float ADC_A0_FULLSCALE_V = NODEMCU_A0_3V3 ? 3.2f : 1.0f;
+
+// ESP8266 ADC resolution
+const float ADC_COUNTS = 1023.0f;
+
+// Typical 0–25V sensor: R1=30k, R2=7.5k -> ratio = (R1+R2)/R2 = 5.0
+const float VSENSE_R1 = 30000.0f;  // ohms
+const float VSENSE_R2 = 7500.0f;   // ohms
+
+// Fine calibration for voltage
+const float VOLT_CAL_GAIN = 1.00f; // multiplicative tweak
+const float VOLT_CAL_OFFS = 0.00f; // additive tweak (volts)
+
+// ---------- Simulated current model ----------
+// I_sim ≈ (Voltage / Vscale) * Imax  ± jitter
+const float ISIM_VSCALE = 12.0f;   // scale reference voltage
+const float ISIM_IMAX_mA = 500.0f; // peak simulated current at VSCALE volts
+const int   ISIM_JITTER_mA = 40;   // random jitter +/- mA
+
+// ---------- Servo ----------
+Servo gateServo;
+int currentServoDeg = 0;
+
+// ---------- Firebase ----------
+FirebaseData    fbdo;
+FirebaseAuth    auth;
+FirebaseConfig  config;
+
+// Track duplicates so we only act when value changes
+int  lastCommand = -999;
+bool streamOK = false;
+
+// Telemetry
+float g_voltage_V = 0.0f;
+float g_current_mA = 0.0f;
+
+uint32_t lastSampleMs = 0;
+uint32_t lastPushMs   = 0;
+uint32_t msgHoldUntil = 0;
+String   msg1, msg2;
+
+// ---------- Helpers ----------
+void relayWrite(bool on) {
+  if (RELAY_ACTIVE_LOW) digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  else                  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+}
+
+void i2cScan() {
+  Serial.println(F("\n[I2C] Scanning..."));
+  byte count = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(F("  - Found I2C device at 0x"));
+      if (addr < 16) Serial.print('0');
+      Serial.println(addr, HEX);
+      count++;
+      delay(2);
+    }
+  }
+  if (count == 0) Serial.println(F("  - No I2C devices found"));
+  Serial.println();
+}
+
+bool initOLED() {
+  // Try 0x3C
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR_1)) {
+    g_oled_addr = OLED_ADDR_1;
+    return true;
+  }
+  delay(200);
+  // Try 0x3D
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR_2)) {
+    g_oled_addr = OLED_ADDR_2;
+    return true;
+  }
+  return false;
+}
+
+void showCentered(const String &line1, const String &line2 = "", const String &line3 = "") {
+  if (g_oled_addr == 0) return; // OLED not initialized
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  int lines = 0;
+  if (line1.length()) lines++;
+  if (line2.length()) lines++;
+  if (line3.length()) lines++;
+
+  int startY = (SCREEN_HEIGHT - (lines * 10)) / 2;
+
+  auto drawLine = [&](int y, const String &txt) {
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+    int x = (SCREEN_WIDTH - w) / 2;
+    display.setCursor(x < 0 ? 0 : x, y);
+    display.print(txt);
+  };
+
+  int y = startY;
+  if (line1.length()) { drawLine(y, line1); y += 12; }
+  if (line2.length()) { drawLine(y, line2); y += 12; }
+  if (line3.length()) { drawLine(y, line3); }
+  display.display();
+}
+
+void splash(const String &title, const String &subtitle = "") {
+  if (g_oled_addr == 0) return;
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 8);
+  display.print(title);
+  display.setTextSize(1);
+  display.setCursor(2, 40);
+  display.print(subtitle);
+  display.display();
+}
+
+void showTelemetry() {
+  if (g_oled_addr == 0) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(2, 10);
+  display.print("Battery Monitor");
+
+  char line[32];
+  snprintf(line, sizeof(line), "Voltage: %.2f V", g_voltage_V);
+  display.setCursor(2, 28); display.print(line);
+
+  snprintf(line, sizeof(line), "Current: %.1f mA", g_current_mA);
+  display.setCursor(2, 42); display.print(line);
+
+  display.display();
+}
+
+void setServoAngle(int deg) {
+  deg = constrain(deg, 0, 180);
+  if (!gateServo.attached()) gateServo.attach(SERVO_PIN, 500, 2400);
+  gateServo.write(deg);
+  currentServoDeg = deg;
+  delay(700); // settle
+}
+
+void ensureNodesExist() {
+  // Create nodes if missing; do not overwrite existing values
+  if (!Firebase.RTDB.getInt(&fbdo, CMD_PATH))   Firebase.RTDB.setInt(&fbdo, CMD_PATH, 0);
+  if (!Firebase.RTDB.getFloat(&fbdo, VOLT_PATH)) Firebase.RTDB.setFloat(&fbdo, VOLT_PATH, 0.0f);
+  if (!Firebase.RTDB.getFloat(&fbdo, CURR_PATH)) Firebase.RTDB.setFloat(&fbdo, CURR_PATH, 0.0f);
+}
+
+float readVoltageFromA0() {
+  int raw = analogRead(A0);  // 0..1023
+  float v_pad = (raw / ADC_COUNTS) * ADC_A0_FULLSCALE_V;  // voltage at A0 pad
+  float ratio = (VSENSE_R1 + VSENSE_R2) / VSENSE_R2;      // divider ratio
+  float v = v_pad * ratio;
+  // fine calibration
+  v = v * VOLT_CAL_GAIN + VOLT_CAL_OFFS;
+  return v;
+}
+
+float simulateCurrent_mA(float volts) {
+  // Base linear relation + jitter
+  float base = (volts / ISIM_VSCALE) * ISIM_IMAX_mA;
+  if (base < 0) base = 0;
+  // Add +/- jitter
+  int jitter = random(-ISIM_JITTER_mA, ISIM_JITTER_mA + 1);
+  float mA = base + jitter;
+  if (mA < 0) mA = 0;
+  return mA;
+}
+
+void applyInitialCommand() {
+  if (Firebase.RTDB.getInt(&fbdo, CMD_PATH)) {
+    int cmd = fbdo.intData();
+    lastCommand = -999; // force handle
+    if (cmd == 1) {
+      setServoAngle(180);
+      showCentered("Please take", "your charger");
+      lastCommand = 1;
+      msgHoldUntil = millis() + 2000;
+    } else if (cmd == 2) {
+      showCentered("Please put", "your charger");
+      msgHoldUntil = millis() + 10000;
+      uint32_t t0 = millis();
+      while (millis() - t0 < 10000) { yield(); delay(5); }
+      setServoAngle(0);
+      showCentered("Gate closed", "Servo at 0 deg");
+      lastCommand = 2;
+      msgHoldUntil = millis() + 2000;
+    } else if (cmd == 3) {
+      relayWrite(true);
+      showCentered("Relay", "ON");
+      lastCommand = 3;
+      msgHoldUntil = millis() + 2000;
+    } else if (cmd == 4) {
+      relayWrite(false);
+      showCentered("Relay", "OFF");
+      lastCommand = 4;
+      msgHoldUntil = millis() + 2000;
+    } else {
+      showTelemetry();
+      lastCommand = cmd;
+    }
+  }
+}
+
+void handleCommand(int cmd) {
+  if (cmd == lastCommand) return;  // ignore duplicates
+  lastCommand = cmd;
+
+  switch (cmd) {
+    case 1:
+      setServoAngle(180);
+      showCentered("Please take", "your charger");
+      msgHoldUntil = millis() + 2000;
+      break;
+
+    case 2: {
+      showCentered("Please put", "your charger");
+      msgHoldUntil = millis() + 10000;
+      uint32_t t0 = millis();
+      while (millis() - t0 < 10000) { yield(); delay(5); } // 10 s
+      setServoAngle(0);
+      showCentered("Gate closed", "Servo at 0 deg");
+      msgHoldUntil = millis() + 2000;
+      break;
+    }
+
+    case 3:
+      relayWrite(true);
+      showCentered("Relay", "ON");
+      msgHoldUntil = millis() + 2000;
+      break;
+
+    case 4:
+      relayWrite(false);
+      showCentered("Relay", "OFF");
+      msgHoldUntil = millis() + 2000;
+      break;
+
+    default:
+      // fall back to live telemetry
+      break;
+  }
+}
+
+// Stream callbacks
+void streamCallback(FirebaseStream data) {
+  if (data.dataType() == "int" || data.dataType() == "number") {
+    handleCommand(data.intData());
+  } else if (data.dataType() == "string") {
+    handleCommand(data.stringData().toInt());
+  }
+}
+
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) streamOK = false;
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 25000) {
+    delay(400);
+  }
+}
+
+void startStream() {
+  streamOK = Firebase.RTDB.beginStream(&fbdo, CMD_PATH);
+  if (streamOK) Firebase.RTDB.setStreamCallback(&fbdo, streamCallback, streamTimeoutCallback);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Seed RNG for simulated current jitter
+  randomSeed(analogRead(A0));
+
+  // IO
+  pinMode(RELAY_PIN, OUTPUT);
+  relayWrite(false); // default OFF
+
+  // I2C + scan
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // Fast I2C for stability on some modules
+  i2cScan();
+
+  // OLED auto-detect
+  if (initOLED()) {
+    splash("Power Bank", "Controller");
+    delay(800);
+  } else {
+    Serial.println(F("[OLED] Not found at 0x3C or 0x3D. Check wiring or controller type (SH1106?)."));
+  }
+
+  // Servo initial to 0 (physical boot default)
+  setServoAngle(0);
+
+  // WiFi
+  connectWiFi();
+  showCentered("WiFi", (WiFi.status() == WL_CONNECTED) ? "Connected" : "Not Connected");
+
+  // Firebase config
+  config.api_key      = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback; // from TokenHelper.h
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectNetwork(true);
+
+  // Ensure nodes exist (non-destructive)
+  ensureNodesExist();
+
+  // Start stream then apply current value once
+  startStream();
+  applyInitialCommand();
+
+  showCentered("Ready", "Waiting command...");
+}
+
+void loop() {
+  // Sample voltage every 1 s and compute simulated current
+  if (millis() - lastSampleMs > 1000) {
+    g_voltage_V = readVoltageFromA0();
+    g_current_mA = simulateCurrent_mA(g_voltage_V);
+    lastSampleMs = millis();
+  }
+
+  // Push to Firebase every 2 s
+  if (Firebase.ready() && millis() - lastPushMs > 2000) {
+    Firebase.RTDB.setFloat(&fbdo, VOLT_PATH, g_voltage_V);
+    Firebase.RTDB.setFloat(&fbdo, CURR_PATH, g_current_mA);
+    lastPushMs = millis();
+  }
+
+  // OLED: show command messages briefly, else live telemetry
+  if (millis() > msgHoldUntil) {
+    showTelemetry();
+  }
+
+  delay(50);
+}
