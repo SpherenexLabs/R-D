@@ -1,0 +1,295 @@
+/*************************************************************
+ * ESP8266 + 4x IR Sensors + Servo + Firebase RTDB
+ *
+ * Firebase RTDB structure:
+ *   /Tollgate/IR1    -> int (0 or 1)
+ *   /Tollgate/IR2    -> int (0 or 1)
+ *   /Tollgate/IR3    -> int (0 or 1)
+ *   /Tollgate/IR4    -> int (0 or 1)
+ *   /Tollgate/Servo  -> int (0 or 90)
+ *   /Tollgate/Entry  -> String ("IR2","IR3","IR4")   // IR1 will NOT update this
+ *
+ * Logic:
+ *   - All IR states logged to Firebase.
+ *   - Entry stores which of IR2/IR3/IR4 was last detected.
+ *   - ONLY IR1 controls the servo:
+ *       IR1 == 1 -> Servo = 90°
+ *       IR1 == 0 -> Servo = 0°
+ *************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Servo.h>
+
+// Optional debug helpers (from Firebase library examples)
+// If you don't have these files, just comment out these 2 lines.
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================== HARDWARE PINS ==================
+// Change these according to your wiring
+const int IR1_PIN = D1;   // GPIO5
+const int IR2_PIN = D2;   // GPIO4
+const int IR3_PIN = D5;   // GPIO14
+const int IR4_PIN = D6;   // GPIO12
+const int SERVO_PIN = D7; // GPIO13
+
+// If your IR sensors are "active LOW" (output LOW when object detected), keep true.
+// If they are active HIGH, set this to false.
+const bool IR_ACTIVE_LOW = true;
+
+// Servo object
+Servo gateServo;
+
+// Last known states to detect changes
+int lastIR1 = -1;
+int lastIR2 = -1;
+int lastIR3 = -1;
+int lastIR4 = -1;
+
+// Current servo angle
+int servoAngle = 0;
+
+// Helper: read IR and convert to 0/1 based on IR_ACTIVE_LOW
+int readIRState(int pin)
+{
+  int raw = digitalRead(pin);
+  if (IR_ACTIVE_LOW)
+  {
+    // Obstacle detected when pin is LOW
+    return (raw == LOW) ? 1 : 0;
+  }
+  else
+  {
+    // Obstacle detected when pin is HIGH
+    return (raw == HIGH) ? 1 : 0;
+  }
+}
+
+void setupWiFi()
+{
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setupFirebase()
+{
+  // Configure Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Sign in with email & password (or use anonymous sign-in if you prefer)
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // For debug messages about token generation
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Firebase initialized.");
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  // Pin modes
+  pinMode(IR1_PIN, INPUT);
+  pinMode(IR2_PIN, INPUT);
+  pinMode(IR3_PIN, INPUT);
+  pinMode(IR4_PIN, INPUT);
+
+  // Attach servo
+  gateServo.attach(SERVO_PIN);
+
+  // Initial servo position (closed gate)
+  servoAngle = 0;
+  gateServo.write(servoAngle);
+
+  // Start Wi-Fi and Firebase
+  setupWiFi();
+  setupFirebase();
+
+  // Initialize IR states
+  lastIR1 = readIRState(IR1_PIN);
+  lastIR2 = readIRState(IR2_PIN);
+  lastIR3 = readIRState(IR3_PIN);
+  lastIR4 = readIRState(IR4_PIN);
+
+  // Push initial values to Firebase
+  if (Firebase.ready())
+  {
+    Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR1", lastIR1);
+    Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR2", lastIR2);
+    Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR3", lastIR3);
+    Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR4", lastIR4);
+    Firebase.RTDB.setInt(&fbdo, "/Tollgate/Servo", servoAngle);
+    Firebase.RTDB.setString(&fbdo, "/Tollgate/Entry", "NONE");
+  }
+}
+
+void updateEntryNode(const String &irName)
+{
+  if (!Firebase.ready())
+    return;
+
+  if (Firebase.RTDB.setString(&fbdo, "/Tollgate/Entry", irName))
+  {
+    Serial.print("Entry updated: ");
+    Serial.println(irName);
+  }
+  else
+  {
+    Serial.print("Failed to update Entry: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void updateServoFromIR1(int ir1State)
+{
+  // Only IR1 should control the servo
+  int desiredAngle = (ir1State == 1) ? 90 : 0;
+
+  if (desiredAngle != servoAngle)
+  {
+    servoAngle = desiredAngle;
+    gateServo.write(servoAngle);
+    Serial.print("Servo moved to: ");
+    Serial.println(servoAngle);
+
+    if (Firebase.ready())
+    {
+      if (!Firebase.RTDB.setInt(&fbdo, "/Tollgate/Servo", servoAngle))
+      {
+        Serial.print("Failed to update Servo in Firebase: ");
+        Serial.println(fbdo.errorReason());
+      }
+    }
+  }
+}
+
+void loop()
+{
+  // Do nothing if Firebase is not ready yet
+  if (!Firebase.ready())
+  {
+    delay(200);
+    return;
+  }
+
+  // Read all IR states
+  int ir1 = readIRState(IR1_PIN);
+  int ir2 = readIRState(IR2_PIN);
+  int ir3 = readIRState(IR3_PIN);
+  int ir4 = readIRState(IR4_PIN);
+
+  // IR1: controls Servo + logs value (NO Entry update for IR1)
+  if (ir1 != lastIR1)
+  {
+    lastIR1 = ir1;
+    Serial.print("IR1 changed: ");
+    Serial.println(ir1);
+
+    // Update RTDB
+    if (!Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR1", ir1))
+    {
+      Serial.print("Failed to update IR1: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    // Update servo based on IR1
+    updateServoFromIR1(ir1);
+
+    // NOTE: We do NOT call updateEntryNode("IR1") here anymore
+  }
+
+  // IR2: logs + Entry
+  if (ir2 != lastIR2)
+  {
+    lastIR2 = ir2;
+    Serial.print("IR2 changed: ");
+    Serial.println(ir2);
+
+    if (!Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR2", ir2))
+    {
+      Serial.print("Failed to update IR2: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    if (ir2 == 1)
+    {
+      updateEntryNode("IR2");
+    }
+  }
+
+  // IR3: logs + Entry
+  if (ir3 != lastIR3)
+  {
+    lastIR3 = ir3;
+    Serial.print("IR3 changed: ");
+    Serial.println(ir3);
+
+    if (!Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR3", ir3))
+    {
+      Serial.print("Failed to update IR3: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    if (ir3 == 1)
+    {
+      updateEntryNode("IR3");
+    }
+  }
+
+  // IR4: logs + Entry
+  if (ir4 != lastIR4)
+  {
+    lastIR4 = ir4;
+    Serial.print("IR4 changed: ");
+    Serial.println(ir4);
+
+    if (!Firebase.RTDB.setInt(&fbdo, "/Tollgate/IR4", ir4))
+    {
+      Serial.print("Failed to update IR4: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    if (ir4 == 1)
+    {
+      updateEntryNode("IR4");
+    }
+  }
+
+  // Small delay so we don't hammer Firebase too hard
+  delay(100);
+}
