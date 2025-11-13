@@ -1,0 +1,433 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+// IMPORTANT: no trailing slash in DATABASE_URL
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// If your relay is "LOW-level trigger" (IN pulled LOW = ON), set true.
+#define RELAY_ACTIVE_LOW  true
+
+// Ultrasonic settings
+const int TRIG_PIN = D4;   // GPIO2
+const int ECHO_PIN = D8;   // GPIO15
+const float OBSTACLE_THRESHOLD_CM = 20.0;  // obstacle if <= 20cm
+const float OBSTACLE_CLEAR_CM     = 25.0;  // clear if > 25cm (hysteresis)
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// L298N motor pins
+const int IN1 = D1;  // GPIO5
+const int IN2 = D2;  // GPIO4
+const int IN3 = D5;  // GPIO14
+const int IN4 = D6;  // GPIO12
+
+// Relay pins (3 pumps used)
+const int RELAY_PUMP1 = D7;  // GPIO13 -> CH1 (Pump1)
+const int RELAY_PUMP2 = D0;  // GPIO16 -> CH2 (Pump2)
+const int RELAY_PUMP3 = D3;  // GPIO0  -> CH3 (Pump3)
+
+// Timing
+const unsigned long POLL_MS = 250;
+unsigned long lastPoll = 0;
+
+// State trackers
+char desiredDir     = 'S';   // latest direction from Firebase (current/visible)
+char lastCmd        = 'X';   // last command actually applied to motors
+char lastNonStopDir = 'S';   // last non-'S' direction (F/B/L/R) for resume
+
+int  lastSpray  = -1;    // last Spray value written
+int  lastPlant  = -1;    // last Plant value read
+int  lastObject = -1;    // last Object value written to Firebase
+
+bool obstacleActive = false;  // true when obstacle detected
+
+// Forward declarations
+void initFirebaseNodes();
+void pollDirection();
+void pollPlant();
+void pollUltrasonic();
+float readDistanceCM();
+
+// ------------ Motor helpers ------------
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void driveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void driveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void applyCommand(char c) {
+  switch (c) {
+    case 'F': driveForward();  break;
+    case 'B': driveBackward(); break;
+    case 'L': turnLeft();      break;
+    case 'R': turnRight();     break;
+    case 'S':
+    default:  stopMotors();    break;
+  }
+  lastCmd = c;
+  Serial.printf("[MOTOR] Command applied: %c\n", c);
+}
+
+// ------------ Relay helpers ------------
+void relayWrite(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+void allPumpsOff() {
+  relayWrite(RELAY_PUMP1, false);
+  relayWrite(RELAY_PUMP2, false);
+  relayWrite(RELAY_PUMP3, false);
+}
+
+void setPumpChannel(int ch) {
+  // Turn everything off first
+  allPumpsOff();
+
+  switch (ch) {
+    case 1:
+      relayWrite(RELAY_PUMP1, true);
+      Serial.println("[PUMP] Pump1 ON (Relay1)");
+      break;
+    case 2:
+      relayWrite(RELAY_PUMP2, true);
+      Serial.println("[PUMP] Pump2 ON (Relay2)");
+      break;
+    case 3:
+      relayWrite(RELAY_PUMP3, true);
+      Serial.println("[PUMP] Pump3 ON (Relay3)");
+      break;
+    default:
+      Serial.println("[PUMP] All OFF");
+      break;
+  }
+}
+
+// ------------ Setup blocks ------------
+void setupPins() {
+  // Motors
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  // Relays
+  pinMode(RELAY_PUMP1, OUTPUT);
+  pinMode(RELAY_PUMP2, OUTPUT);
+  pinMode(RELAY_PUMP3, OUTPUT);
+  allPumpsOff();
+
+  // Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+}
+
+void setupWiFi() {
+  Serial.printf("\n[WiFi] Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print('.');
+  }
+  Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+// ---- Create default nodes in Firebase if they don't exist ----
+void initFirebaseNodes() {
+  Serial.println("[Firebase] Initializing default nodes...");
+
+  // Direction = "S"
+  if (Firebase.RTDB.setString(&fbdo, "/Pesiticide/Direction", "S")) {
+    Serial.println("[Firebase] /Pesiticide/Direction = \"S\" (OK)");
+  } else {
+    Serial.printf("[Firebase] Failed to set Direction: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  // Spray = 0 (all pumps OFF)
+  if (Firebase.RTDB.setInt(&fbdo, "/Pesiticide/Spray", 0)) {
+    Serial.println("[Firebase] /Pesiticide/Spray = 0 (OK)");
+    lastSpray = 0;
+  } else {
+    Serial.printf("[Firebase] Failed to set Spray: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  // Plant = 0 (no plant selected)
+  if (Firebase.RTDB.setInt(&fbdo, "/Pesiticide/Plant", 0)) {
+    Serial.println("[Firebase] /Pesiticide/Plant = 0 (OK)");
+    lastPlant = 0;
+  } else {
+    Serial.printf("[Firebase] Failed to set Plant: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  // Object = 0 (no obstacle)
+  if (Firebase.RTDB.setInt(&fbdo, "/Pesiticide/Object", 0)) {
+    Serial.println("[Firebase] /Pesiticide/Object = 0 (OK)");
+    lastObject = 0;
+  } else {
+    Serial.printf("[Firebase] Failed to set Object: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Email/password auth
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("[Firebase] Started with email/password auth");
+
+  // Wait for Firebase to be ready (token issued)
+  unsigned long start = millis();
+  while (!Firebase.ready() && millis() - start < 15000) {
+    Serial.println("[Firebase] Waiting for ready...");
+    delay(500);
+  }
+
+  if (Firebase.ready()) {
+    Serial.println("[Firebase] Ready. Initializing nodes...");
+    initFirebaseNodes();
+  } else {
+    Serial.println("[Firebase] Not ready, could not init nodes");
+  }
+}
+
+// ------------ Pollers ------------
+
+// Direction: F/B/L/R/S from Firebase
+void pollDirection() {
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.getString(&fbdo, "/Pesiticide/Direction")) {
+    String val = fbdo.stringData();
+    val.trim();
+    if (val.length() > 0) {
+      char c = toupper(val.charAt(0));
+      if (c != 'F' && c != 'B' && c != 'L' && c != 'R' && c != 'S') {
+        c = 'S';
+      }
+
+      desiredDir = c;
+      if (c != 'S') {
+        // Remember last non-stop direction for resume after obstacle
+        lastNonStopDir = c;
+      }
+
+      Serial.printf("[DIR] Desired direction from Firebase: %c\n", desiredDir);
+
+      // Apply only if no obstacle
+      if (!obstacleActive && desiredDir != lastCmd) {
+        applyCommand(desiredDir);
+      }
+    }
+  } else {
+    Serial.printf("[Firebase] Direction read err: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+}
+
+// Plant:1/2/3 -> Spray:1/2/3 and pumps ON accordingly
+// Plant:0      -> Spray:0 and all pumps OFF
+void pollPlant() {
+  if (!Firebase.ready()) return;
+
+  int plantVal = -9999;
+  bool hasValue = false;
+
+  if (Firebase.RTDB.getInt(&fbdo, "/Pesiticide/Plant")) {
+    plantVal = fbdo.intData();
+    hasValue = true;
+  } else if (Firebase.RTDB.getString(&fbdo, "/Pesiticide/Plant")) {
+    String s = fbdo.stringData();
+    s.trim();
+    if (s.length() > 0) {
+      plantVal = s.toInt();
+      hasValue = true;
+    }
+  } else {
+    Serial.printf("[Firebase] Plant read err: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  if (!hasValue) return;
+
+  int p = plantVal;
+  if (p < 0 || p > 3) p = 0;  // clamp to 0..3
+
+  if (p != lastPlant) {
+    Serial.printf("[PLANT] Plant = %d\n", p);
+
+    // 1) Mirror Spray node: Spray = Plant
+    if (Firebase.ready() && p != lastSpray) {
+      if (Firebase.RTDB.setInt(&fbdo, "/Pesiticide/Spray", p)) {
+        Serial.printf("[SPRAY] Mirrored Spray = %d\n", p);
+        lastSpray = p;
+      } else {
+        Serial.printf("[Firebase] Failed to set Spray: %s\n",
+                      fbdo.errorReason().c_str());
+      }
+    }
+
+    // 2) Control pumps as per Plant (0->all off, 1/2/3->pump N)
+    setPumpChannel(p);
+
+    lastPlant = p;
+  }
+}
+
+// Ultrasonic: update Object and stop/resume motors & Direction
+void pollUltrasonic() {
+  float dist = readDistanceCM();
+  if (dist <= 0) {
+    // invalid reading, ignore
+    return;
+  }
+
+  bool newObstacle = obstacleActive;
+
+  if (dist <= OBSTACLE_THRESHOLD_CM) {
+    newObstacle = true;
+  } else if (dist > OBSTACLE_CLEAR_CM) {
+    newObstacle = false;
+  }
+
+  if (newObstacle != obstacleActive) {
+    obstacleActive = newObstacle;
+
+    if (Firebase.ready()) {
+      int objVal = obstacleActive ? 1 : 0;
+      if (objVal != lastObject) {
+        if (Firebase.RTDB.setInt(&fbdo, "/Pesiticide/Object", objVal)) {
+          Serial.printf("[OBJ] /Pesiticide/Object = %d (OK)\n", objVal);
+          lastObject = objVal;
+        } else {
+          Serial.printf("[Firebase] Object write err: %s\n",
+                        fbdo.errorReason().c_str());
+        }
+      }
+    }
+
+    if (obstacleActive) {
+      // Obstacle detected: Direction should be "S" and motors stop
+      Serial.printf("[OBSTACLE] Detected at %.2f cm → STOP motors, Direction=S\n", dist);
+      if (Firebase.ready()) {
+        if (!Firebase.RTDB.setString(&fbdo, "/Pesiticide/Direction", "S")) {
+          Serial.printf("[Firebase] Failed to set Direction=S: %s\n",
+                        fbdo.errorReason().c_str());
+        }
+      }
+      applyCommand('S');  // stop motors
+    } else {
+      // Obstacle cleared: resume previous non-stop direction
+      Serial.printf("[OBSTACLE] Cleared at %.2f cm → Resume motors (%c)\n",
+                    dist, lastNonStopDir);
+
+      if (Firebase.ready()) {
+        // Reflect resume direction in Firebase
+        String dirStr = String(lastNonStopDir);
+        if (!Firebase.RTDB.setString(&fbdo, "/Pesiticide/Direction", dirStr)) {
+          Serial.printf("[Firebase] Failed to restore Direction=%c: %s\n",
+                        lastNonStopDir, fbdo.errorReason().c_str());
+        }
+      }
+
+      desiredDir = lastNonStopDir;
+      applyCommand(lastNonStopDir);
+    }
+  }
+}
+
+// Measure distance from ultrasonic sensor
+float readDistanceCM() {
+  // Trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Echo pulse
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+
+  if (duration == 0) {
+    // No echo detected
+    return -1.0;
+  }
+
+  // Speed of sound ~343 m/s => 0.0343 cm/us, divide by 2 (to target and back)
+  float distance = (duration * 0.0343) / 2.0;
+  if (distance > 400.0) distance = 400.0;
+  return distance;
+}
+
+// ------------ Arduino ------------
+void setup() {
+  Serial.begin(115200);
+  setupPins();
+  setupWiFi();
+  setupFirebase();
+  Serial.println("[SYS] Ready. Watching /Pesiticide/... nodes and obstacle sensor...");
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastPoll >= POLL_MS) {
+    lastPoll = now;
+    pollUltrasonic();  // first, so obstacle logic can override motors
+    pollDirection();
+    pollPlant();       // Plant drives Spray + pumps
+  }
+}
