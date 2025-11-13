@@ -1,0 +1,263 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// If your relay is "LOW-level trigger" (IN pulled LOW = ON), keep true.
+#define RELAY_ACTIVE_LOW  true
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// L298N motor pins (NodeMCU labels)
+const int IN1 = D1;  // GPIO5
+const int IN2 = D2;  // GPIO4
+const int IN3 = D5;  // GPIO14
+const int IN4 = D6;  // GPIO12
+
+// Single relay pin (UV relay)
+const int RELAY_UV = D7;  // GPIO13 -> relay IN
+
+// Timing
+const unsigned long POLL_MS = 250;
+unsigned long lastPoll = 0;
+
+// State trackers
+char desiredDir    = 'S';    // last commanded direction from Firebase
+char lastMotorCmd  = 'X';    // last motor command actually applied
+int  lastRelayVal  = -1;     // last Relay value from Firebase (0 or 1)
+
+// ---------- Motor helpers ----------
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void driveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void driveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void applyCommand(char c) {
+  switch (c) {
+    case 'F': driveForward();  break;
+    case 'B': driveBackward(); break;
+    case 'L': turnLeft();      break;
+    case 'R': turnRight();     break;
+    case 'S':
+    default:  stopMotors();    break;
+  }
+  lastMotorCmd = c;
+  Serial.printf("[MOTOR] Command applied: %c\n", c);
+}
+
+// ---------- Relay helpers ----------
+void relayWrite(bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_UV, on ? LOW : HIGH);
+  } else {
+    digitalWrite(RELAY_UV, on ? HIGH : LOW);
+  }
+}
+
+// ---------- Setup blocks ----------
+void setupPins() {
+  // Motors
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  // Relay
+  pinMode(RELAY_UV, OUTPUT);
+  relayWrite(false);   // relay OFF initially
+}
+
+void setupWiFi() {
+  Serial.printf("\n[WiFi] Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print('.');
+  }
+  Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+// Create default nodes in Firebase if they don't exist
+void initFirebaseNodes() {
+  Serial.println("[Firebase] Initializing /UV_Sanitization nodes...");
+
+  // Direction = "S" (stop)
+  if (Firebase.RTDB.setString(&fbdo, "/UV_Sanitization/Direction", "S")) {
+    Serial.println("[Firebase] /UV_Sanitization/Direction = \"S\" (OK)");
+    desiredDir = 'S';
+  } else {
+    Serial.printf("[Firebase] Failed to set Direction: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  // Relay = 1 (OFF) => relay OFF initially
+  if (Firebase.RTDB.setInt(&fbdo, "/UV_Sanitization/Relay", 1)) {
+    Serial.println("[Firebase] /UV_Sanitization/Relay = 1 (OFF) (OK)");
+    lastRelayVal = 1;
+  } else {
+    Serial.printf("[Firebase] Failed to set Relay: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("[Firebase] Started with email/password auth");
+
+  unsigned long start = millis();
+  while (!Firebase.ready() && millis() - start < 15000) {
+    Serial.println("[Firebase] Waiting for ready...");
+    delay(500);
+  }
+
+  if (Firebase.ready()) {
+    Serial.println("[Firebase] Ready. Initializing nodes...");
+    initFirebaseNodes();
+  } else {
+    Serial.println("[Firebase] Not ready, could not init nodes");
+  }
+}
+
+// ---------- Pollers ----------
+
+// /UV_Sanitization/Direction -> F/B/L/R/S
+void pollDirection() {
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.getString(&fbdo, "/UV_Sanitization/Direction")) {
+    String val = fbdo.stringData();
+    val.trim();
+    if (val.length() == 0) return;
+
+    char c = toupper(val.charAt(0));
+    if (c != 'F' && c != 'B' && c != 'L' && c != 'R' && c != 'S') {
+      c = 'S';
+    }
+
+    if (c != desiredDir) {
+      desiredDir = c;
+      Serial.printf("[DIR] Desired direction from Firebase: %c\n", desiredDir);
+    }
+
+    // Always move motors based on Direction
+    if (desiredDir != lastMotorCmd) {
+      applyCommand(desiredDir);
+    }
+  } else {
+    Serial.printf("[Firebase] Direction read err: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+}
+
+// /UV_Sanitization/Relay -> 0: relay ON, 1: relay OFF
+void pollRelay() {
+  if (!Firebase.ready()) return;
+
+  int relayVal = -9999;
+  bool hasValue = false;
+
+  // Try int first
+  if (Firebase.RTDB.getInt(&fbdo, "/UV_Sanitization/Relay")) {
+    relayVal = fbdo.intData();
+    hasValue = true;
+  }
+  // If stored as string
+  else if (Firebase.RTDB.getString(&fbdo, "/UV_Sanitization/Relay")) {
+    String s = fbdo.stringData();
+    s.trim();
+    if (s.length() > 0) {
+      relayVal = s.toInt();
+      hasValue = true;
+    }
+  } else {
+    Serial.printf("[Firebase] Relay read err: %s\n",
+                  fbdo.errorReason().c_str());
+  }
+
+  if (!hasValue) return;
+
+  // Clamp to 0 or 1
+  if (relayVal != 0 && relayVal != 1) relayVal = 1; // default OFF
+
+  if (relayVal != lastRelayVal) {
+    lastRelayVal = relayVal;
+
+    if (relayVal == 0) {
+      // Relay:0 -> relay ON
+      relayWrite(true);
+      Serial.println("[RELAY] Relay=0 -> Relay ON");
+    } else {
+      // Relay:1 -> relay OFF
+      relayWrite(false);
+      Serial.println("[RELAY] Relay=1 -> Relay OFF");
+    }
+  }
+}
+
+// ---------- Arduino ----------
+void setup() {
+  Serial.begin(115200);
+  setupPins();
+  setupWiFi();
+  setupFirebase();
+  Serial.println("[SYS] Ready. Watching /UV_Sanitization/Direction and /UV_Sanitization/Relay...");
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastPoll >= POLL_MS) {
+    lastPoll = now;
+    pollRelay();     // UV ON/OFF
+    pollDirection(); // Motor control by Direction
+  }
+}
