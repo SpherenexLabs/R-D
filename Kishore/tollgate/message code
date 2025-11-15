@@ -1,0 +1,212 @@
+/*************************************************************
+ * ESP8266 #2  ->  OLED Firebase Message Display
+ *
+ * Firebase RTDB path:
+ *   /Tollgate/message  -> String
+ *
+ * Function:
+ *   - Reads /Tollgate/message from Firebase.
+ *   - Displays the message text on a 128x64 SSD1306 OLED.
+ *   - Only this message is shown (no IR / Servo on this board).
+ *************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Optional debug helpers (from Firebase examples)
+// If you don't have these, you can comment them.
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------- OLED Settings ----------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1      // Reset pin (not used with I2C)
+#define OLED_ADDR     0x3C    // Change to 0x3D if your module uses that
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- Globals ----------
+String lastMessage = "";   // last message displayed
+unsigned long lastPoll = 0;
+const unsigned long POLL_INTERVAL_MS = 500;  // how often to poll Firebase
+
+// ---------- Wi-Fi Setup ----------
+void setupWiFi()
+{
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ---------- Firebase Setup ----------
+void setupFirebase()
+{
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // For debug messages about token generation
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Firebase initialized.");
+}
+
+// ---------- OLED Helpers ----------
+void oledPrintMessage(const String &msg)
+{
+  display.clearDisplay();
+  display.setTextSize(1);               // Small font
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  // Optional: label
+  // display.println("Message:");
+
+  // Simple word-wrap: print up to ~20 chars per line
+  int16_t x = 0, y = 0;
+  display.setCursor(x, y);
+
+  const int maxCharsPerLine = 20;
+  int len = msg.length();
+  int idx = 0;
+
+  while (idx < len)
+  {
+    String line = msg.substring(idx, idx + maxCharsPerLine);
+    display.println(line);
+    idx += maxCharsPerLine;
+
+    // If we reach bottom of screen, stop (to avoid drawing off-screen)
+    y += 8;  // ~8 pixels per text line at size 1
+    if (y >= SCREEN_HEIGHT - 8) break;
+  }
+
+  display.display();
+}
+
+// ---------- Read message from Firebase ----------
+void fetchAndDisplayMessage()
+{
+  if (!Firebase.ready())
+    return;
+
+  if (Firebase.RTDB.getString(&fbdo, "/Tollgate/message"))
+  {
+    String msg = fbdo.stringData();
+    msg.trim();
+
+    if (msg != lastMessage)
+    {
+      Serial.print("New message from Firebase: ");
+      Serial.println(msg);
+
+      lastMessage = msg;
+      oledPrintMessage(lastMessage);
+    }
+  }
+  else
+  {
+    Serial.print("Failed to read /Tollgate/message: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("----- OLED MESSAGE DISPLAY STARTUP -----");
+
+  // Initialize I2C & OLED
+  Wire.begin(); // SDA/SCL: D2/D1 on NodeMCU by default
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
+  {
+    Serial.println("SSD1306 allocation failed. Check wiring / address.");
+    for (;;)
+      ; // Don't proceed, loop forever
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi...");
+  display.display();
+
+  // WiFi + Firebase
+  setupWiFi();
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi OK");
+  display.println("Connecting Firebase...");
+  display.display();
+
+  setupFirebase();
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Firebase OK");
+  display.println("Waiting for");
+  display.println("/Tollgate/message");
+  display.display();
+
+  Serial.println("----- SETUP COMPLETE -----");
+}
+
+void loop()
+{
+  if (!Firebase.ready())
+  {
+    delay(200);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastPoll >= POLL_INTERVAL_MS)
+  {
+    lastPoll = now;
+    fetchAndDisplayMessage();
+  }
+
+  // Small delay to keep loop nice
+  delay(10);
+}
