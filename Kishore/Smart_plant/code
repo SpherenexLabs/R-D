@@ -1,0 +1,278 @@
+/************************************************************
+ * ESP32 + DHT11 + pH + Water Level + HW-028 Moisture + OLED + Firebase
+ *
+ * Firebase RTDB path : /Smart_plant
+ * Fields             : Temperature (°C), Humidity (%), pH,
+ *                      Water_Level (%), Moisture (%), Timestamp
+ ************************************************************/
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <DHT.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"   // For Firebase token debug (optional)
+#include "addons/RTDBHelper.h"    // For Firebase debug (optional)
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- WiFi / Firebase ----------
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyBi4imuMT5imCT-8IBULdyFqj-ZZtl68Do"
+#define DATABASE_URL  "https://regal-welder-453313-d6-default-rtdb.firebaseio.com"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ---------------- Sensor Pins ---------------------
+#define DHTPIN   4        // GPIO4 for DHT11 data
+#define DHTTYPE  DHT11
+
+#define PH_PIN      34    // Po of pH sensor
+#define WATER_PIN   35    // Water level AO
+#define MOIST_PIN   32    // HW-028 AO
+
+// ---------------- OLED Settings -------------------
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------------- Firebase Objects ----------------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------------- Sensor Objects ------------------
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------------- Timing --------------------------
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL_MS = 2000;  // 2 seconds
+
+// --------------------------------------------------
+// WiFi Connect
+// --------------------------------------------------
+void connectWiFi() {
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --------------------------------------------------
+// OLED Init
+// --------------------------------------------------
+void initOLED() {
+  Wire.begin(21, 22);   // SDA, SCL
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;);  // Halt if OLED not found
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Smart Plant Node");
+  display.println("Initializing...");
+  display.display();
+}
+
+// --------------------------------------------------
+// Show sensor values on OLED
+// --------------------------------------------------
+void showOnOLED(float temp, float hum, float ph,
+                float levelPercent, float moistPercent) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+
+  display.println("Smart Plant Monitor");
+  display.println("--------------------");
+
+  display.print("T:");
+  display.print(temp, 1);
+  display.print("C  H:");
+  display.print(hum, 1);
+  display.println("%");
+
+  display.print("pH:");
+  display.println(ph, 2);
+
+  display.print("Lvl:");
+  display.print(levelPercent, 1);
+  display.println("%");
+
+  display.print("Mst:");
+  display.print(moistPercent, 1);
+  display.println("%");
+
+  display.display();
+}
+
+// --------------------------------------------------
+// Read pH (real time, multi-sample, mapped to 5–8 range)
+// --------------------------------------------------
+float readPH() {
+  analogSetPinAttenuation(PH_PIN, ADC_11db);
+
+  const int SAMPLES = 10;
+  uint32_t sumRaw = 0;
+
+  for (int i = 0; i < SAMPLES; i++) {
+    sumRaw += analogRead(PH_PIN);
+    delay(10);
+  }
+
+  float raw = sumRaw / (float)SAMPLES;       // 0..4095
+  float voltage = (raw / 4095.0f) * 3.3f;    // 0..3.3V
+
+  Serial.print("pH RAW(avg): ");
+  Serial.print(raw);
+  Serial.print("  V: ");
+  Serial.print(voltage, 3);
+
+  // Map 0–3.3 V to pH 5.0–8.0
+  float phValue = 5.0f + (voltage / 3.3f) * 3.0f;
+
+  // Clamp to [5.0, 8.0]
+  if (phValue < 5.0f) phValue = 5.0f;
+  if (phValue > 8.0f) phValue = 8.0f;
+
+  Serial.print("  pH: ");
+  Serial.println(phValue, 2);
+
+  return phValue;
+}
+
+// --------------------------------------------------
+// Read water level as percentage
+// --------------------------------------------------
+float readWaterLevelPercent() {
+  int raw = analogRead(WATER_PIN);            // 0..4095
+  float percent = (raw / 4095.0f) * 100.0f;   // 0..100 %
+  if (percent < 0)   percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
+}
+
+// --------------------------------------------------
+// Read moisture from HW-028 as percentage
+// --------------------------------------------------
+float readMoisturePercent() {
+  int raw = analogRead(MOIST_PIN);            // 0..4095
+  float percent = (1.0f - (raw / 4095.0f)) * 100.0f;
+  if (percent < 0)   percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
+}
+
+// --------------------------------------------------
+// Setup
+// --------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("Smart Plant Node starting...");
+
+  dht.begin();
+  initOLED();
+  connectWiFi();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback; // optional
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Firebase initialized.");
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println("Smart Plant Node");
+  display.println("Firebase OK");
+  display.display();
+  delay(1500);
+}
+
+// --------------------------------------------------
+// Loop
+// --------------------------------------------------
+void loop() {
+  if (millis() - lastReadTime >= READ_INTERVAL_MS) {
+    lastReadTime = millis();
+
+    // -------- Read DHT11 --------
+    float h = dht.readHumidity();
+    float t = dht.readTemperature(); // °C
+
+    if (isnan(h) || isnan(t)) {
+      Serial.println("Failed to read from DHT11!");
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.setTextSize(1);
+      display.println("DHT11 ERROR");
+      display.display();
+      return;
+    }
+
+    // -------- Read pH --------
+    float phValue = readPH();
+
+    // -------- Read water level --------
+    float levelPercent = readWaterLevelPercent();
+
+    // -------- Read soil moisture --------
+    float moistPercent = readMoisturePercent();
+
+    // -------- Debug summary --------
+    Serial.print("T: "); Serial.print(t);
+    Serial.print(" C, H: "); Serial.print(h);
+    Serial.print(" %, Lvl: "); Serial.print(levelPercent);
+    Serial.print(" %, Moist: "); Serial.print(moistPercent);
+    Serial.println(" %");
+
+    // -------- Update OLED --------
+    showOnOLED(t, h, phValue, levelPercent, moistPercent);
+
+    // -------- Push to Firebase --------
+    if (Firebase.ready()) {
+      FirebaseJson json;
+      json.set("Temperature", t);
+      json.set("Humidity", h);
+      json.set("pH", phValue);
+      json.set("Water_Level", levelPercent);
+      json.set("Moisture", moistPercent);
+      json.set("Timestamp", millis());
+
+      if (Firebase.RTDB.updateNode(&fbdo, "/Smart_plant", &json)) {
+        Serial.println("Data sent to /Smart_plant OK.");
+      } else {
+        Serial.print("Firebase update failed: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      Serial.println("Firebase not ready...");
+    }
+  }
+}
