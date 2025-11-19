@@ -1,0 +1,319 @@
+/************************************************************
+ * ESP8266 + L293D + Servo + Ultrasonic + Firebase RTDB
+ *
+ * Firebase RTDB structure:
+ *   /Smart_robot/direction -> "F","B","L","R","S"
+ *   /Smart_robot/servo     -> 0 or 1
+ *   /Smart_robot/Obstacle  -> 0 or 1
+ ************************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Servo.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------------- WiFi & Firebase Config ----------------
+#define WIFI_SSID      "car"
+#define WIFI_PASSWORD  "123456789"
+
+#define API_KEY        "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL   "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL     "spherenexgpt@gmail.com"
+#define USER_PASSWORD  "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------------- Pin Definitions ----------------
+// Motor driver pins (L293D)
+const uint8_t IN1 = D1;   // GPIO5
+const uint8_t IN2 = D2;   // GPIO4
+const uint8_t IN3 = D5;   // GPIO14
+const uint8_t IN4 = D6;   // GPIO12
+
+// Servo pin
+const uint8_t SERVO_PIN = D4;  // GPIO2
+
+// Ultrasonic sensor pins (HC-SR04)
+const uint8_t US_TRIG_PIN = D7;  // GPIO13
+const uint8_t US_ECHO_PIN = D0;  // GPIO16
+
+// Obstacle distance threshold (cm)
+const float OBSTACLE_THRESHOLD_CM = 20.0;
+
+Servo myServo;
+
+// Cached values
+String lastDirection        = "S";  // last direction from Firebase
+String lastNonStopDirection = "S";  // last F/B/L/R before STOP/obstacle
+int    lastServoState       = -1;   // -1 = unknown
+int    lastObstacleState    = 0;    // 0 = no obstacle at start
+
+// Timing
+unsigned long lastPollMillis = 0;
+const unsigned long POLL_INTERVAL_MS = 300;  // ms
+
+// ---------------- Motor Control Helpers ----------------
+void motorStop() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void motorForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void motorBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void motorLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void motorRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void applyDirection(const String &dir) {
+  if (dir == "F") {
+    motorForward();
+    Serial.println("Direction: FORWARD");
+  } else if (dir == "B") {
+    motorBackward();
+    Serial.println("Direction: BACKWARD");
+  } else if (dir == "L") {
+    motorLeft();
+    Serial.println("Direction: LEFT");
+  } else if (dir == "R") {
+    motorRight();
+    Serial.println("Direction: RIGHT");
+  } else {  // "S" or anything else
+    motorStop();
+    Serial.println("Direction: STOP");
+  }
+}
+
+void applyServo(int state) {
+  if (state == 1) {
+    myServo.write(90);
+    Serial.println("Servo: 90 degrees (state = 1)");
+  } else {
+    myServo.write(0);
+    Serial.println("Servo: 0 degrees (state = 0 or invalid)");
+  }
+}
+
+// ---------------- Ultrasonic / Obstacle Logic ----------------
+int checkObstacle() {
+  // Trigger ultrasonic pulse
+  digitalWrite(US_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(US_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG_PIN, LOW);
+
+  // Read echo pulse (timeout 30ms)
+  long duration = pulseIn(US_ECHO_PIN, HIGH, 30000);
+
+  float distanceCm;
+  if (duration == 0) {
+    // No echo detected
+    distanceCm = 9999.0;
+  } else {
+    distanceCm = duration * 0.034f / 2.0f;
+  }
+
+  int obstacleState = 0;
+  if (distanceCm > 0 && distanceCm <= OBSTACLE_THRESHOLD_CM) {
+    obstacleState = 1;
+  }
+
+  // If state changed, update Firebase and log
+  if (obstacleState != lastObstacleState) {
+    Serial.print("Obstacle state changed: ");
+    Serial.print(obstacleState);
+    Serial.print(" at distance: ");
+    Serial.print(distanceCm);
+    Serial.println(" cm");
+
+    lastObstacleState = obstacleState;
+
+    if (!Firebase.RTDB.setInt(&fbdo, "/Smart_robot/Obstacle", obstacleState)) {
+      Serial.print("Failed to set Obstacle: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  return obstacleState;
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  motorStop();
+
+  // Servo
+  myServo.attach(SERVO_PIN);
+  myServo.write(0);
+
+  // Ultrasonic pins
+  pinMode(US_TRIG_PIN, OUTPUT);
+  pinMode(US_ECHO_PIN, INPUT);
+
+  // WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Firebase initialized");
+
+  // Initialize DB defaults
+  if (Firebase.RTDB.setString(&fbdo, "/Smart_robot/direction", "S")) {
+    Serial.println("Initialized direction to 'S'");
+  }
+  if (Firebase.RTDB.setInt(&fbdo, "/Smart_robot/servo", 0)) {
+    Serial.println("Initialized servo to 0");
+  }
+  if (Firebase.RTDB.setInt(&fbdo, "/Smart_robot/Obstacle", 0)) {
+    Serial.println("Initialized Obstacle to 0");
+  }
+
+  lastDirection        = "S";
+  lastNonStopDirection = "S";
+  lastObstacleState    = 0;
+}
+
+// ---------------- Main Loop ----------------
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    delay(1000);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastPollMillis >= POLL_INTERVAL_MS) {
+    lastPollMillis = now;
+
+    // Save old obstacle state
+    int prevObstacleState = lastObstacleState;
+
+    // 1) Check obstacle
+    int obstacleState = checkObstacle(); // also updates lastObstacleState + /Obstacle
+
+    if (obstacleState == 1) {
+      // ----- OBSTACLE PRESENT -----
+      motorStop();
+      Serial.println("Obstacle=1 -> Motors STOP");
+
+      // Force direction = "S" in Firebase
+      if (lastDirection != "S") {
+        Serial.println("Obstacle=1 -> Forcing direction = 'S' in Firebase");
+        if (Firebase.RTDB.setString(&fbdo, "/Smart_robot/direction", "S")) {
+          lastDirection = "S";
+        } else {
+          Serial.print("Failed to set direction to S: ");
+          Serial.println(fbdo.errorReason());
+        }
+      }
+    } else {
+      // ----- NO OBSTACLE -----
+      if (prevObstacleState == 1 && obstacleState == 0) {
+        // Obstacle just cleared -> resume last non-stop direction
+        Serial.print("Obstacle cleared -> Resume last non-stop direction: ");
+        Serial.println(lastNonStopDirection);
+
+        applyDirection(lastNonStopDirection);
+
+        if (Firebase.RTDB.setString(&fbdo, "/Smart_robot/direction", lastNonStopDirection)) {
+          lastDirection = lastNonStopDirection;
+        } else {
+          Serial.print("Failed to restore direction in Firebase: ");
+          Serial.println(fbdo.errorReason());
+        }
+      } else {
+        // Normal operation: read direction from Firebase
+        String dir = lastDirection;
+        if (Firebase.RTDB.getString(&fbdo, "/Smart_robot/direction")) {
+          dir = fbdo.stringData();
+          dir.trim();
+
+          if (dir != lastDirection) {
+            Serial.print("Direction from Firebase: ");
+            Serial.println(dir);
+            lastDirection = dir;
+          }
+
+          // Update lastNonStopDirection only for F/B/L/R
+          if (dir == "F" || dir == "B" || dir == "L" || dir == "R") {
+            lastNonStopDirection = dir;
+          }
+
+          // Apply direction (S will simply stop)
+          applyDirection(dir);
+        } else {
+          Serial.print("Failed to get direction: ");
+          Serial.println(fbdo.errorReason());
+        }
+      }
+    }
+
+    // 3) Servo control
+    if (Firebase.RTDB.getInt(&fbdo, "/Smart_robot/servo")) {
+      int servoState = fbdo.intData();
+      if (servoState != lastServoState) {
+        Serial.print("New servo state from Firebase: ");
+        Serial.println(servoState);
+        applyServo(servoState);
+        lastServoState = servoState;
+      }
+    } else {
+      Serial.print("Failed to get servo: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+}
