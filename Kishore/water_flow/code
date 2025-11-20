@@ -1,0 +1,383 @@
+/************************************************************
+ * IoT-Based Real-Time Water Supply Monitoring and Leakage Detection
+ * Node: ESP8266 (NodeMCU) + 2 Flow Sensors + Analog Water Level Sensor
+ *       + OLED (SSD1306) + Firebase RTDB
+ *
+ * Firebase RTDB structure (example):
+ *   /Water_Supply_Node1/Tank/LevelPercent
+ *   /Water_Supply_Node1/Tank/LevelLiters
+ *   /Water_Supply_Node1/Flow/Main/RateLMin
+ *   /Water_Supply_Node1/Flow/Main/TotalLiters
+ *   /Water_Supply_Node1/Flow/Consumer/RateLMin
+ *   /Water_Supply_Node1/Flow/Consumer/TotalLiters
+ *   /Water_Supply_Node1/Leakage/WastageLiters
+ *   /Water_Supply_Node1/Leakage/WastagePercent
+ *   /Water_Supply_Node1/Leakage/MoneyLost
+ *   /Water_Supply_Node1/Leakage/LeakDetected
+ *   /Water_Supply_Node1/Leakage/LastAlert
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Firebase helper (included with Firebase ESP Client examples)
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------------- WiFi & Firebase Config ----------------
+#define WIFI_SSID      "water"
+#define WIFI_PASSWORD  "123456789"
+
+#define API_KEY        "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL   "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"  // RTDB URL
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase base path for this node
+#define FB_BASE_PATH   "/Water_Supply_Node1"
+
+// Monetary rate per liter (for wastage cost)
+const float RATE_PER_LITER = 0.02f;  // Example: 0.02 currency units per liter
+
+// Tank total volume in liters (update to your tank size)
+const float TANK_VOLUME_L  = 1000.0f;
+
+// Flow sensor calibration (YF-S201 typical ~450 pulses/L, calibrate yourself!)
+const float PULSES_PER_LITER_MAIN     = 450.0f;
+const float PULSES_PER_LITER_CONSUMER = 450.0f;
+
+// Time windows
+const unsigned long FLOW_WINDOW_MS    = 2000;  // compute flow every 2 seconds
+const unsigned long FIREBASE_PUSH_MS  = 5000;  // push to Firebase every 5 seconds
+
+// Leakage threshold (as percentage of supplied volume)
+const float LEAKAGE_THRESHOLD_PERCENT = 5.0f;  // > 5% difference = leak
+// Also minimum absolute liters to avoid noise
+const float LEAKAGE_MIN_LITERS       = 10.0f;
+
+// ================== PIN MAPPING (NodeMCU) ==========
+// Use NodeMCU labels here
+
+// Flow sensors
+const int PIN_FLOW_MAIN     = D5;  // GPIO14 - inlet flow sensor
+const int PIN_FLOW_CONSUMER = D6;  // GPIO12 - consumer flow sensor
+
+// Analog water level sensor
+// Signal pin -> A0
+const int PIN_LEVEL_SENSOR  = A0;
+
+// Buzzer / leak alert LED
+const int PIN_BUZZER        = D7;  // GPIO13
+
+// ================== LEVEL CALIBRATION ===============
+// Raw ADC values at EMPTY and FULL tank.
+// You MUST calibrate these values by printing analogRead(A0)
+// at real empty and full conditions and then update here.
+
+int RAW_EMPTY = 100;   // example: ADC value when tank is empty
+int RAW_FULL  = 900;   // example: ADC value when tank is full
+
+// ================== OLED CONFIG =====================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64  // for 128x64 display
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ================== GLOBALS ========================
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+volatile uint32_t pulsesMain     = 0;
+volatile uint32_t pulsesConsumer = 0;
+
+unsigned long lastFlowCalcTime   = 0;
+unsigned long lastFirebasePush   = 0;
+
+// Computed values
+float mainFlowRateLMin      = 0.0f;
+float consumerFlowRateLMin  = 0.0f;
+float mainTotalLiters       = 0.0f;
+float consumerTotalLiters   = 0.0f;
+float tankLevelPercent      = 0.0f;
+float tankLevelLiters       = 0.0f;
+float wastageLiters         = 0.0f;
+float wastagePercent        = 0.0f;
+float moneyLost             = 0.0f;
+int   leakDetected          = 0;   // 0 or 1
+
+// ----------------- ISR HANDLERS ---------------------
+void IRAM_ATTR ISR_flowMain() {
+  pulsesMain++;
+}
+
+void IRAM_ATTR ISR_flowConsumer() {
+  pulsesConsumer++;
+}
+
+// ----------------- UTILITY FUNCTIONS ---------------
+
+// Read analog water level and convert to percent & liters
+void updateTankLevel() {
+  int raw = analogRead(PIN_LEVEL_SENSOR);
+
+  // For calibration:
+  // Serial.print("Raw level: ");
+  // Serial.println(raw);
+
+  // Clamp raw within expected range
+  if (raw < RAW_EMPTY) raw = RAW_EMPTY;
+  if (raw > RAW_FULL)  raw = RAW_FULL;
+
+  float level = (float)(raw - RAW_EMPTY) / (float)(RAW_FULL - RAW_EMPTY);
+  if (level < 0) level = 0;
+  if (level > 1) level = 1;
+
+  tankLevelPercent = level * 100.0f;
+  tankLevelLiters  = level * TANK_VOLUME_L;
+}
+
+// Compute flow and totals every FLOW_WINDOW_MS
+void computeFlows() {
+  static uint32_t lastPulsesMain     = 0;
+  static uint32_t lastPulsesConsumer = 0;
+  unsigned long now = millis();
+  unsigned long dt  = now - lastFlowCalcTime;
+  if (dt < FLOW_WINDOW_MS) return;
+  lastFlowCalcTime = now;
+
+  noInterrupts();
+  uint32_t currentPulsesMain     = pulsesMain;
+  uint32_t currentPulsesConsumer = pulsesConsumer;
+  interrupts();
+
+  uint32_t deltaMainPulses     = currentPulsesMain - lastPulsesMain;
+  uint32_t deltaConsumerPulses = currentPulsesConsumer - lastPulsesConsumer;
+
+  lastPulsesMain     = currentPulsesMain;
+  lastPulsesConsumer = currentPulsesConsumer;
+
+  float dt_minutes = dt / 60000.0f;  // ms -> minutes
+
+  // Convert pulses to liters in this window
+  float mainLitersWindow     = deltaMainPulses     / PULSES_PER_LITER_MAIN;
+  float consumerLitersWindow = deltaConsumerPulses / PULSES_PER_LITER_CONSUMER;
+
+  if (dt_minutes > 0) {
+    mainFlowRateLMin     = mainLitersWindow / dt_minutes;
+    consumerFlowRateLMin = consumerLitersWindow / dt_minutes;
+  } else {
+    mainFlowRateLMin     = 0;
+    consumerFlowRateLMin = 0;
+  }
+
+  mainTotalLiters     += mainLitersWindow;
+  consumerTotalLiters += consumerLitersWindow;
+
+  // Leakage calculation
+  wastageLiters = mainTotalLiters - consumerTotalLiters;
+  if (wastageLiters < 0) wastageLiters = 0;
+
+  if (mainTotalLiters > 0) {
+    wastagePercent = (wastageLiters / mainTotalLiters) * 100.0f;
+  } else {
+    wastagePercent = 0;
+  }
+
+  moneyLost = wastageLiters * RATE_PER_LITER;
+
+  // Leak detection logic
+  if (wastageLiters >= LEAKAGE_MIN_LITERS && wastagePercent >= LEAKAGE_THRESHOLD_PERCENT) {
+    leakDetected = 1;
+  } else {
+    leakDetected = 0;
+  }
+}
+
+// Update OLED display
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Lvl:");
+  display.print(tankLevelPercent, 1);
+  display.print("% ");
+
+  display.print("(");
+  display.print(tankLevelLiters, 0);
+  display.print("L)");
+
+  display.setCursor(0, 16);
+  display.print("In:");
+  display.print(mainFlowRateLMin, 1);
+  display.print(" L/m");
+
+  display.setCursor(0, 26);
+  display.print("Out:");
+  display.print(consumerFlowRateLMin, 1);
+  display.print(" L/m");
+
+  display.setCursor(0, 36);
+  display.print("Wast:");
+  display.print(wastageLiters, 1);
+  display.print("L ");
+  display.print("(");
+  display.print(wastagePercent, 1);
+  display.print("%)");
+
+  display.setCursor(0, 48);
+  if (leakDetected) {
+    display.print("LEAKAGE DETECTED!");
+  } else {
+    display.print("Status: Normal    ");
+  }
+
+  display.display();
+}
+
+// Push data to Firebase
+void pushToFirebase() {
+  static String lastAlertStr = "OK";
+
+  if (leakDetected) {
+    lastAlertStr = "Leakage detected";
+  } else {
+    lastAlertStr = "OK";
+  }
+
+  FirebaseJson json;
+
+  // Tank
+  json.set("Tank/LevelPercent", tankLevelPercent);
+  json.set("Tank/LevelLiters",  tankLevelLiters);
+
+  // Flow
+  json.set("Flow/Main/RateLMin",        mainFlowRateLMin);
+  json.set("Flow/Main/TotalLiters",     mainTotalLiters);
+  json.set("Flow/Consumer/RateLMin",    consumerFlowRateLMin);
+  json.set("Flow/Consumer/TotalLiters", consumerTotalLiters);
+
+  // Leakage
+  json.set("Leakage/WastageLiters",   wastageLiters);
+  json.set("Leakage/WastagePercent",  wastagePercent);
+  json.set("Leakage/MoneyLost",       moneyLost);
+  json.set("Leakage/LeakDetected",    leakDetected);
+  json.set("Leakage/LastAlert",       lastAlertStr);
+
+  if (Firebase.RTDB.updateNode(&fbdo, FB_BASE_PATH, &json)) {
+    Serial.println("Firebase update OK");
+  } else {
+    Serial.print("Firebase update FAILED: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+// Buzzer indication
+void updateBuzzer() {
+  if (leakDetected) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(100);
+    digitalWrite(PIN_BUZZER, LOW);
+  } else {
+    digitalWrite(PIN_BUZZER, LOW);
+  }
+}
+
+// ================== SETUP ==========================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Pins
+  pinMode(PIN_FLOW_MAIN,     INPUT_PULLUP);
+  pinMode(PIN_FLOW_CONSUMER, INPUT_PULLUP);
+  pinMode(PIN_LEVEL_SENSOR,  INPUT);
+  pinMode(PIN_BUZZER,        OUTPUT);
+  digitalWrite(PIN_BUZZER,   LOW);
+
+  // Attach interrupts
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW_MAIN), ISR_flowMain, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW_CONSUMER), ISR_flowConsumer, RISING);
+
+  // OLED init - I2C on D2(SDA) and D1(SCL)
+  Wire.begin(D2, D1);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (true) { delay(100); }
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Water Supply Node1");
+  display.display();
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+// ================== LOOP ===========================
+void loop() {
+  // Update tank level from analog sensor
+  updateTankLevel();
+
+  // Compute flows and leakage
+  computeFlows();
+
+  // Update OLED display
+  updateOLED();
+
+  // Buzzer (local alert)
+  updateBuzzer();
+
+  // Push to Firebase periodically
+  unsigned long now = millis();
+  if (now - lastFirebasePush >= FIREBASE_PUSH_MS) {
+    lastFirebasePush = now;
+    pushToFirebase();
+  }
+
+  // Debug prints
+  Serial.print("Level: ");
+  Serial.print(tankLevelPercent, 1);
+  Serial.print("%  In: ");
+  Serial.print(mainFlowRateLMin, 1);
+  Serial.print(" L/m  Out: ");
+  Serial.print(consumerFlowRateLMin, 1);
+  Serial.print(" L/m  Wast:");
+  Serial.print(wastageLiters, 1);
+  Serial.print("L (");
+  Serial.print(wastagePercent, 1);
+  Serial.print("%)  Leak: ");
+  Serial.println(leakDetected ? "YES" : "NO");
+
+  delay(100);  // small delay to keep loop stable
+}
