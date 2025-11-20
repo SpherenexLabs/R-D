@@ -1,0 +1,119 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// ============ USER CONFIG: WIFI ===================
+#define WIFI_SSID     "smart"        // change if needed
+#define WIFI_PASSWORD "123456789"    // change if needed
+
+// ============ USER CONFIG: FIREBASE ===============
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ============ PIN CONFIG ==========================
+
+// Button on D5 (GPIO14), using INPUT_PULLUP
+const int BUTTON_PIN = D5;
+
+// Debounce
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50; // ms
+
+// State tracking
+bool lastStablePressed = false;
+bool lastSentPressed   = false;
+
+// ============ SETUP ===============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println(F("ESP8266 Button -> Firebase Alert Project"));
+
+  // Button pin with internal pull-up
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // WiFi setup
+  Serial.print(F("Connecting to WiFi: "));
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(500);
+  }
+  Serial.println();
+  Serial.print(F("WiFi connected, IP: "));
+  Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println(F("Firebase initialized."));
+
+  // Initialize Alert = 0 (button not pressed)
+  if (Firebase.ready()) {
+    if (Firebase.RTDB.setInt(&fbdo, "/firebase/Alert", 0)) {
+      Serial.println(F("Initialized /firebase/Alert = 0"));
+    } else {
+      Serial.print(F("Init write failed: "));
+      Serial.println(fbdo.errorReason());
+    }
+  }
+}
+
+// ============ LOOP ================================
+void loop() {
+  // Read raw state (active LOW)
+  int reading = digitalRead(BUTTON_PIN);
+  bool pressedNow = (reading == LOW);
+
+  // Simple debounce
+  static bool lastReading = HIGH;
+  if (reading != lastReading) {
+    lastDebounceTime = millis();
+  }
+  lastReading = reading;
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // After debounce time, consider it stable
+    if (pressedNow != lastStablePressed) {
+      lastStablePressed = pressedNow;
+
+      // Only send to Firebase when stable state changes
+      if (Firebase.ready()) {
+        int alertValue = pressedNow ? 1 : 0;
+
+        Serial.print(F("Button changed, pressed = "));
+        Serial.print(pressedNow ? F("YES") : F("NO"));
+        Serial.print(F(" -> /firebase/Alert = "));
+        Serial.println(alertValue);
+
+        if (Firebase.RTDB.setInt(&fbdo, "/firebase/Alert", alertValue)) {
+          Serial.println(F("Firebase update OK."));
+          lastSentPressed = pressedNow;
+        } else {
+          Serial.print(F("Firebase update failed: "));
+          Serial.println(fbdo.errorReason());
+        }
+      }
+    }
+  }
+
+  // Small delay for stability
+  delay(10);
+}
