@@ -1,0 +1,315 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ============ USER CONFIG: WIFI ===================
+#define WIFI_SSID     "smart"        // change if needed
+#define WIFI_PASSWORD "123456789"    // change if needed
+
+// ============ USER CONFIG: FIREBASE ===============
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ============ OLED CONFIG =========================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1       // No reset pin
+#define OLED_ADDR     0x3C     // Common SSD1306 I2C address
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+bool oledOk = false;
+
+// ============ PINS ================================
+
+// Analog voltage sensor
+const int VOLTAGE_SENSOR_PIN = A0;
+
+// Single relay pin (LOW-level trigger)
+const int RELAY1_PIN = D5; // GPIO14
+
+// Theft loop pin: connect this pin to GND with a wire.
+// If the wire is removed (pin goes HIGH due to INPUT_PULLUP) -> theft.
+const int THEFT_PIN = D7; // GPIO13
+
+// If relay is active LOW (IN=LOW => ON), keep true
+const bool RELAY_ACTIVE_LOW = true;
+
+// ============ MEASUREMENT / CALIBRATION ===========
+const float ADC_MAX      = 1023.0;
+const float VOLTAGE_MAX  = 25.0;    // Adjust to match your voltage sensor scaling
+const float LOAD_RESISTANCE_OHM = 100.0;  // Example load for I = V/R demo
+
+// ============ TIMING ==============================
+unsigned long lastSensorUpdate = 0;
+const unsigned long sensorInterval = 1000; // ms
+
+unsigned long lastRelayCheck = 0;
+const unsigned long relayInterval = 500;   // ms
+
+// Cached values
+float voltageValue = 0.0;
+float currentValue = 0.0;
+bool relay1State   = false;
+bool theftDetected = false;  // true when theft loop is open
+
+// ============ RELAY CONTROL HELPER ================
+void setRelay(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(pin, on ? LOW : HIGH);
+  } else {
+    digitalWrite(pin, on ? HIGH : LOW);
+  }
+}
+
+// ============ OLED UPDATE (MAIN DATA SCREEN) ======
+void updateOLED() {
+  if (!oledOk) return;
+
+  display.clearDisplay();
+  // Bigger text
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Line 1: Voltage
+  display.setCursor(0, 0);
+  display.print(F("V:"));
+  display.print(voltageValue, 1);   // 1 decimal
+
+  // Line 2: Current
+  display.setCursor(0, 16);
+  display.print(F("I:"));
+  display.print(currentValue, 2);   // 2 decimals
+
+  // Line 3: Relay 1 status
+  display.setCursor(0, 32);
+  display.print(F("R1:"));
+  display.print(relay1State ? F("ON") : F("OFF"));
+
+  // Line 4: Theft status
+  display.setCursor(0, 48);
+  display.print(F("T:"));
+  if (theftDetected) {
+    display.print(F("THEFT"));
+  } else {
+    display.print(F("SAFE"));
+  }
+
+  display.display();
+}
+
+// ============ SENSOR READ + FIREBASE UPLOAD =======
+void readAndUploadSensors() {
+  int raw = analogRead(VOLTAGE_SENSOR_PIN);
+  float voltage = (raw / ADC_MAX) * VOLTAGE_MAX;
+  float current = 0.0;
+
+  if (LOAD_RESISTANCE_OHM > 0.0) {
+    current = voltage / LOAD_RESISTANCE_OHM;
+  }
+
+  voltageValue = voltage;
+  currentValue = current;
+
+  Serial.print(F("ADC raw: "));
+  Serial.print(raw);
+  Serial.print(F(" | V: "));
+  Serial.print(voltageValue, 2);
+  Serial.print(F(" V | I: "));
+  Serial.print(currentValue, 2);
+  Serial.println(F(" A"));
+
+  // Upload to Firebase
+  if (Firebase.ready()) {
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Logging/Voltage", voltageValue)) {
+      Serial.print(F("Failed to write Voltage: "));
+      Serial.println(fbdo.errorReason());
+    }
+    if (!Firebase.RTDB.setFloat(&fbdo, "/Logging/Current", currentValue)) {
+      Serial.print(F("Failed to write Current: "));
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  updateOLED();
+}
+
+// ============ THEFT DETECTION READING =============
+// When theftDetected changes, also update /Logging/Theft:
+//   SAFE  -> Theft = 0
+//   THEFT -> Theft = 1
+void readTheftStatus() {
+  // THEFT_PIN is INPUT_PULLUP:
+  //   - normal (wire to GND): reads LOW  -> no theft
+  //   - wire removed/open:   reads HIGH -> theftDetected = true
+  int state = digitalRead(THEFT_PIN);
+  bool newTheft = (state == HIGH);
+
+  if (newTheft != theftDetected) {
+    theftDetected = newTheft;
+    Serial.print(F("Theft status changed -> "));
+    Serial.println(theftDetected ? F("THEFT") : F("SAFE"));
+
+    // Update Firebase Theft node
+    if (Firebase.ready()) {
+      int theftValue = theftDetected ? 1 : 0;
+      if (!Firebase.RTDB.setInt(&fbdo, "/Logging/Theft", theftValue)) {
+        Serial.print(F("Failed to write /Logging/Theft: "));
+        Serial.println(fbdo.errorReason());
+      } else {
+        Serial.print(F("Updated /Logging/Theft = "));
+        Serial.println(theftValue);
+      }
+    }
+
+    updateOLED();
+  }
+}
+
+// ============ RELAY CONTROL FROM FIREBASE =========
+// /Logging/Relay:
+//   0 -> OFF
+//   1 -> ON
+void updateRelayFromFirebase() {
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.getInt(&fbdo, "/Logging/Relay")) {
+    int relayCmd = fbdo.intData();
+    Serial.print(F("Relay command from /Logging/Relay: "));
+    Serial.println(relayCmd);
+
+    if (relayCmd == 1) {
+      relay1State = true;
+    } else {
+      relay1State = false;
+    }
+
+    setRelay(RELAY1_PIN, relay1State);
+    updateOLED();
+  } else {
+    Serial.print(F("Failed to read /Logging/Relay: "));
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+// ============ SETUP ===============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println(F("ESP8266 Logging + Single Relay + Theft Detection"));
+
+  // Relay pin
+  pinMode(RELAY1_PIN, OUTPUT);
+  setRelay(RELAY1_PIN, false);
+
+  // Theft pin with internal pull-up
+  pinMode(THEFT_PIN, INPUT_PULLUP);
+  theftDetected = false;
+
+  // OLED init (I2C on D2 (SDA), D1 (SCL))
+  Wire.begin(D2, D1); // SDA, SCL
+  oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledOk) {
+    Serial.println(F("SSD1306 allocation failed"));
+  } else {
+    // First screen: show SSID and Password
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("SSID:"));
+    display.println(WIFI_SSID);
+    display.println(F("PASS:"));
+    display.println(WIFI_PASSWORD);
+    display.display();
+    delay(4000); // Show credentials for a few seconds
+  }
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print(F("Connecting to WiFi"));
+  if (oledOk) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println(F("Connecting WiFi:"));
+    display.println(WIFI_SSID);
+    display.display();
+  }
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(500);
+  }
+  Serial.println();
+  Serial.print(F("WiFi connected, IP: "));
+  Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println(F("Firebase initialized."));
+
+  if (oledOk) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println(F("WiFi OK"));
+    display.println(F("Firebase OK"));
+    display.println(F("Starting..."));
+    display.display();
+    delay(1500);
+  }
+
+  // Initialize Theft = 0 in Firebase
+  if (Firebase.ready()) {
+    if (!Firebase.RTDB.setInt(&fbdo, "/Logging/Theft", 0)) {
+      Serial.print(F("Failed to init /Logging/Theft: "));
+      Serial.println(fbdo.errorReason());
+    } else {
+      Serial.println(F("Initialized /Logging/Theft = 0"));
+    }
+  }
+
+  // Initial OLED data screen
+  updateOLED();
+}
+
+// ============ LOOP ================================
+void loop() {
+  unsigned long now = millis();
+
+  // Sensor read + upload every 1 second
+  if (now - lastSensorUpdate >= sensorInterval) {
+    lastSensorUpdate = now;
+    readAndUploadSensors();
+  }
+
+  // Relay update every 0.5 second
+  if (now - lastRelayCheck >= relayInterval) {
+    lastRelayCheck = now;
+    updateRelayFromFirebase();
+  }
+
+  // Check theft status frequently
+  readTheftStatus();
+
+  delay(10);
+}
