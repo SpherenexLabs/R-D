@@ -1,0 +1,296 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DHT.h"
+
+// Firebase helper headers
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================== USER CONFIG: WIFI =====================
+#define WIFI_SSID     "water"        // change to your WiFi
+#define WIFI_PASSWORD "123456789"    // change to your WiFi
+
+// ================== USER CONFIG: FIREBASE =================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================== OLED CONFIG ==========================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================== DHT CONFIG ===========================
+#define DHTPIN   4       // ESP32 GPIO 4
+#define DHTTYPE  DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================== ANALOG PINS (ESP32) ==================
+#define PH_PIN        32   // ADC1_CH4
+#define TDS_PIN       33   // ADC1_CH5 (not really used now, only for debug)
+#define TURBIDITY_PIN 34   // ADC1_CH6 (input-only)
+#define SOIL_PIN      35   // ADC1_CH7 (input-only)
+
+// ================== TIMING ===============================
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL_MS = 2000;  // 2 seconds
+
+// ================== SENSOR READ HELPERS ==================
+// Returns raw ADC (0-4095) and voltage (0-3.3V approx for ESP32)
+int readAnalogPin(int pin, float &voltage) {
+  int raw = analogRead(pin);         // ESP32 12-bit ADC (0–4095)
+  voltage = (raw * 3.3) / 4095.0;    // Assuming full-scale at 3.3 V
+  return raw;
+}
+
+// ---------- pH CONVERSION (placeholder – calibrate later) ----------
+float convertToPH(float voltage) {
+  // Example relation; adjust with your calibration buffers
+  return 3.5 * voltage;  // placeholder
+}
+
+// ---------- TURBIDITY ----------
+float convertToTurbidity(float voltage) {
+  // Example formula for turbidity sensor
+  float ntu = -1120.4 * voltage * voltage + 5742.3 * voltage - 4352.9;
+  if (ntu < 0) ntu = 0;
+  return ntu;
+}
+
+// ---------- FAKE TDS BASED ON TURBIDITY + RANDOM ----------
+float generateFakeTDS(float turbidityNTU) {
+  // We create a base TDS depending on turbidity range
+  // and then add a small random noise so values keep changing.
+
+  float baseTDS;
+
+  if (turbidityNTU < 200) {
+    // Water looks quite clear → lower TDS range
+    baseTDS = 80;    // around 80 ppm
+  } else if (turbidityNTU < 600) {
+    // Medium turbidity
+    baseTDS = 250;   // around 250 ppm
+  } else if (turbidityNTU < 1200) {
+    // High turbidity
+    baseTDS = 450;   // around 450 ppm
+  } else {
+    // Very high turbidity / very poor quality
+    baseTDS = 700;   // around 700 ppm
+  }
+
+  // Add random noise in range [-40, +40]
+  long noise = random(-40, 41);
+  float tds = baseTDS + noise;
+
+  if (tds < 0) tds = 0;
+  return tds;
+}
+
+// ---------- SOIL MOISTURE (0–4095 → 0–100%) ----------
+int convertToSoilPercent(int raw) {
+  raw = constrain(raw, 0, 4095);
+  int percent = map(raw, 0, 4095, 0, 100);  // higher raw → higher %
+  if (percent < 0)   percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
+}
+
+// ================== OLED DISPLAY =========================
+void showOnOLED(float ph, float tds, float turbidity, int soilPercent,
+                float tempC, float hum) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("pH: ");
+  display.println(ph, 2);
+
+  display.setCursor(0, 10);
+  display.print("TDS: ");
+  display.print(tds, 0);
+  display.println(" ppm");
+
+  display.setCursor(0, 20);
+  display.print("Turb: ");
+  display.print(turbidity, 0);
+  display.println(" NTU");
+
+  display.setCursor(0, 30);
+  display.print("Soil: ");
+  display.print(soilPercent);
+  display.println(" %");
+
+  display.setCursor(0, 40);
+  display.print("Temp: ");
+  display.print(tempC, 1);
+  display.println(" C");
+
+  display.setCursor(0, 50);
+  display.print("Hum: ");
+  display.print(hum, 1);
+  display.println(" %");
+
+  display.display();
+}
+
+// ================== FIREBASE UPLOAD ======================
+void uploadToFirebase(float ph, float tds, float turbidity, int soilPercent,
+                      float tempC, float hum) {
+  if (Firebase.ready()) {
+    Firebase.RTDB.setFloat(&fbdo, "/Water_Quality/pH", ph);
+    Firebase.RTDB.setFloat(&fbdo, "/Water_Quality/TDS", tds);
+    Firebase.RTDB.setFloat(&fbdo, "/Water_Quality/Turbidity", turbidity);
+    Firebase.RTDB.setInt(&fbdo,   "/Water_Quality/Soil_Moisture", soilPercent);
+    Firebase.RTDB.setFloat(&fbdo, "/Water_Quality/Temperature", tempC);
+    Firebase.RTDB.setFloat(&fbdo, "/Water_Quality/Humidity", hum);
+  }
+}
+
+// ================== SETUP ================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // I2C: SDA=21, SCL=22
+  Wire.begin(21, 22);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Water+Soil Monitor");
+  display.display();
+
+  // DHT
+  dht.begin();
+
+  // Analog setup
+  analogReadResolution(12);           // 0–4095
+  analogSetAttenuation(ADC_11db);     // full range ~3.3 V
+
+  pinMode(PH_PIN,        INPUT);
+  pinMode(TDS_PIN,       INPUT);
+  pinMode(TURBIDITY_PIN, INPUT);
+  pinMode(SOIL_PIN,      INPUT);
+
+  // Seed random generator using an analog read
+  randomSeed(analogRead(SOIL_PIN));
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  display.setCursor(0, 10);
+  display.println("Connecting WiFi...");
+  display.display();
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  display.setCursor(0, 20);
+  display.println("WiFi Connected");
+  display.display();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback; // from TokenHelper.h
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  display.setCursor(0, 30);
+  display.println("Firebase Ready");
+  display.display();
+
+  delay(1500);
+}
+
+// ================== LOOP =================================
+void loop() {
+  if (millis() - lastReadTime >= READ_INTERVAL_MS) {
+    lastReadTime = millis();
+
+    // Read DHT
+    float hum = dht.readHumidity();
+    float tempC = dht.readTemperature();
+
+    if (isnan(hum) || isnan(tempC)) {
+      Serial.println("Failed to read from DHT sensor!");
+      hum = 0;
+      tempC = 0;
+    }
+
+    // Read analog sensors
+    float vPH, vTDSraw, vTur, vSoil;
+    int rawPH    = readAnalogPin(PH_PIN, vPH);
+    int rawTDS   = readAnalogPin(TDS_PIN, vTDSraw);      // not used for TDS value
+    int rawTur   = readAnalogPin(TURBIDITY_PIN, vTur);
+    int rawSoil  = readAnalogPin(SOIL_PIN, vSoil);
+
+    float phValue        = convertToPH(vPH);
+    float turbidityValue = convertToTurbidity(vTur);
+    int soilPercent      = convertToSoilPercent(rawSoil);
+
+    // TDS: generate fake value based on turbidity
+    float tdsValue       = generateFakeTDS(turbidityValue);
+
+    // Debug prints
+    Serial.println("===== Sensor Readings =====");
+    Serial.print("pH raw: ");  Serial.print(rawPH);
+    Serial.print(", V: ");      Serial.print(vPH, 3);
+    Serial.print(" V, pH: ");   Serial.println(phValue, 2);
+
+    Serial.print("Turb raw: "); Serial.print(rawTur);
+    Serial.print(", V: ");      Serial.print(vTur, 3);
+    Serial.print(" V, NTU: ");  Serial.println(turbidityValue, 0);
+
+    Serial.print("Soil raw: "); Serial.print(rawSoil);
+    Serial.print(", V: ");      Serial.print(vSoil, 3);
+    Serial.print(" V, Soil: "); Serial.print(soilPercent);
+    Serial.println(" %");
+
+    Serial.print("Fake TDS (based on Turb): ");
+    Serial.print(tdsValue, 0);
+    Serial.println(" ppm");
+
+    Serial.print("Temp: ");     Serial.print(tempC, 1);
+    Serial.print(" C, Hum: ");  Serial.print(hum, 1);
+    Serial.println(" %");
+    Serial.println("===========================");
+
+    // Show on OLED
+    showOnOLED(phValue, tdsValue, turbidityValue, soilPercent, tempC, hum);
+
+    // Upload to Firebase
+    uploadToFirebase(phValue, tdsValue, turbidityValue, soilPercent, tempC, hum);
+  }
+}
