@@ -1,0 +1,415 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Servo.h>
+
+// ============ WIFI CONFIG ===================
+#define WIFI_SSID     "robot"        // change as needed
+#define WIFI_PASSWORD "123456789"    // change as needed
+
+// ============ FIREBASE CONFIG ===============
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Helpers from Firebase library examples
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============ ULTRASONIC CONFIG =============
+// HC-SR04
+const int TRIG_PIN = D1;  // GPIO5
+const int ECHO_PIN = D2;  // GPIO4 (via divider)
+
+// Detection thresholds (cm)
+const float OBSTACLE_NEAR_CM   = 20.0;  // start stopping below this
+const float OBSTACLE_CLEAR_CM  = 25.0;  // consider cleared above this
+
+// ============ MOTOR PINS (L293D) ============
+// NodeMCU pins for L293D inputs
+const int IN1 = D5; // GPIO14
+const int IN2 = D6; // GPIO12
+const int IN3 = D7; // GPIO13
+const int IN4 = D8; // GPIO15
+
+// ============ GAS, FLAME, SERVO PINS ========
+const int GAS_PIN   = D0; // GPIO16 - gas sensor digital output
+const int FLAME_PIN = D3; // GPIO0  - flame sensor digital output
+const int SERVO_PIN = D4; // GPIO2  - servo signal
+
+Servo myServo;
+
+// ============ CONTROL VARIABLES =============
+String lastUserCommand     = "S"; // last direction from Firebase
+String savedBeforeObstacle = "S"; // direction before auto-stop
+String currentApplied      = "S"; // current motion
+
+bool obstacleActive = false;
+
+// Gas / flame last states to avoid repeated writes
+int lastGasValue   = -1;  // -1 = unknown, 0/1 = state
+int lastFlameValue = -1;
+
+// Servo tracking
+int lastServoState = -1;  // -1 = unknown, 0/1
+
+// Timing
+unsigned long lastFirebaseRead     = 0;
+unsigned long firebaseReadInterval = 300;   // ms
+
+unsigned long lastUltrasonicCheck  = 0;
+unsigned long ultrasonicInterval   = 200;   // ms
+
+unsigned long lastSensorUpdate     = 0;
+unsigned long sensorUpdateInterval = 400;   // ms  (gas, flame, servo)
+
+// ============ FUNCTION DECLARATIONS =========
+void connectWiFi();
+void initFirebase();
+float getDistanceCm();
+void applyDirection(char cmd);
+void stopMotors();
+void driveForward();
+void driveBackward();
+void turnLeft();
+void turnRight();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Pin modes
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // Digital sensor inputs
+  // Most gas/flame sensor modules are active-LOW:
+  //   - Output HIGH = no detection
+  //   - Output LOW  = detection
+  pinMode(GAS_PIN,   INPUT);
+  pinMode(FLAME_PIN, INPUT);
+
+  stopMotors();
+
+  // Servo init
+  myServo.attach(SERVO_PIN);
+  myServo.write(0);  // default 0°
+
+  connectWiFi();
+  initFirebase();
+
+  // Initialize Firebase nodes
+  if (Firebase.ready()) {
+    Firebase.RTDB.setString(&fbdo, "/Robot/direction", "S");
+    Firebase.RTDB.setInt(&fbdo, "/Robot/Obstacle", 0);
+    Firebase.RTDB.setInt(&fbdo, "/Robot/Gas", 0);
+    Firebase.RTDB.setInt(&fbdo, "/Robot/Flame", 0);
+    Firebase.RTDB.setInt(&fbdo, "/Robot/Servo", 0);
+  }
+}
+
+void loop() {
+  if (!Firebase.ready()) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // ---------- 1) Ultrasonic / Obstacle Handling ----------
+  if (now - lastUltrasonicCheck >= ultrasonicInterval) {
+    lastUltrasonicCheck = now;
+
+    float distance = getDistanceCm();
+
+    if (distance > 0 && distance <= OBSTACLE_NEAR_CM) {
+      // Obstacle detected
+      if (!obstacleActive) {
+        obstacleActive = true;
+
+        savedBeforeObstacle = lastUserCommand;
+
+        stopMotors();
+        currentApplied = "S";
+
+        Firebase.RTDB.setInt(&fbdo, "/Robot/Obstacle", 1);
+        Firebase.RTDB.setString(&fbdo, "/Robot/direction", "S");
+
+        Serial.println("Obstacle detected -> Stopping, Obstacle=1, direction=S");
+      }
+    } else if (distance > OBSTACLE_CLEAR_CM || distance == -1) {
+      // No obstacle in front
+      if (obstacleActive) {
+        obstacleActive = false;
+        Firebase.RTDB.setInt(&fbdo, "/Robot/Obstacle", 0);
+        Serial.println("Obstacle cleared -> Obstacle=0");
+
+        if (savedBeforeObstacle != "S") {
+          Firebase.RTDB.setString(&fbdo, "/Robot/direction", savedBeforeObstacle);
+          applyDirection(savedBeforeObstacle[0]);
+          currentApplied = savedBeforeObstacle;
+
+          Serial.print("Resuming previous command: ");
+          Serial.println(savedBeforeObstacle);
+        } else {
+          stopMotors();
+          currentApplied = "S";
+          Serial.println("Previous command was S, staying stopped.");
+        }
+      }
+    }
+  }
+
+  // ---------- 2) Read direction from Firebase ----------
+  if (!obstacleActive && (now - lastFirebaseRead >= firebaseReadInterval)) {
+    lastFirebaseRead = now;
+
+    if (Firebase.RTDB.getString(&fbdo, "/Robot/direction")) {
+      String dir = fbdo.stringData();
+      dir.trim();
+
+      if (dir.length() > 0) {
+        char cmd = dir[0];
+
+        if (dir != lastUserCommand) {
+          lastUserCommand = dir;
+
+          Serial.print("New direction from Firebase: ");
+          Serial.println(dir);
+
+          switch (cmd) {
+            case 'F':
+            case 'B':
+            case 'L':
+            case 'R':
+              applyDirection(cmd);
+              currentApplied = dir;
+              break;
+
+            case 'S':
+            default:
+              stopMotors();
+              currentApplied = "S";
+              Serial.println("Manual Stop command received.");
+              break;
+          }
+        }
+      }
+    } else {
+      Serial.print("Firebase getString(direction) failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  // ---------- 3) Gas, Flame, Servo Handling ----------
+  if (now - lastSensorUpdate >= sensorUpdateInterval) {
+    lastSensorUpdate = now;
+
+    // 3.1 Gas sensor (ACTIVE-LOW)
+    int gasRaw = digitalRead(GAS_PIN);
+    // For most digital gas modules:
+    //   LOW  = gas detected  -> 1
+    //   HIGH = no gas        -> 0
+    int gasDetected = (gasRaw == LOW) ? 1 : 0;
+
+    if (gasDetected != lastGasValue) {
+      lastGasValue = gasDetected;
+      if (!Firebase.RTDB.setInt(&fbdo, "/Robot/Gas", gasDetected)) {
+        Serial.print("Failed to set Gas: ");
+        Serial.println(fbdo.errorReason());
+      } else {
+        Serial.print("Gas state updated: ");
+        Serial.println(gasDetected);
+      }
+    }
+
+    // 3.2 Flame sensor (ACTIVE-LOW)
+    int flameRaw = digitalRead(FLAME_PIN);
+    // For most flame modules:
+    //   LOW  = flame detected -> 1
+    //   HIGH = no flame       -> 0
+    int flameDetected = (flameRaw == LOW) ? 1 : 0;
+
+    if (flameDetected != lastFlameValue) {
+      lastFlameValue = flameDetected;
+      if (!Firebase.RTDB.setInt(&fbdo, "/Robot/Flame", flameDetected)) {
+        Serial.print("Failed to set Flame: ");
+        Serial.println(fbdo.errorReason());
+      } else {
+        Serial.print("Flame state updated: ");
+        Serial.println(flameDetected);
+      }
+    }
+
+    // 3.3 Servo control from Firebase
+    if (Firebase.RTDB.getInt(&fbdo, "/Robot/Servo")) {
+      int servoVal = fbdo.intData();
+
+      // Force into 0/1 range for safety
+      servoVal = (servoVal != 0) ? 1 : 0;
+
+      if (servoVal != lastServoState) {
+        lastServoState = servoVal;
+        if (servoVal == 1) {
+          myServo.write(90);  // rotate to 90°
+          Serial.println("Servo -> 90 degrees (Servo=1)");
+        } else {
+          myServo.write(0);   // rotate to 0°
+          Serial.println("Servo -> 0 degrees (Servo=0)");
+        }
+      }
+    } else {
+      Serial.print("Firebase getInt(Servo) failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+}
+
+// ============================================
+//            WIFI & FIREBASE SETUP
+// ============================================
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+    if (retries > 60) {
+      Serial.println("WiFi connection failed, restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Initializing Firebase...");
+  while (!Firebase.ready()) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nFirebase is ready.");
+}
+
+// ============================================
+//            ULTRASONIC FUNCTION
+// ============================================
+float getDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  float distance = (duration / 2.0) * 0.0343;
+  return distance;
+}
+
+// ============================================
+//            MOTOR CONTROL FUNCTIONS
+// ============================================
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void driveForward() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void driveBackward() {
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void applyDirection(char cmd) {
+  switch (cmd) {
+    case 'F':
+      Serial.println("Driving FORWARD");
+      driveForward();
+      break;
+    case 'B':
+      Serial.println("Driving BACKWARD");
+      driveBackward();
+      break;
+    case 'L':
+      Serial.println("Turning LEFT");
+      turnLeft();
+      break;
+    case 'R':
+      Serial.println("Turning RIGHT");
+      turnRight();
+      break;
+    default:
+      Serial.println("Unknown command, STOP");
+      stopMotors();
+      break;
+  }
+}
