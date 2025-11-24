@@ -1,0 +1,458 @@
+/************************************************************
+ * 3_Pesticide_Spray Robot
+ * ESP8266 + L298N + 3-Relay + HC-SR04 + Solar Voltage Sensor
+ *
+ * Firebase RTDB structure:
+ *   /3_Pesticide_Spray/direction -> "F","B","L","R","S"
+ *   /3_Pesticide_Spray/Obstacle  -> 0,1 (written by ESP)
+ *   /3_Pesticide_Spray/Spray     -> 0,1,2,3
+ *   /3_Pesticide_Spray/Voltage   -> float (solar voltage)
+ *   /3_Pesticide_Spray/Current   -> float (solar current)
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// Helpers from Firebase examples
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================= WIFI CONFIG ======================
+#define WIFI_SSID     "spray"        // change as needed
+#define WIFI_PASSWORD "123456789"    // change as needed
+
+// ================= FIREBASE CONFIG ==================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================= NODE PATHS =======================
+const String ROOT_NODE     = "/3_Pesticide_Spray";
+const String PATH_DIR      = ROOT_NODE + "/direction";
+const String PATH_OBS      = ROOT_NODE + "/Obstacle";
+const String PATH_SPRAY    = ROOT_NODE + "/Spray";
+const String PATH_VOLTAGE  = ROOT_NODE + "/Voltage";
+const String PATH_CURRENT  = ROOT_NODE + "/Current";
+
+// ================ MOTOR DRIVER PINS =================
+// L298N: IN1, IN2, IN3, IN4
+// Use only safe pins for motors
+const int IN1 = D1;   // GPIO5  - Left motor IN1
+const int IN2 = D2;   // GPIO4  - Left motor IN2
+const int IN3 = D5;   // GPIO14 - Right motor IN3
+const int IN4 = D6;   // GPIO12 - Right motor IN4
+
+// ================ RELAY PINS (SPRAY) ================
+// Use safe pins for relays (avoid D3, D8)
+const int RELAY1_PIN = D7;  // GPIO13 - Spray 1
+const int RELAY2_PIN = D0;  // GPIO16 - Spray 2
+const int RELAY3_PIN = D4;  // GPIO2  - Spray 3 (OK as OUTPUT, just keep high at boot)
+
+// Most 5V relay modules are ACTIVE-LOW
+#define RELAY_ACTIVE_LOW  true
+
+// ================ ULTRASONIC PINS ===================
+// Choose boot-safe mapping:
+// TRIG: D3 (GPIO0) as OUTPUT
+// ECHO: D8 (GPIO15) as INPUT (idle LOW, which is good for boot)
+const int TRIG_PIN = D3;   // GPIO0 - HC-SR04 TRIG (output)
+const int ECHO_PIN = D8;   // GPIO15 - HC-SR04 ECHO (input via level shifter / divider)
+
+// Obstacle detection threshold
+const float OBSTACLE_THRESHOLD_CM = 20.0;  // adjust as needed
+
+// ================ SOLAR VOLTAGE SENSOR ==============
+const int VOLTAGE_PIN = A0;
+
+// Analog reference and divider
+const float ADC_REF_VOLT      = 3.3;    // NodeMCU internal ref (0–3.3 V at A0)
+const int   ADC_RESOLUTION    = 1023;   // 10-bit ADC
+const float VOLTAGE_DIV_RATIO = 5.0;    // sensor scaling (adjust after calibration)
+const float LOAD_RESISTANCE_OHMS = 10.0;  // assumed load to estimate current (adjust)
+
+// ================ STATE VARIABLES ===================
+String currentDirection      = "S";  // what we currently drive to motors
+String lastNonStopDirection  = "S";  // last F/B/L/R command (for resume)
+bool   obstacleActive        = false;
+bool   manualStop            = false; // true if user set direction = "S"
+
+// Timers
+unsigned long lastFirebaseReadMs   = 0;
+unsigned long lastObstacleCheckMs  = 0;
+unsigned long lastSolarUploadMs    = 0;
+
+const unsigned long FIREBASE_READ_INTERVAL_MS  = 300;   // read direction/Spray
+const unsigned long OBSTACLE_CHECK_INTERVAL_MS = 150;   // ultrasonic
+const unsigned long SOLAR_UPLOAD_INTERVAL_MS   = 1000;  // Voltage/Current
+
+// ====================================================
+// Utility: Relay ON/OFF wrappers
+// ====================================================
+void setRelay(int pin, bool on)
+{
+  int level;
+  if (RELAY_ACTIVE_LOW)
+    level = on ? LOW : HIGH;
+  else
+    level = on ? HIGH : LOW;
+
+  digitalWrite(pin, level);
+}
+
+// ====================================================
+// Motor control helpers
+// ====================================================
+void motorsStop()
+{
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void motorsForward()
+{
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void motorsBackward()
+{
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void motorsLeft()
+{
+  // Turn on spot: left backward, right forward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void motorsRight()
+{
+  // Turn on spot: left forward, right backward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+// Apply currentDirection to motors, considering obstacle & manual stop
+void updateMotors()
+{
+  if (obstacleActive) {
+    motorsStop();
+    return;
+  }
+
+  if (manualStop || currentDirection == "S") {
+    motorsStop();
+  } else if (currentDirection == "F") {
+    motorsForward();
+  } else if (currentDirection == "B") {
+    motorsBackward();
+  } else if (currentDirection == "L") {
+    motorsLeft();
+  } else if (currentDirection == "R") {
+    motorsRight();
+  } else {
+    motorsStop();
+  }
+}
+
+// ====================================================
+// Ultrasonic distance measurement
+// ====================================================
+float measureDistanceCm()
+{
+  // Trigger a 10us pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo pulse width
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+
+  if (duration == 0) {
+    // No echo
+    return -1.0;
+  }
+
+  // Speed of sound ~340 m/s -> 29.1 us per cm (round trip)
+  float distanceCm = (float)duration * 0.0343 / 2.0;
+  return distanceCm;
+}
+
+// ====================================================
+// Read direction from Firebase
+// ====================================================
+void readDirectionFromFirebase()
+{
+  if (!Firebase.RTDB.getString(&fbdo, PATH_DIR)) {
+    Serial.print("Failed to get direction: ");
+    Serial.println(fbdo.errorReason());
+    return;
+  }
+
+  String dir = fbdo.stringData();
+  dir.trim();
+  dir.toUpperCase();
+
+  if (dir == "S") {
+    manualStop = true;
+    currentDirection = "S";
+    Serial.println("[DIR] Manual STOP (S)");
+  } else if (dir == "F" || dir == "B" || dir == "L" || dir == "R") {
+    manualStop = false;
+    currentDirection = dir;
+    lastNonStopDirection = dir;  // remember this for after obstacle clears
+    Serial.print("[DIR] Command = ");
+    Serial.println(dir);
+  } else {
+    Serial.print("[DIR] Invalid direction received: ");
+    Serial.println(dir);
+  }
+}
+
+// ====================================================
+// Read Spray from Firebase and control relays
+// ====================================================
+void readSprayFromFirebase()
+{
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_SPRAY)) {
+    Serial.print("Failed to get Spray: ");
+    Serial.println(fbdo.errorReason());
+    return;
+  }
+
+  int sprayCmd = fbdo.intData();
+  Serial.print("[Spray] Command = ");
+  Serial.println(sprayCmd);
+
+  // Turn all OFF first
+  setRelay(RELAY1_PIN, false);
+  setRelay(RELAY2_PIN, false);
+  setRelay(RELAY3_PIN, false);
+
+  if (sprayCmd == 1) {
+    setRelay(RELAY1_PIN, true);
+  } else if (sprayCmd == 2) {
+    setRelay(RELAY2_PIN, true);
+  } else if (sprayCmd == 3) {
+    setRelay(RELAY3_PIN, true);
+  }
+}
+
+// ====================================================
+// Check obstacle via ultrasonic and update Firebase
+// Also handles direction=S when obstacle detected,
+// and resumes previous direction after it clears
+// (only if user did NOT manually stop).
+// ====================================================
+void checkObstacle()
+{
+  float dist = measureDistanceCm();
+  bool previouslyActive = obstacleActive;
+
+  if (dist > 0 && dist < OBSTACLE_THRESHOLD_CM) {
+    obstacleActive = true;
+  } else {
+    obstacleActive = false;
+  }
+
+  if (obstacleActive != previouslyActive) {
+    int obsVal = obstacleActive ? 1 : 0;
+
+    // Update Obstacle node
+    if (!Firebase.RTDB.setInt(&fbdo, PATH_OBS, obsVal)) {
+      Serial.print("Failed to set Obstacle: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    if (obstacleActive) {
+      // Obstacle just detected:
+      // - Do NOT mark manualStop = true (this is auto stop)
+      // - Set direction = "S" in Firebase
+      Serial.print("[Obstacle] DETECTED (");
+      Serial.print(dist);
+      Serial.println(" cm) -> stopping and direction=S");
+
+      currentDirection = "S";
+      if (!Firebase.RTDB.setString(&fbdo, PATH_DIR, "S")) {
+        Serial.print("Failed to set direction=S on obstacle: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      // Obstacle just cleared:
+      Serial.print("[Obstacle] CLEARED (");
+      Serial.print(dist);
+      Serial.println(" cm)");
+
+      // If user didn't manually stop and we have a last direction, resume it
+      if (!manualStop && lastNonStopDirection != "S") {
+        currentDirection = lastNonStopDirection;
+        Serial.print("[Obstacle] Resuming previous direction: ");
+        Serial.println(lastNonStopDirection);
+
+        if (!Firebase.RTDB.setString(&fbdo, PATH_DIR, lastNonStopDirection)) {
+          Serial.print("Failed to restore direction after obstacle: ");
+          Serial.println(fbdo.errorReason());
+        }
+      } else {
+        Serial.println("[Obstacle] Not resuming (manual stop or no last direction).");
+      }
+    }
+  }
+
+  // Ensure motors follow the latest obstacle/manual state
+  updateMotors();
+}
+
+// ====================================================
+// Measure solar voltage & calculate current, upload
+// ====================================================
+void measureAndUploadSolar()
+{
+  int raw = analogRead(VOLTAGE_PIN);
+
+  // Convert ADC reading to voltage at A0
+  float v_adc = (float)raw * ADC_REF_VOLT / (float)ADC_RESOLUTION;
+
+  // Real solar voltage after divider
+  float v_solar = v_adc * VOLTAGE_DIV_RATIO;
+
+  // Simple estimation: I = V / R (assumed load)
+  float i_solar = 0.0;
+  if (LOAD_RESISTANCE_OHMS > 0.0) {
+    i_solar = v_solar / LOAD_RESISTANCE_OHMS;
+  }
+
+  Serial.print("[Solar] RAW=");
+  Serial.print(raw);
+  Serial.print(" V_solar=");
+  Serial.print(v_solar, 2);
+  Serial.print(" V, I_solar=");
+  Serial.print(i_solar, 2);
+  Serial.println(" A");
+
+  // Push to Firebase
+  if (!Firebase.RTDB.setFloat(&fbdo, PATH_VOLTAGE, v_solar)) {
+    Serial.print("Failed to set Voltage: ");
+    Serial.println(fbdo.errorReason());
+  }
+  if (!Firebase.RTDB.setFloat(&fbdo, PATH_CURRENT, i_solar)) {
+    Serial.print("Failed to set Current: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+// ====================================================
+// Setup
+// ====================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  // Pin modes
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Safe initial states
+  motorsStop();
+  setRelay(RELAY1_PIN, false);
+  setRelay(RELAY2_PIN, false);
+  setRelay(RELAY3_PIN, false);
+
+  // WiFi
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.database_url = DATABASE_URL;
+
+  // Assign callback for token generation status
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize RTDB values
+  Firebase.RTDB.setString(&fbdo, PATH_DIR, "S");  // start in STOP
+  Firebase.RTDB.setInt(&fbdo, PATH_OBS, 0);
+  Firebase.RTDB.setInt(&fbdo, PATH_SPRAY, 0);
+  Firebase.RTDB.setFloat(&fbdo, PATH_VOLTAGE, 0.0);
+  Firebase.RTDB.setFloat(&fbdo, PATH_CURRENT, 0.0);
+
+  Serial.println("Setup complete. Waiting for commands...");
+}
+
+// ====================================================
+// Main loop
+// ====================================================
+void loop()
+{
+  unsigned long now = millis();
+
+  // 1) Periodically read direction & Spray from Firebase
+  if (Firebase.ready() && (now - lastFirebaseReadMs >= FIREBASE_READ_INTERVAL_MS)) {
+    lastFirebaseReadMs = now;
+    readDirectionFromFirebase();
+    readSprayFromFirebase();
+    updateMotors();
+  }
+
+  // 2) Check obstacle via ultrasonic
+  if (now - lastObstacleCheckMs >= OBSTACLE_CHECK_INTERVAL_MS) {
+    lastObstacleCheckMs = now;
+    checkObstacle();
+  }
+
+  // 3) Measure solar voltage & current, upload
+  if (now - lastSolarUploadMs >= SOLAR_UPLOAD_INTERVAL_MS) {
+    lastSolarUploadMs = now;
+    measureAndUploadSolar();
+  }
+
+  delay(10);
+}
