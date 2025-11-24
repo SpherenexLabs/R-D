@@ -1,0 +1,306 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ctype.h>  // for toupper
+
+// ============ WIFI CONFIG ===================
+#define WIFI_SSID     "robot"        // change as needed
+#define WIFI_PASSWORD "123456789"    // change as needed
+
+// ============ FIREBASE CONFIG ===============
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Helpers from Firebase library examples
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============ FIREBASE PATHS =================
+const char* PATH_OBSTACLE  = "/Motor_control/Obstacle";
+
+// ============ ULTRASONIC CONFIG =============
+// HC-SR04
+const int TRIG_PIN = D1;  // GPIO5
+const int ECHO_PIN = D2;  // GPIO4 (via divider)
+
+// Detection thresholds (cm)
+const float OBSTACLE_NEAR_CM   = 20.0;  // obstacle if <= this
+const float OBSTACLE_CLEAR_CM  = 25.0;  // considered cleared if > this
+
+// ============ MOTOR PINS (L293D) ============
+// NodeMCU pins for L293D inputs
+const int IN1 = D5; // GPIO14
+const int IN2 = D6; // GPIO12
+const int IN3 = D7; // GPIO13
+const int IN4 = D8; // GPIO15
+
+// ============ CONTROL VARIABLES =============
+String lastUserCommand = "S"; // last command from Serial
+bool obstacleActive    = false;
+
+// Timing
+unsigned long lastUltrasonicCheck  = 0;
+unsigned long ultrasonicInterval   = 200;   // ms
+
+// ============ FUNCTION DECLARATIONS =========
+void connectWiFi();
+void initFirebase();
+float getDistanceCm();
+void applyDirection(char cmd);
+void stopMotors();
+void driveForward();
+void driveBackward();
+void turnLeft();
+void turnRight();
+
+// ============================================
+//                 SETUP
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Pin modes
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+
+  connectWiFi();
+  initFirebase();
+
+  // Initialize Firebase Obstacle node (Direction is no longer used)
+  if (Firebase.ready()) {
+    Firebase.RTDB.setInt(&fbdo, PATH_OBSTACLE, 0);
+  }
+
+  Serial.println("Setup complete. Control robot via Serial:");
+  Serial.println("F=Forward, B=Backward, L=Left, R=Right, S=Stop");
+}
+
+// ============================================
+//                  LOOP
+// ============================================
+void loop() {
+  unsigned long now = millis();
+
+  // ---------- 0) Read command from Serial Monitor ----------
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+
+    // Ignore newline / carriage return
+    if (c == '\n' || c == '\r') {
+      return;
+    }
+
+    c = toupper(c);
+
+    switch (c) {
+      case 'F':
+      case 'B':
+      case 'L':
+      case 'R':
+      case 'S':
+        lastUserCommand = String(c);
+        Serial.print("Serial command: ");
+        Serial.println(c);
+        applyDirection(c);
+        break;
+
+      default:
+        Serial.print("Unknown command: ");
+        Serial.println(c);
+        Serial.println("Use F,B,L,R,S");
+        break;
+    }
+  }
+
+  // ---------- 1) Ultrasonic / Obstacle Handling ----------
+  if (now - lastUltrasonicCheck >= ultrasonicInterval) {
+    lastUltrasonicCheck = now;
+
+    float distance = getDistanceCm();
+    bool previouslyActive = obstacleActive;
+
+    if (distance > 0 && distance <= OBSTACLE_NEAR_CM) {
+      obstacleActive = true;
+    } else if (distance > OBSTACLE_CLEAR_CM || distance == -1) {
+      obstacleActive = false;
+    }
+
+    // If obstacle state changed, update Firebase
+    if (obstacleActive != previouslyActive) {
+      int obsVal = obstacleActive ? 1 : 0;
+
+      Serial.print("Obstacle state changed: ");
+      Serial.print(obsVal);
+      Serial.print(" (distance = ");
+      Serial.print(distance);
+      Serial.println(" cm)");
+
+      if (Firebase.ready()) {
+        if (!Firebase.RTDB.setInt(&fbdo, PATH_OBSTACLE, obsVal)) {
+          Serial.print("Failed to set Obstacle in Firebase: ");
+          Serial.println(fbdo.errorReason());
+        }
+      }
+      // IMPORTANT: We DO NOT stop motors here anymore
+    }
+  }
+
+  // small delay to avoid busy looping too hard
+  delay(5);
+}
+
+// ============================================
+//            WIFI & FIREBASE SETUP
+// ============================================
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+    if (retries > 60) {
+      Serial.println("WiFi connection failed, restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Initializing Firebase...");
+  while (!Firebase.ready()) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nFirebase is ready.");
+}
+
+// ============================================
+//            ULTRASONIC FUNCTION
+// ============================================
+float getDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    // no echo
+    return -1;
+  }
+
+  float distance = (duration / 2.0) * 0.0343;
+  return distance;
+}
+
+// ============================================
+//            MOTOR CONTROL FUNCTIONS
+// ============================================
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void driveForward() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void driveBackward() {
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void applyDirection(char cmd) {
+  switch (cmd) {
+    case 'F':
+      Serial.println("Driving FORWARD");
+      driveForward();
+      break;
+    case 'B':
+      Serial.println("Driving BACKWARD");
+      driveBackward();
+      break;
+    case 'L':
+      Serial.println("Turning LEFT");
+      turnLeft();
+      break;
+    case 'R':
+      Serial.println("Turning RIGHT");
+      turnRight();
+      break;
+    case 'S':
+    default:
+      Serial.println("STOP");
+      stopMotors();
+      break;
+  }
+}
