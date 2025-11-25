@@ -1,0 +1,469 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ============ WIFI CONFIG ===================
+#define WIFI_SSID     "robot"
+#define WIFI_PASSWORD "123456789"
+
+// ============ FIREBASE CONFIG ===============
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Helpers from Firebase library examples
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============ OLED CONFIG ===================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1  // No reset pin
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Use custom I2C pins for OLED so D1/D2 stay free for ultrasonic
+const int OLED_SDA = D3;  // GPIO0
+const int OLED_SCL = D4;  // GPIO2
+
+// ============ ULTRASONIC CONFIG =============
+// HC-SR04
+const int TRIG_PIN = D1;  // GPIO5
+const int ECHO_PIN = D2;  // GPIO4 (via divider to 3.3V)
+
+// Detection threshold (cm) -> obstacle when <= 5 cm
+const float OBSTACLE_NEAR_CM = 5.0;
+
+// ============ MOTOR PINS (L293D) ============
+// NodeMCU pins for L293D inputs
+const int IN1 = D5; // GPIO14
+const int IN2 = D6; // GPIO12
+const int IN3 = D7; // GPIO13
+const int IN4 = D8; // GPIO15
+
+// ============ SOLAR / VOLTAGE SENSOR ========
+const int VOLTAGE_PIN = A0;      // Voltage sensor output to A0
+const float ADC_REF_VOLT = 3.3;  // NodeMCU A0 full-scale
+const float VOLTAGE_DIVIDER_RATIO = 11.0;  // for typical 0–25V sensor (30k/7.5k)
+
+// Assume panel is connected to a load ~10 Ω just for estimation
+const float PANEL_LOAD_RESISTANCE = 10.0;  // Ohms, adjust to your real load
+
+// Set motor speed (0–1023). Lower = slower.
+const int MOTOR_SPEED = 200;   // adjust as you like
+
+// ============ CONTROL VARIABLES =============
+String lastUserCommand     = "S"; // last direction from Firebase
+String savedBeforeObstacle = "S"; // direction before auto-sequence
+String currentApplied      = "S"; // current motion
+
+bool obstacleActive = false;
+
+// Timing
+unsigned long lastFirebaseRead      = 0;
+unsigned long firebaseReadInterval  = 300;   // ms
+
+unsigned long lastUltrasonicCheck   = 0;
+unsigned long ultrasonicInterval    = 200;   // ms
+
+unsigned long lastSolarUpdate       = 0;
+unsigned long solarUpdateInterval   = 1000;  // ms (1 second)
+
+// Last measured solar values
+float lastSVol = 0.0;
+float lastSCur = 0.0;
+
+// ============ FUNCTION DECLARATIONS =========
+void connectWiFi();
+void initFirebase();
+float getDistanceCm();
+void applyDirection(char cmd);
+void stopMotors();
+void driveForward();
+void driveBackward();
+void turnLeft();
+void turnRight();
+void readSolarAndUpdate();
+void updateOLED(float sVol, float sCur);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Ultrasonic pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+
+  // I2C for OLED (custom pins)
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // common OLED address
+    Serial.println("SSD1306 allocation failed");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Robot1 Solar + Obstacle");
+    display.display();
+  }
+
+  connectWiFi();
+  initFirebase();
+
+  // Initialize Firebase nodes
+  if (Firebase.ready()) {
+    Firebase.RTDB.setString(&fbdo, "/Robot1/Direction", "S");
+    Firebase.RTDB.setInt(&fbdo, "/Robot1/Obstacle", 0);
+    Firebase.RTDB.setFloat(&fbdo, "/Robot1/S_vol", 0.0);
+    Firebase.RTDB.setFloat(&fbdo, "/Robot1/S_cur", 0.0);
+  }
+}
+
+void loop() {
+  if (!Firebase.ready()) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // ---------- 1) Ultrasonic / Obstacle Handling ----------
+  if (now - lastUltrasonicCheck >= ultrasonicInterval) {
+    lastUltrasonicCheck = now;
+
+    float distance = getDistanceCm();
+
+    // Trigger only when not already in obstacle sequence
+    if (!obstacleActive && distance > 0 && distance <= OBSTACLE_NEAR_CM) {
+      obstacleActive = true;
+
+      // Save last user command (F/B/L/R/S)
+      savedBeforeObstacle = lastUserCommand;
+
+      Serial.print("Obstacle detected at: ");
+      Serial.print(distance);
+      Serial.println(" cm -> starting escape sequence");
+
+      // Mark obstacle in Firebase
+      Firebase.RTDB.setInt(&fbdo, "/Robot1/Obstacle", 1);
+
+      // 1) Move BACKWARD for 3 seconds
+      Firebase.RTDB.setString(&fbdo, "/Robot1/Direction", "B");
+      applyDirection('B');
+      Serial.println("Obstacle: moving BACKWARD for 3 seconds");
+      delay(3000);
+
+      // 2) Move RIGHT for 10 seconds
+      Firebase.RTDB.setString(&fbdo, "/Robot1/Direction", "R");
+      applyDirection('R');
+      Serial.println("Obstacle: turning RIGHT for 10 seconds");
+      delay(10000);
+
+      // 3) Stop motors
+      Firebase.RTDB.setString(&fbdo, "/Robot1/Direction", "S");
+      stopMotors();
+      Serial.println("Obstacle sequence done, STOP");
+
+      // Clear obstacle flag
+      Firebase.RTDB.setInt(&fbdo, "/Robot1/Obstacle", 0);
+
+      // Mark sequence finished
+      obstacleActive = false;
+
+      // Resume previous command if it wasn't Stop
+      if (savedBeforeObstacle != "S" && savedBeforeObstacle.length() > 0) {
+        char prevCmd = savedBeforeObstacle[0];
+        Firebase.RTDB.setString(&fbdo, "/Robot1/Direction", savedBeforeObstacle);
+        applyDirection(prevCmd);
+        currentApplied = savedBeforeObstacle;
+
+        Serial.print("Resuming previous command: ");
+        Serial.println(savedBeforeObstacle);
+      } else {
+        currentApplied = "S";
+        Serial.println("Previous command was S, staying stopped.");
+      }
+    }
+  }
+
+  // ---------- 2) Read direction from Firebase (only when not in sequence) ----------
+  if (!obstacleActive && (now - lastFirebaseRead >= firebaseReadInterval)) {
+    lastFirebaseRead = now;
+
+    if (Firebase.RTDB.getString(&fbdo, "/Robot1/Direction")) {
+      String dir = fbdo.stringData();
+      dir.trim();
+
+      if (dir.length() > 0) {
+        char cmd = dir[0];
+
+        if (dir != lastUserCommand) {
+          lastUserCommand = dir;
+
+          Serial.print("New direction from Firebase: ");
+          Serial.println(dir);
+
+          switch (cmd) {
+            case 'F':
+            case 'B':
+            case 'L':
+            case 'R':
+              applyDirection(cmd);
+              currentApplied = dir;
+              break;
+
+            case 'S':
+            default:
+              stopMotors();
+              currentApplied = "S";
+              Serial.println("Manual Stop command received.");
+              break;
+          }
+        }
+      }
+    } else {
+      Serial.print("Firebase getString(/Robot1/Direction) failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  // ---------- 3) Solar / Voltage Sensor + OLED + Firebase ----------
+  if (now - lastSolarUpdate >= solarUpdateInterval) {
+    lastSolarUpdate = now;
+    readSolarAndUpdate();
+  }
+}
+
+// ============================================
+//            WIFI & FIREBASE SETUP
+// ============================================
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+    if (retries > 60) {
+      Serial.println("WiFi connection failed, restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Initializing Firebase...");
+  while (!Firebase.ready()) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nFirebase is ready.");
+}
+
+// ============================================
+//            ULTRASONIC FUNCTION
+// ============================================
+float getDistanceCm() {
+  // Trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo (timeout 30 ms)
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    // No echo, maybe out of range
+    return -1;
+  }
+
+  float distance = (duration / 2.0) * 0.0343; // cm
+  return distance;
+}
+
+// ============================================
+//            SOLAR / VOLTAGE + OLED
+// ============================================
+void readSolarAndUpdate() {
+  int adcRaw = analogRead(VOLTAGE_PIN);
+
+  // Voltage at A0
+  float vA0 = (adcRaw * ADC_REF_VOLT) / 1023.0;
+
+  // Voltage at solar side (through divider)
+  float sVol = vA0 * VOLTAGE_DIVIDER_RATIO;
+
+  // Simple current estimate using R = V / I -> I = V / R
+  float sCur = 0.0;
+  if (PANEL_LOAD_RESISTANCE > 0.0) {
+    sCur = sVol / PANEL_LOAD_RESISTANCE;   // in Amps (approx)
+  }
+
+  lastSVol = sVol;
+  lastSCur = sCur;
+
+  Serial.print("Solar: S_vol = ");
+  Serial.print(sVol, 2);
+  Serial.print(" V,  S_cur = ");
+  Serial.print(sCur, 2);
+  Serial.println(" A");
+
+  // Update Firebase
+  if (!Firebase.RTDB.setFloat(&fbdo, "/Robot1/S_vol", sVol)) {
+    Serial.print("Failed to set S_vol: ");
+    Serial.println(fbdo.errorReason());
+  }
+  if (!Firebase.RTDB.setFloat(&fbdo, "/Robot1/S_cur", sCur)) {
+    Serial.print("Failed to set S_cur: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  // Update OLED
+  updateOLED(sVol, sCur);
+}
+
+void updateOLED(float sVol, float sCur) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("Robot1 Status");
+
+  display.setCursor(0, 16);
+  display.print("S_vol: ");
+  display.print(sVol, 2);
+  display.println(" V");
+
+  display.setCursor(0, 28);
+  display.print("S_cur: ");
+  display.print(sCur, 2);
+  display.println(" A");
+
+  display.setCursor(0, 40);
+  display.print("Dir: ");
+  display.print(lastUserCommand);
+
+  display.display();
+}
+
+// ============================================
+//            MOTOR CONTROL FUNCTIONS
+// ============================================
+void stopMotors() {
+  // Fully stop all pins
+  analogWrite(IN1, 0);
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0);
+  analogWrite(IN4, 0);
+}
+
+// FORWARD: both motors forward at reduced speed
+void driveForward() {
+  // Left motor forward: IN1 = PWM, IN2 = LOW
+  analogWrite(IN1, MOTOR_SPEED);
+  analogWrite(IN2, 0);
+
+  // Right motor forward: IN3 = PWM, IN4 = LOW
+  analogWrite(IN3, MOTOR_SPEED);
+  analogWrite(IN4, 0);
+}
+
+// BACKWARD: both motors backward at reduced speed
+void driveBackward() {
+  // Left motor backward: IN1 = LOW, IN2 = PWM
+  analogWrite(IN1, 0);
+  analogWrite(IN2, MOTOR_SPEED);
+
+  // Right motor backward: IN3 = LOW, IN4 = PWM
+  analogWrite(IN3, 0);
+  analogWrite(IN4, MOTOR_SPEED);
+}
+
+// LEFT TURN: left motor backward, right motor forward at reduced speed
+void turnLeft() {
+  // Left motor backward
+  analogWrite(IN1, 0);
+  analogWrite(IN2, MOTOR_SPEED);
+
+  // Right motor forward
+  analogWrite(IN3, MOTOR_SPEED);
+  analogWrite(IN4, 0);
+}
+
+// RIGHT TURN: left motor forward, right motor backward at reduced speed
+void turnRight() {
+  // Left motor forward
+  analogWrite(IN1, MOTOR_SPEED);
+  analogWrite(IN2, 0);
+
+  // Right motor backward
+  analogWrite(IN3, 0);
+  analogWrite(IN4, MOTOR_SPEED);
+}
+
+void applyDirection(char cmd) {
+  switch (cmd) {
+    case 'F':
+      Serial.println("Driving FORWARD (reduced speed)");
+      driveForward();
+      break;
+    case 'B':
+      Serial.println("Driving BACKWARD (reduced speed)");
+      driveBackward();
+      break;
+    case 'L':
+      Serial.println("Turning LEFT (reduced speed)");
+      turnLeft();
+      break;
+    case 'R':
+      Serial.println("Turning RIGHT (reduced speed)");
+      turnRight();
+      break;
+    default:
+      Serial.println("Unknown command, STOP");
+      stopMotors();
+      break;
+  }
+}
