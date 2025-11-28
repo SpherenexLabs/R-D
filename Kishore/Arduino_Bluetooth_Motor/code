@@ -1,0 +1,107 @@
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+
+// Bluetooth SoftwareSerial pins
+const uint8_t BT_RX_PIN = 10; // Arduino RX  <- HC-05 TX
+const uint8_t BT_TX_PIN = 11; // Arduino TX  -> HC-05 RX (use voltage divider)
+
+// initialize SoftwareSerial for Bluetooth
+SoftwareSerial BT(BT_RX_PIN, BT_TX_PIN);
+
+// Motor direction pins (L293D IN pins)
+const uint8_t IN1 = 2;  // Left motor A
+const uint8_t IN2 = 3;  // Left motor B
+const uint8_t IN3 = 4;  // Right motor A
+const uint8_t IN4 = 7;  // Right motor B
+
+void setupPins() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // ensure stopped initially
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void moveForward() {
+  // both motors forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void moveBackward() {
+  // both motors backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  // pivot left: left backward, right forward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  // pivot right: left forward, right backward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600); // change if HC-05 uses different baud
+  setupPins();
+  Serial.println("BT Motor Control (no PWM) ready. Send F/B/L/R/S");
+}
+
+void handleCommand(char c) {
+  switch (c) {
+    case 'F': moveForward(); Serial.println("Forward"); break;
+    case 'B': moveBackward(); Serial.println("Backward"); break;
+    case 'L': turnLeft(); Serial.println("Left"); break;
+    case 'R': turnRight(); Serial.println("Right"); break;
+    case 'S': stopMotors(); Serial.println("Stop"); break;
+    default:
+      Serial.print("Unknown: ");
+      Serial.println(c);
+      break;
+  }
+}
+
+void loop() {
+  if (BT.available()) {
+    char c = BT.read();
+    if (c == '\r' || c == '\n') return;
+    c = toupper(c);
+    Serial.print("BT: ");
+    Serial.println(c);
+    handleCommand(c);
+  }
+
+  // Optional: control from USB serial monitor too
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') return;
+    c = toupper(c);
+    handleCommand(c);
+  }
+}
