@@ -1,0 +1,233 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ctype.h>  // for toupper
+
+// ============ WIFI CONFIG ===================
+#define WIFI_SSID     "robot"        // change if needed
+#define WIFI_PASSWORD "123456789"    // change if needed
+
+// ============ FIREBASE CONFIG ================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Helpers from Firebase library examples
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ============ RTDB PATHS =====================
+const char* PATH_DIRECTION = "/Motor_Buzzer/direction";
+const char* PATH_OBSTACLE  = "/Motor_Buzzer/Obstacle";
+const char* PATH_BUZZ      = "/Motor_Buzzer/Buzz";
+
+// ============ PIN CONFIG =====================
+// Ultrasonic sensor (HC-SR04)
+#define TRIG_PIN   D1      // GPIO5
+#define ECHO_PIN   D2      // GPIO4  (through voltage divider from 5V echo)
+
+// L293D motor driver (two DC motors)
+#define IN1        D5      // GPIO14
+#define IN2        D6      // GPIO12
+#define IN3        D7      // GPIO13
+#define IN4        D8      // GPIO15
+
+// Buzzer
+#define BUZZER_PIN D3      // GPIO0
+
+// ============ PARAMETERS =====================
+const float OBSTACLE_THRESHOLD_CM = 20.0;  // obstacle distance in cm
+
+// Direction states
+char requestedDirection = 'S';   // value read from Firebase (F, B, L, R, S)
+char activeDirection    = 'S';   // what motors are currently doing
+
+// Obstacle tracking
+bool lastObstacle = false;
+
+// Buzzer tracking
+bool buzzActive = false;
+unsigned long buzzStartMillis = 0;
+const unsigned long BUZZ_DURATION_MS = 2000;  // 2 seconds
+
+// Timing for Firebase loop
+unsigned long lastFbMillis = 0;
+const unsigned long FB_INTERVAL = 300;  // ms
+
+// --------------------------------------------------
+// Ultrasonic distance function
+// --------------------------------------------------
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (duration == 0) return -1.0; // no echo
+  return duration * 0.0343f / 2.0f;
+}
+
+// --------------------------------------------------
+// Motor control helpers
+// --------------------------------------------------
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void moveForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void moveLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void moveRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void applyDirection(char dir) {
+  switch (dir) {
+    case 'F': moveForward(); break;
+    case 'B': moveBackward(); break;
+    case 'L': moveLeft(); break;
+    case 'R': moveRight(); break;
+    case 'S':
+    default:  stopMotors(); break;
+  }
+}
+
+// --------------------------------------------------
+// Setup
+// --------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("Motor + Buzzer + Ultrasonic + Firebase");
+
+  // Pin modes
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  stopMotors();
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println();
+  Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email    = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize default RTDB values
+  Firebase.RTDB.setString(&fbdo, PATH_DIRECTION, "S");
+  Firebase.RTDB.setInt(&fbdo, PATH_OBSTACLE, 0);
+  Firebase.RTDB.setInt(&fbdo, PATH_BUZZ, 0);
+}
+
+// --------------------------------------------------
+// Loop
+// --------------------------------------------------
+void loop() {
+  unsigned long now = millis();
+
+  // Handle ongoing buzzer (non-blocking)
+  if (buzzActive) {
+    if (now - buzzStartMillis >= BUZZ_DURATION_MS) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzActive = false;
+
+      // Reset Buzz node to 0
+      if (Firebase.ready()) {
+        Firebase.RTDB.setInt(&fbdo, PATH_BUZZ, 0);
+      }
+    }
+  }
+
+  // Throttle Firebase operations
+  if (!Firebase.ready()) return;
+  if (now - lastFbMillis < FB_INTERVAL) return;
+  lastFbMillis = now;
+
+  // ---------------------------
+  // 1) Read direction
+  // ---------------------------
+  if (Firebase.RTDB.getString(&fbdo, PATH_DIRECTION)) {
+    String d = fbdo.stringData();
+    if (d.length() > 0) {
+      char c = toupper(d.charAt(0));
+      if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') {
+        requestedDirection = c;
+      }
+    }
+  }
+
+  // ---------------------------
+  // 2) Ultrasonic & obstacle
+  // ---------------------------
+  float distance = readDistanceCM();
+  bool obstacleNow = false;
+
+  if (distance > 0 && distance <= OBSTACLE_THRESHOLD_CM) {
+    obstacleNow = true;
+  }
+
+  // Only update RTDB when state changes
+  if (obstacleNow != lastObstacle) {
+    lastObstacle = obstacleNow;
+    int obsFlag = obstacleNow ? 1 : 0;
+    Serial.print("Obstacle state changed: "); Serial.println(obsFlag);
+    Firebase.RTDB.setInt(&fbdo, PATH_OBSTACLE, obsFlag);
+
+    // Trigger buzzer automatically when obstacle detected
+    if (obstacleNow && !buzzActive) {
+      buzzActive = true;
+      buzzStartMillis = now;
+      digitalWrite(BUZZER_PIN, HIGH);
+      Firebase.RTDB.setInt(&fbdo, PATH_BUZZ, 1);
+    }
+  }
+
+  // ---------------------------
+  // 3) Normal direction control (NO obstacle effect)
+  // ---------------------------
+  if (requestedDirection != activeDirection) {
+    Serial.print("Direction changed to: "); Serial.println(requestedDirection);
+    applyDirection(requestedDirection);
+    activeDirection = requestedDirection;
+  }
+
+  delay(10);
+}
