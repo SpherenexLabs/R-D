@@ -1,0 +1,266 @@
+/************************************************************
+ * ESP8266 + DHT11 + MQ Gas Sensor + OLED (SSD1306 I2C)
+ * + 2-Channel Relay + Firebase RTDB
+ *
+ * Firebase RTDB structure:
+ *   IOT_Based_Air/
+ *     Temp  (float, °C)
+ *     Hum   (float, %RH)
+ *     Gas   (int, 0–1023 raw MQ analog)
+ *     Fan   (string: "ON" / "OFF")
+ *
+ * Logic:
+ *   - Read DHT11 -> Temp, Hum
+ *   - Read MQ gas sensor -> Gas (raw ADC)
+ *   - If Gas > GAS_THRESHOLD:
+ *         Relay1 ON, Fan = "ON"
+ *     else:
+ *         Relay1 OFF, Fan = "OFF"
+ *   - Update OLED and Firebase every few seconds
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#include "DHT.h"
+
+// ================== USER CONFIG ===================
+// ============ WIFI CONFIG ===================
+#define WIFI_SSID     "air"         // change to your WiFi SSID
+#define WIFI_PASSWORD "123456789"   // change to your WiFi password
+
+// ============ FIREBASE CONFIG ================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Base RTDB path
+const char* BASE_PATH = "IOT_Based_Air";
+
+// ================== DHT11 CONFIG ==================
+// Using D7 pin on NodeMCU (D7 = GPIO13)
+#define DHTPIN  D7
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================== OLED CONFIG ===================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// I2C pins for ESP8266 NodeMCU
+#define I2C_SDA D2   // GPIO4
+#define I2C_SCL D1   // GPIO5
+
+// ================== MQ GAS SENSOR =================
+#define MQ_PIN A0           // Analog input on ESP8266
+const int GAS_THRESHOLD = 400;   // Adjust this after testing
+
+// ================== RELAY CONFIG ==================
+// 2-channel relay module
+#define RELAY1_PIN D5       // GPIO14 (controls fan)
+#define RELAY2_PIN D6       // GPIO12 (unused, free for future use)
+
+// Most relay modules are ACTIVE LOW (IN = LOW -> ON)
+const bool RELAY_ACTIVE_LOW  = true;
+const int  RELAY_ON_LEVEL    = RELAY_ACTIVE_LOW ? LOW  : HIGH;
+const int  RELAY_OFF_LEVEL   = RELAY_ACTIVE_LOW ? HIGH : LOW;
+
+// ================== FIREBASE OBJECTS ==============
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================== TIMING ========================
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_INTERVAL_MS = 3000;  // 3 seconds
+
+// ================== FUNCTIONS =====================
+
+void setRelay1(bool on) {
+  digitalWrite(RELAY1_PIN, on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+}
+
+void showDataOnOLED(float temp, float hum, int gasValue, const String &fanStatus) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Line 1
+  display.setCursor(0, 0);
+  display.print("Temp: ");
+  display.print(temp, 1);
+  display.println(" C");
+
+  // Line 2
+  display.setCursor(0, 12);
+  display.print("Hum : ");
+  display.print(hum, 1);
+  display.println(" %");
+
+  // Line 3 - Fan status
+  display.setCursor(0, 24);
+  display.print("Fan : ");
+  display.print(fanStatus);
+
+  // Line 4 - Gas value under Fan
+  display.setCursor(0, 36);
+  display.print("Gas : ");
+  display.print(gasValue);
+
+  // WiFi status bottom
+  display.setCursor(0, 52);
+  display.print("WiFi: ");
+  display.print(WiFi.status() == WL_CONNECTED ? "OK" : "DIS");
+
+  display.display();
+}
+
+void showWiFiScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("WiFi Config:");
+  display.print("SSID: ");
+  display.println(WIFI_SSID);
+  display.print("PASS: ");
+  display.println(WIFI_PASSWORD);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // ------------ GPIO -------------
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  setRelay1(false);  // Fan OFF initially
+  digitalWrite(RELAY2_PIN, RELAY_OFF_LEVEL); // keep relay2 OFF
+
+  // ------------ I2C + OLED -------------
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  // Show WiFi credentials for first 3 seconds
+  showWiFiScreen();
+  delay(3000);
+
+  // ------------ DHT --------------
+  dht.begin();
+
+  // ------------ WiFi -------------
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi...");
+  display.display();
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    // optional timeout to avoid infinite loop
+    if (millis() - wifiStart > 20000) { // 20s timeout
+      Serial.println("\nWiFi connect timeout");
+      break;
+    }
+  }
+  Serial.println();
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi Connected!");
+  display.print("IP: ");
+  display.println(WiFi.localIP());
+  display.display();
+  delay(1200);
+
+  // ------------ Firebase ---------
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Serial.println("Signing in to Firebase...");
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("Firebase ready.");
+}
+
+void loop() {
+  // Allow sketch to keep running even if Firebase not ready.
+
+  if (millis() - lastUpdate >= UPDATE_INTERVAL_MS) {
+    lastUpdate = millis();
+
+    // ======= Read DHT11 =======
+    float hum  = dht.readHumidity();
+    float temp = dht.readTemperature(); // °C
+
+    if (isnan(hum) || isnan(temp)) {
+      Serial.println("Failed to read from DHT sensor! Skipping this cycle.");
+      // skip posting to Firebase and updating OLED for this cycle
+    } else {
+      // ======= Read MQ Gas Sensor =======
+      int gasRaw = analogRead(MQ_PIN);   // 0–1023
+
+      // ======= Fan / Relay Logic =======
+      bool fanOn = (gasRaw > GAS_THRESHOLD);
+      String fanStatus = fanOn ? "ON" : "OFF";
+
+      setRelay1(fanOn);
+
+      // ======= Debug Serial =======
+      Serial.print("Temp: "); Serial.print(temp);
+      Serial.print("  Hum: "); Serial.print(hum);
+      Serial.print("  Gas: "); Serial.print(gasRaw);
+      Serial.print("  Fan: "); Serial.println(fanStatus);
+
+      // ======= Update Firebase RTDB =======
+      String base = String(BASE_PATH) + "/";
+
+      if (!Firebase.RTDB.setFloat(&fbdo, base + "Temp", temp)) {
+        Serial.print("Failed write Temp: ");
+        Serial.println(fbdo.errorReason());
+      }
+
+      if (!Firebase.RTDB.setFloat(&fbdo, base + "Hum", hum)) {
+        Serial.print("Failed write Hum: ");
+        Serial.println(fbdo.errorReason());
+      }
+
+      if (!Firebase.RTDB.setInt(&fbdo, base + "Gas", gasRaw)) {
+        Serial.print("Failed write Gas: ");
+        Serial.println(fbdo.errorReason());
+      }
+
+      if (!Firebase.RTDB.setString(&fbdo, base + "Fan", fanStatus)) {
+        Serial.print("Failed write Fan: ");
+        Serial.println(fbdo.errorReason());
+      }
+
+      // ======= Update OLED =======
+      showDataOnOLED(temp, hum, gasRaw, fanStatus);
+    } // end DHT valid check
+  } // end timing if
+}
