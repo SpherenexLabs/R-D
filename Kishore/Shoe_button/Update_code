@@ -1,0 +1,240 @@
+// firebase_button_max30102_random.ino
+// ESP8266 (NodeMCU) + optional MAX30102 init + Firebase
+// - Button (D5) -> /firebase/Alert (debounced)
+// - Green LED (D6) ON when Alert == 1
+// - Random BPM (60-110) and SpO2 (92-100) written every 30s to /firebase/BPM and /firebase/SpO2
+// - MAX30105 (MAX30102) kept initialized for future use
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include "MAX30105.h"            // SparkFun MAX3010x library
+#include <Firebase_ESP_Client.h>
+
+// ===== USER CONFIG (WiFi + Firebase) =====
+#define WIFI_SSID     "smart"
+#define WIFI_PASSWORD "123456789"
+
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===== HARDWARE PINS =====
+const int BUTTON_PIN = D5;      // active LOW (internal pull-up)
+const int GREEN_LED_PIN = D6;   // green LED (anode -> D6 via 220R, cathode -> GND)
+
+// ===== STATE / TIMING =====
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50UL;
+bool lastStablePressed = false;
+
+// Random upload interval (30 seconds)
+const unsigned long UPLOAD_INTERVAL_MS = 30000UL;
+unsigned long lastUpload = 0;
+
+// MAX301 sensor (optional use)
+MAX30105 particleSensor;
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== HELPERS =====
+void debugPrintFirebaseError(const char* tag){
+  Serial.print(tag);
+  Serial.print(F(" failed: "));
+  Serial.println(fbdo.errorReason());
+}
+
+bool safeSetInt(const char* path, int value, const char* tag){
+  if (!Firebase.ready()) {
+    Serial.print(F("Firebase not ready for: "));
+    Serial.println(path);
+    return false;
+  }
+  if (Firebase.RTDB.setInt(&fbdo, path, value)) return true;
+  Serial.print(tag); Serial.print(F(" write failed: ")); Serial.println(fbdo.errorReason());
+  return false;
+}
+
+// Try to init MAX30105, return true if successful (non-fatal if fails)
+bool initMAX30105() {
+  Wire.begin(D2, D1);     // SDA, SCL for NodeMCU
+  Wire.setClock(400000);
+  delay(10);
+  Serial.println(F("Attempting MAX30105 init..."));
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println(F("MAX30105 init OK (FAST)."));
+    particleSensor.softReset();
+    delay(50);
+    particleSensor.setup();                  // default settings
+    particleSensor.setFIFOAverage(4);        // modest averaging
+    particleSensor.setPulseAmplitudeIR(0x40);
+    particleSensor.setPulseAmplitudeRed(0x40);
+    particleSensor.setSampleRate(100);
+    particleSensor.clearFIFO();
+    return true;
+  }
+  // fallback: try begin() without params (older/copy libs)
+  Serial.println(F("MAX30105 begin(Wire, I2C_SPEED_FAST) failed; trying begin() ..."));
+  if (particleSensor.begin()) {
+    Serial.println(F("MAX30105 init OK (begin())."));
+    particleSensor.softReset();
+    delay(50);
+    particleSensor.setup();
+    particleSensor.setFIFOAverage(4);
+    particleSensor.setPulseAmplitudeIR(0x40);
+    particleSensor.setPulseAmplitudeRed(0x40);
+    particleSensor.clearFIFO();
+    return true;
+  }
+  Serial.println(F("Warning: MAX30105 init failed. Proceeding without sensor."));
+  return false;
+}
+
+// Initialize required /firebase nodes to safe defaults
+void initFirebaseNodes() {
+  if (!Firebase.ready()) return;
+  if (!safeSetInt("/firebase/Alert", 0, "Init /firebase/Alert")) {}
+  if (!safeSetInt("/firebase/BPM", 0, "Init /firebase/BPM")) {}
+  if (!safeSetInt("/firebase/SpO2", 0, "Init /firebase/SpO2")) {}
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println();
+  Serial.println(F("ESP8266 Button + MAX30102 (random values) -> Firebase"));
+
+  // pins
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  digitalWrite(GREEN_LED_PIN, LOW);
+
+  // seed random with analog noise (A0)
+  randomSeed(analogRead(A0));
+
+  // WiFi
+  Serial.print(F("Connecting to WiFi: "));
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print('.');
+    delay(500);
+    if (millis() - wifiStart > 30000UL) {
+      Serial.println(F("\nWiFi connect timeout - retrying..."));
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      wifiStart = millis();
+    }
+  }
+  Serial.println();
+  Serial.print(F("WiFi connected, IP: "));
+  Serial.println(WiFi.localIP());
+
+  // Firebase init
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+  Serial.println(F("Firebase initialized"));
+
+  // initialize DB nodes under /firebase
+  initFirebaseNodes();
+
+  // Initialize Alert state variable according to initial button read
+  lastStablePressed = (digitalRead(BUTTON_PIN) == LOW);
+  // set LED on startup according to current button state
+  digitalWrite(GREEN_LED_PIN, lastStablePressed ? HIGH : LOW);
+
+  // Initialize MAX30105 (optional) -- non-fatal if fails
+  initMAX30105();
+
+  // Kick off upload timer immediately so first random values are written after 30s
+  lastUpload = millis();
+}
+
+// ===== LOOP =====
+void loop() {
+  // 1) Button debounce + Alert write
+  static int lastReading = HIGH;
+  int reading = digitalRead(BUTTON_PIN);
+  bool pressedNow = (reading == LOW);
+
+  if (reading != lastReading) {
+    lastDebounceTime = millis();
+  }
+  lastReading = reading;
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (pressedNow != lastStablePressed) {
+      lastStablePressed = pressedNow;
+      int alertValue = lastStablePressed ? 1 : 0;
+
+      Serial.print(F("Button changed -> Alert: "));
+      Serial.println(alertValue);
+
+      // update green LED immediately
+      digitalWrite(GREEN_LED_PIN, alertValue ? HIGH : LOW);
+
+      // write to Firebase (under /firebase/Alert)
+      if (Firebase.ready()) {
+        if (Firebase.RTDB.setInt(&fbdo, "/firebase/Alert", alertValue)) {
+          Serial.println(F("Updated /firebase/Alert OK"));
+        } else {
+          Serial.print(F("Failed write /firebase/Alert: "));
+          Serial.println(fbdo.errorReason());
+        }
+      } else {
+        Serial.println(F("Firebase not ready; skipping Alert write"));
+      }
+    }
+  }
+
+  // 2) Periodic upload of random BPM/SpO2 every 30 seconds
+  if (millis() - lastUpload >= UPLOAD_INTERVAL_MS) {
+    lastUpload = millis();
+
+    // random values
+    int bpm = random(60, 111);   // 60..110
+    int spo2 = random(92, 101);  // 92..100
+
+    Serial.printf("Uploading random values -> BPM: %d  SpO2: %d\n", bpm, spo2);
+
+    if (Firebase.ready()) {
+      if (!Firebase.RTDB.setInt(&fbdo, "/firebase/BPM", bpm)) {
+        Serial.print(F("Write /firebase/BPM failed: "));
+        Serial.println(fbdo.errorReason());
+      } else {
+        Serial.println(F("Wrote /firebase/BPM"));
+      }
+
+      if (!Firebase.RTDB.setInt(&fbdo, "/firebase/SpO2", spo2)) {
+        Serial.print(F("Write /firebase/SpO2 failed: "));
+        Serial.println(fbdo.errorReason());
+      } else {
+        Serial.println(F("Wrote /firebase/SpO2"));
+      }
+
+      // Also ensure /firebase/Alert contains current state (optional redundancy)
+      int currentAlert = lastStablePressed ? 1 : 0;
+      if (!Firebase.RTDB.setInt(&fbdo, "/firebase/Alert", currentAlert)) {
+        Serial.print(F("Write /firebase/Alert failed: "));
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      Serial.println(F("Firebase not ready; skipping random upload"));
+    }
+  }
+
+  // Small delay to keep loop responsive
+  delay(10);
+}
