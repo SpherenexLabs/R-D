@@ -1,0 +1,220 @@
+/* ESP32 + 2 IR + Servo + OLED + Firebase (Realtime DB)
+   - IR1 -> logs to: Toll_29_11_2025/IR_1
+   - IR2 -> logs to: Toll_29_11_2025/IR_2
+   - OLED displays Payment_Status and Rupees
+   - Firebase field Toll_29_11_2025/Servo = "1" => servo to 90deg
+                                            "0" => servo to 0deg
+
+   Libraries required:
+   - Firebase ESP Client (Firebase_ESP_Client)
+   - Adafruit SSD1306
+   - Adafruit GFX
+   - ESP32Servo
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h" // comes with Firebase_ESP_Client
+#include <ESP32Servo.h>
+
+// ===== USER CONFIG =====
+#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define API_KEY       "YOUR_FIREBASE_API_KEY"
+#define DATABASE_URL  "https://your-project-default-rtdb.firebaseio.com/"  // include trailing slash
+
+// ===== PIN CONFIG =====
+const int IR1_PIN = 34;     // change if needed
+const int IR2_PIN = 35;
+const int SERVO_PIN = 18;   // change if needed
+
+// ===== OLED CONFIG =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ===== Firebase objects =====
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== Other globals =====
+Servo myServo;
+int lastServoPos = -1;
+String fb_path = "Toll_29_11_2025"; // base path in your Firebase DB (change if needed)
+
+// Keep last IR states to avoid spamming firebase
+bool lastIR1State = false;
+bool lastIR2State = false;
+unsigned long lastOledUpdate = 0;
+unsigned long lastFirebasePoll = 0;
+
+// read/poll intervals (ms)
+const unsigned long OLED_UPDATE_MS = 800;
+const unsigned long FIREBASE_POLL_MS = 800;
+
+void wifiConnect() {
+  Serial.print("Connecting to WiFi ");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+    if (millis() - start > 20000) { // 20s timeout
+      Serial.println("\nWiFi connect timeout, restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println();
+  Serial.print("WiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // pins
+  pinMode(IR1_PIN, INPUT_PULLUP); // many IR modules output LOW when triggered
+  pinMode(IR2_PIN, INPUT_PULLUP);
+
+  // servo
+  myServo.setPeriodHertz(50); // standard servo freq
+  myServo.attach(SERVO_PIN, 500, 2400); // min/max pulse widths (us)
+  myServo.write(0); // start at 0 degrees
+  lastServoPos = 0;
+
+  // OLED init (SDA = 21, SCL = 22 on many boards)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    // continue, but OLED won't work
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Toll system booting...");
+    display.display();
+  }
+
+  // WiFi
+  wifiConnect();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.println("Setup complete.");
+}
+
+String makePath(const String &child) {
+  if (fb_path.endsWith("/")) return fb_path + child;
+  return fb_path + "/" + child;
+}
+
+void writeIRToFirebase(const String &child, const char *value) {
+  String path = makePath(child);
+  if (Firebase.RTDB.setString(&fbdo, path.c_str(), value)) {
+    Serial.printf("Wrote %s = %s\n", path.c_str(), value);
+  } else {
+    Serial.printf("Failed write %s : %s\n", path.c_str(), fbdo.errorReason().c_str());
+  }
+}
+
+String readStringFromFirebase(const String &child) {
+  String path = makePath(child);
+  if (Firebase.RTDB.getString(&fbdo, path.c_str())) {
+    // fbdo.to<String>() works with this library; using stringData() is also possible
+    return fbdo.to<String>();
+  } else {
+    Serial.printf("Failed read %s : %s\n", path.c_str(), fbdo.errorReason().c_str());
+    return String("");
+  }
+}
+
+void handleServoFromFirebase() {
+  String s = readStringFromFirebase("Servo"); // expect "0" or "1"
+  if (s.length() == 0) return;
+  s.trim();
+  int target = 0;
+  if (s == "1") target = 90;
+  else target = 0;
+
+  if (target != lastServoPos) {
+    myServo.write(target);
+    lastServoPos = target;
+    Serial.printf("Servo set to %d (fb='%s')\n", target, s.c_str());
+  }
+}
+
+void updateOLED(const String &pstatus, const String &rupees, bool ir1, bool ir2) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Toll Monitor");
+  display.println("----------------");
+  display.print("Payment: ");
+  if (pstatus.length()) display.println(pstatus);
+  else display.println("N/A");
+
+  display.print("Rupees: ");
+  if (rupees.length()) display.println(rupees);
+  else display.println("N/A");
+
+  display.println();
+  display.print("IR1: ");
+  display.println(ir1 ? "TRIG" : "idle");
+  display.print("IR2: ");
+  display.println(ir2 ? "TRIG" : "idle");
+
+  display.print("Servo: ");
+  display.println(lastServoPos);
+
+  display.display();  // Correct usage — returns void
+}
+
+void loop() {
+  // Read IR sensors (active LOW)
+  bool ir1 = (digitalRead(IR1_PIN) == LOW);
+  bool ir2 = (digitalRead(IR2_PIN) == LOW);
+
+  // If states changed, update Firebase (write "1" when triggered, "" when idle)
+  if (ir1 != lastIR1State) {
+    lastIR1State = ir1;
+    if (ir1) writeIRToFirebase("IR_1", "1");
+    else     writeIRToFirebase("IR_1", "");
+  }
+  if (ir2 != lastIR2State) {
+    lastIR2State = ir2;
+    if (ir2) writeIRToFirebase("IR_2", "1");
+    else     writeIRToFirebase("IR_2", "");
+  }
+
+  unsigned long now = millis();
+
+  // Periodically poll firebase for Payment_Status, Rupees and Servo
+  if (now - lastFirebasePoll > FIREBASE_POLL_MS) {
+    lastFirebasePoll = now;
+
+    // Read Payment and Rupees
+    String payment = readStringFromFirebase("Payment_Status");
+    String rupees = readStringFromFirebase("Rupees");
+
+    // Update OLED on its own timer so it's not too fast
+    if (now - lastOledUpdate > OLED_UPDATE_MS) {
+      lastOledUpdate = now;
+      updateOLED(payment, rupees, ir1, ir2);
+    }
+
+    // Handle servo command from Firebase
+    handleServoFromFirebase();
+  }
+
+  delay(50);
+}
