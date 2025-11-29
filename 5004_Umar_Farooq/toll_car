@@ -1,0 +1,120 @@
+// ESP32 2-IR Line Follower (uses your IN1..IN4 motor functions)
+// Pins below: change IR pins to match your wiring
+
+// Motor pins (your values)
+const int IN1 = 18; // Motor A IN1
+const int IN2 = 19; // Motor A IN2
+const int IN3 = 16; // Motor B IN1
+const int IN4 = 17; // Motor B IN2
+
+// IR sensor pins (choose free GPIOs; change if needed)
+const int IR_LEFT_PIN  = 33; // left sensor
+const int IR_RIGHT_PIN = 32; // right sensor
+
+// Set this to the logic level your IR outputs when they detect the line:
+// If your IR output goes LOW when it sees the dark line, set to LOW.
+// If it goes HIGH when it sees the dark line, set to HIGH.
+const int LINE_DETECTED_STATE = LOW;
+
+unsigned long lastPrint = 0;
+const unsigned long PRINT_INTERVAL = 200; // ms
+
+void setup() {
+  Serial.begin(115200);
+
+  // motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  // IR pins
+  pinMode(IR_LEFT_PIN, INPUT);
+  pinMode(IR_RIGHT_PIN, INPUT);
+
+  Serial.println("Line Follower Ready");
+  Serial.println("Adjust LINE_DETECTED_STATE if behavior is reversed.");
+}
+
+void loop() {
+  int leftState  = digitalRead(IR_LEFT_PIN);
+  int rightState = digitalRead(IR_RIGHT_PIN);
+
+  bool leftOnLine  = (leftState  == LINE_DETECTED_STATE);
+  bool rightOnLine = (rightState == LINE_DETECTED_STATE);
+
+  // Behavior:
+  // both on line -> forward
+  // left on line only -> turn left
+  // right on line only -> turn right
+  // neither -> stop (or search)
+
+  if (leftOnLine && rightOnLine) {
+    forward();
+    debugPrint("Forward", leftState, rightState);
+  } else if (leftOnLine && !rightOnLine) {
+    turnLeft();
+    debugPrint("Turn Left", leftState, rightState);
+  } else if (!leftOnLine && rightOnLine) {
+    turnRight();
+    debugPrint("Turn Right", leftState, rightState);
+  } else { // neither sensor sees line
+    stopMotors(); // optional: you can change to slow forward or search behavior
+    debugPrint("Stop / Searching", leftState, rightState);
+  }
+
+  // small delay to avoid rapid toggling
+  delay(20);
+}
+
+// debug printing (rate-limited)
+void debugPrint(const char *action, int leftRead, int rightRead) {
+  unsigned long now = millis();
+  if (now - lastPrint >= PRINT_INTERVAL) {
+    Serial.print(action);
+    Serial.print("  |  L:");
+    Serial.print(leftRead);
+    Serial.print(" R:");
+    Serial.println(rightRead);
+    lastPrint = now;
+  }
+}
+
+// Motor control helpers (left exactly as in your provided sketch)
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  // pivot left (left motor reverse, right motor forward) -- kept as in your sketch
+  digitalWrite(IN1, HIGH);  // left motor reverse
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);   // right motor forward
+  digitalWrite(IN4, HIGH);
+}
+
+void turnRight() {
+  // pivot right (left motor forward, right motor reverse) -- kept as in your sketch
+  digitalWrite(IN1, LOW);  // left motor forward
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); // right motor reverse
+  digitalWrite(IN4, LOW);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
