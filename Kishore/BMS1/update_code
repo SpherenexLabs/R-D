@@ -1,0 +1,257 @@
+/************************************************************
+ * ESP32 + DHT11 + 2x Voltage Sensor + Current Sensor + OLED + 2-Relay + Firebase
+ * Writes to Firebase RTDB node: BMS1/
+ * Updated: fixes for V1/V2 display + ADC attenuation + averaging
+ ************************************************************/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DHT.h"
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================= USER CONFIG ===================
+// WiFi
+#define WIFI_SSID     "bms"
+#define WIFI_PASSWORD "123456789"
+
+// Firebase
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// RTDB Base Path
+#define BMS1_PATH "BMS1"
+
+// ================= DHT11 CONFIG ==================
+#define DHTPIN  4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ================= OLED CONFIG ==================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define I2C_SDA 21
+#define I2C_SCL 22
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ================= RELAY CONFIG ==================
+#define RELAY1_PIN 25
+#define RELAY2_PIN 26
+const bool RELAY_ACTIVE_LOW  = true;
+const int RELAY_ON_LEVEL     = RELAY_ACTIVE_LOW ? LOW  : HIGH;
+const int RELAY_OFF_LEVEL    = RELAY_ACTIVE_LOW ? HIGH : LOW;
+
+// ================= ANALOG SENSOR CONFIG ==========
+// ADC pins (use ADC1 pins - they are safer while WiFi runs)
+#define VOLTAGE1_PIN 34   // Volt1 (ADC1_CH6)
+#define VOLTAGE2_PIN 32   // Volt2 (ADC1_CH4)
+#define CURRENT_PIN  35   // Current sensor (ADC1_CH7)
+
+// Conversion factors - tune these to your hardware
+// Example: if your voltage divider maps 0-25V to 0-3.3V, use 25.0/4095.0
+const float VOLTAGE1_FACTOR = 25.0 / 4095.0; // adjust if needed
+const float VOLTAGE2_FACTOR = 25.0 / 4095.0; // adjust if needed
+const float CURRENT_FACTOR  = 5.0  / 4095.0; // adjust for your current sensor scaling
+
+// Number of samples to average for analog readings
+const int ANALOG_SAMPLES = 8;
+
+// ================= FIREBASE OBJECTS ==============
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ================= TIMING ========================
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_INTERVAL_MS = 2000;
+
+// ================= FUNCTIONS =====================
+void setRelayState(int state){
+  if(state==1){
+    digitalWrite(RELAY1_PIN, RELAY_ON_LEVEL);
+    digitalWrite(RELAY2_PIN, RELAY_OFF_LEVEL);
+  }else if(state==2){
+    digitalWrite(RELAY1_PIN, RELAY_ON_LEVEL);
+    digitalWrite(RELAY2_PIN, RELAY_ON_LEVEL);
+  }else{
+    digitalWrite(RELAY1_PIN, RELAY_OFF_LEVEL);
+    digitalWrite(RELAY2_PIN, RELAY_OFF_LEVEL);
+  }
+}
+
+void showWiFiScreen(){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("WiFi Config:");
+  display.print("SSID: "); display.println(WIFI_SSID);
+  display.print("PASS: "); display.println(WIFI_PASSWORD);
+  display.display();
+}
+
+void showDataOnOLED(float temp, float hum, float v1, float v2, float current, int relayState){
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false); // avoid unexpected wrapping
+
+  display.setCursor(0,0);
+  display.print("Temp: "); display.print(temp,1); display.println(" C");
+
+  display.setCursor(0,12);
+  display.print("Hum : "); display.print(hum,1); display.println(" %");
+
+  // First row of voltages (left and right columns)
+  display.setCursor(0,24);
+  display.print("V1: "); display.print(v1,2); display.println(" V");
+
+  display.setCursor(64,24);
+  display.print("V2: "); display.print(v2,2); display.println(" V");
+
+  display.setCursor(0,36);
+  display.print("Curr: "); display.print(current,2); display.println(" A");
+
+  display.setCursor(0,48);
+  display.print("Relay: "); display.print(relayState);
+
+  display.display();
+}
+
+// readAnalogAvg: takes N samples and returns average raw reading (0..4095)
+int readAnalogAvg(uint8_t pin, int samples=ANALOG_SAMPLES){
+  long sum = 0;
+  for(int i=0;i<samples;i++){
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (int)(sum / samples);
+}
+
+// ================= SETUP =========================
+void setup(){
+  Serial.begin(115200);
+  delay(1000);
+
+  // GPIO
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  setRelayState(0);
+
+  // OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)){
+    Serial.println("SSD1306 failed");
+    while(1);
+  }
+  display.clearDisplay(); display.display();
+  showWiFiScreen(); delay(1500);
+
+  // DHT
+  dht.begin();
+
+  // ADC resolution and attenuation (very important for correct readings)
+  analogReadResolution(12); // 0..4095
+
+  // Set attenuation so ADC can read up to approx 0-3.3V (use ADC_11db for full range)
+  // Note: analogSetPinAttenuation is esp32-specific
+  analogSetPinAttenuation(VOLTAGE1_PIN, ADC_11db);
+  analogSetPinAttenuation(VOLTAGE2_PIN, ADC_11db);
+  analogSetPinAttenuation(CURRENT_PIN,  ADC_11db);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  unsigned long wifiStart = millis();
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(500); Serial.print(".");
+    if(millis() - wifiStart > 20000UL){ // 20s timeout (optional)
+      Serial.println("\nWiFi connect timeout - retrying");
+      WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+      wifiStart = millis();
+    }
+  }
+  Serial.println("\nWiFi Connected: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config,&auth);
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(1024);
+
+  Serial.println("Firebase ready.");
+}
+
+// ================= LOOP =========================
+void loop(){
+  if(!Firebase.ready()) { delay(100); return; }
+
+  if(millis()-lastUpdate>=UPDATE_INTERVAL_MS){
+    lastUpdate = millis();
+
+    // Read sensors
+    float hum = dht.readHumidity();
+    float temp = dht.readTemperature();
+
+    if(isnan(hum)||isnan(temp)){ Serial.println("DHT failed"); /* still continue to try analogs */ }
+
+    // Read analog sensors (raw average)
+    int rawV1 = readAnalogAvg(VOLTAGE1_PIN);
+    int rawV2 = readAnalogAvg(VOLTAGE2_PIN);
+    int rawC  = readAnalogAvg(CURRENT_PIN);
+
+    // Convert to physical units using factors - tune to your sensors
+    float voltage1 = rawV1 * VOLTAGE1_FACTOR;
+    float voltage2 = rawV2 * VOLTAGE2_FACTOR;
+    float current  = rawC  * CURRENT_FACTOR;
+
+    // Optional: if your voltage divider introduces an offset or you need mapping,
+    // you can refine here (e.g., calibrate using a known reference).
+
+    // Relay logic (unchanged)
+    int relayState = 0;
+    if(!isnan(temp)){
+      if(temp>30) relayState=2;
+      else if(temp>25) relayState=1;
+      else relayState=0;
+    }else{
+      relayState = 0; // safe default if temp invalid
+    }
+    setRelayState(relayState);
+
+    // Debug
+    Serial.printf("RawV1:%d RawV2:%d RawC:%d  Temp: %.1f  Hum: %.1f  V1: %.2f  V2: %.2f  Curr: %.2f  Relay: %d\n",
+                  rawV1, rawV2, rawC, temp, hum, voltage1, voltage2, current, relayState);
+
+    // Firebase: Write all fields at once using JSON
+    FirebaseJson json;
+    if(!isnan(temp)) json.set("Temp", temp);
+    if(!isnan(hum))  json.set("Hum", hum);
+    json.set("Volt1", voltage1);
+    json.set("Volt2", voltage2);
+    json.set("Current", current);
+    json.set("Relay", relayState);
+
+    if(Firebase.RTDB.setJSON(&fbdo, BMS1_PATH, &json)){
+      Serial.println("Firebase updated");
+    }else{
+      Serial.print("Firebase update failed: ");
+      Serial.println(fbdo.errorReason());
+    }
+
+    // OLED - show volts even if DHT failed
+    showDataOnOLED(temp, hum, voltage1, voltage2, current, relayState);
+  }
+}
