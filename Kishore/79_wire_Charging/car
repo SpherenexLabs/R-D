@@ -1,0 +1,262 @@
+/************************************************************
+ * ESP8266 + Voltage Sensor + OLED + Firebase RTDB
+ *
+ * Firebase RTDB paths:
+ *   /79_Wire_Charging_04_12_2025/Car/Voltage  -> float (V)
+ *   /79_Wire_Charging_04_12_2025/Car/Current  -> float (A)
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Firebase helper headers (included with Firebase_ESP_Client)
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================== USER CONFIGURATION ==================
+
+#define WIFI_SSID       "wire"
+#define WIFI_PASSWORD   "123456789"
+#define API_KEY         "AIzaSyBzXzocbdytn4N8vLrT-V2JYZ8pgqWrbC0"
+#define DATABASE_URL    "https://self-balancing-7a9fe-default-rtdb.firebaseio.com/"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ================== OLED CONFIGURATION ==================
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1          // -1 if sharing reset pin with ESP8266
+#define SCREEN_ADDRESS  0x3C        // I2C address for 128x64 OLED
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================== ANALOG / SENSOR CONFIG ==============
+const int VOLTAGE_SENSOR_PIN = A0;
+
+// For NodeMCU the ADC is scaled (0–1 V on the pin). If you use a
+// voltage sensor module that already scales the input, keep this 1.0.
+const float ADC_REF_VOLTAGE       = 1.0;   // ADC reference at A0 (NodeMCU)
+const int   ADC_RESOLUTION        = 1023;  // 10-bit ADC
+
+// Your external voltage sensor scaling factor (example ~25 V max)
+const float VOLTAGE_DIVIDER_RATIO = 25.0;  // adjust by calibration
+
+// Approximate current = V / R (fixed load resistor)
+const float LOAD_RESISTANCE_OHMS = 10.0;   // change based on your load
+
+// ================== FIREBASE OBJECTS ====================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastLogTime = 0;
+const unsigned long LOG_INTERVAL_MS = 2000; // log every 2 seconds
+
+// ================== FUNCTION DECLARATIONS ===============
+void initWiFi();
+void initOLED();
+void initFirebase();
+void readVoltageCurrent(float &voltage, float &current);
+void updateOLED(float voltage, float current);
+void logToFirebase(float voltage, float current);
+
+// ================== SETUP ===============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Explicit I2C pins for NodeMCU (SDA = D2, SCL = D1)
+  Wire.begin(D2, D1);
+
+  initOLED();
+  initWiFi();
+  initFirebase();
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Car Charging");
+  display.println("Starting...");
+  display.display();
+  delay(1000);
+}
+
+// ================== LOOP ================================
+void loop() {
+  float voltage = 0.0;
+  float current = 0.0;
+
+  readVoltageCurrent(voltage, current);
+  updateOLED(voltage, current);
+
+  if (Firebase.ready() && (millis() - lastLogTime >= LOG_INTERVAL_MS)) {
+    lastLogTime = millis();
+    logToFirebase(voltage, current);
+  }
+
+  delay(200);
+}
+
+// ================== FUNCTION DEFINITIONS =================
+
+void initWiFi() {
+  Serial.println();
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi...");
+  display.display();
+
+  int maxTries = 60;  // ~30 seconds
+  while (WiFi.status() != WL_CONNECTED && maxTries-- > 0) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+
+    display.println("WiFi Connected");
+    display.println(WiFi.localIP().toString());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed.");
+
+    display.println("WiFi Failed");
+  }
+
+  display.display();
+  delay(1000);
+}
+
+void initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+    for (;;); // halt
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Car Charging");
+  display.println("Initializing...");
+  display.display();
+}
+
+void initFirebase() {
+  Serial.println("Initializing Firebase...");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // Set user credentials (sign-in)
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // Optional: see token status in Serial Monitor
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Firebase Ready");
+  display.display();
+
+  delay(1000);
+}
+
+void readVoltageCurrent(float &voltage, float &current) {
+  int adcValue = analogRead(VOLTAGE_SENSOR_PIN);
+
+  // Voltage at ADC pin (0–1.0 V typically on NodeMCU)
+  float vOut = (adcValue * ADC_REF_VOLTAGE) / ADC_RESOLUTION;
+
+  // Actual input voltage using external sensor ratio
+  voltage = vOut * VOLTAGE_DIVIDER_RATIO;
+
+  // Approximate current with fixed load
+  current = 0.0;
+  if (LOAD_RESISTANCE_OHMS > 0.0f) {
+    current = voltage / LOAD_RESISTANCE_OHMS;
+  }
+
+  Serial.print("ADC: ");
+  Serial.print(adcValue);
+  Serial.print("  Voltage: ");
+  Serial.print(voltage, 2);
+  Serial.print(" V  Current: ");
+  Serial.print(current, 3);
+  Serial.println(" A");
+}
+
+void updateOLED(float voltage, float current) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("Car Charging");
+
+  display.setCursor(0, 16);
+  display.print("Voltage: ");
+  display.print(voltage, 2);
+  display.println(" V");
+
+  display.setCursor(0, 32);
+  display.print("Current: ");
+  display.print(current, 3);
+  display.println(" A");
+
+  display.display();
+}
+
+void logToFirebase(float voltage, float current) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skip Firebase log");
+    return;
+  }
+
+  // Write to /79_Wire_Charging_04_12_2025/Car/Voltage
+  bool ok1 = Firebase.RTDB.setFloat(
+      &fbdo,
+      "/79_Wire_Charging_04_12_2025/Car/Voltage",
+      voltage
+  );
+  if (!ok1) {
+    Serial.print("Error writing Voltage: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  // Write to /79_Wire_Charging_04_12_2025/Car/Current
+  bool ok2 = Firebase.RTDB.setFloat(
+      &fbdo,
+      "/79_Wire_Charging_04_12_2025/Car/Current",
+      current
+  );
+  if (!ok2) {
+    Serial.print("Error writing Current: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  if (ok1 && ok2) {
+    Serial.println("Firebase log success");
+  }
+}
