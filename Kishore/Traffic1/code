@@ -1,0 +1,590 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================== OLED CONFIG ======================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1   // Reset pin (not used)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================== TRAFFIC LIGHT PINS ===============
+const int NUM_LANES = 4;
+
+// Lane order: 0=N, 1=E, 2=S, 3=W
+int redPins[NUM_LANES]    = { 2, 16, 19, 26 };
+int yellowPins[NUM_LANES] = { 4, 17, 23, 27 };
+int greenPins[NUM_LANES]  = { 5, 18, 25, 32 };
+
+// ================== ULTRASONIC PINS ==================
+// TRIG pins (outputs)
+int trigPins[NUM_LANES] = { 12, 13, 14, 15 };
+// ECHO pins (inputs, use 34/35/36/39 on ESP32)
+int echoPins[NUM_LANES] = { 34, 35, 36, 39 };
+
+// Store latest distance readings (cm)
+float distances[NUM_LANES] = {0, 0, 0, 0};
+
+// ================== TIMING CONFIG ====================
+// Base green time (ms) – will be adjusted based on density
+unsigned long GREEN_BASE_MS   = 20000; // 20 seconds
+unsigned long GREEN_EXTRA_MS  = 10000; // up to +10s if very dense
+unsigned long YELLOW_TIME_MS  = 5000;  // 5 seconds
+
+// If lane has a vehicle closer than this, we consider "present"
+const float VEHICLE_PRESENT_CM = 100.0; // 1 meter
+
+// If lane has a vehicle closer than this, treat as "high density"
+const float HIGH_DENSITY_CM = 30.0;
+
+// ================== STATE MACHINE ====================
+enum Phase {
+  PHASE_GREEN,
+  PHASE_YELLOW
+};
+
+Phase currentPhase = PHASE_GREEN;
+int currentLane = 0;  // 0..3
+unsigned long phaseStartTime = 0;
+unsigned long currentGreenDuration = 0; // dynamic, per lane
+
+// ================= WIFI CONFIG ======================
+#define WIFI_SSID     "traffic"
+#define WIFI_PASSWORD "123456789"
+
+// ================= FIREBASE CONFIG ==================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Firebase update rate
+unsigned long lastFirebaseUpdate = 0;
+const unsigned long FIREBASE_UPDATE_INTERVAL_MS = 2000; // 2 seconds
+
+// Firebase paths
+const char* TRAFFIC_BASE_PATH = "/Traffic2";
+const char* AMBULANCE_PATH    = "/Traffic2/Ambulance";
+
+// ============== AMBULANCE PRIORITY CONFIG ============
+bool ambulanceActive = false;        // true when 30s window running
+unsigned long ambulanceStartTime = 0;
+const unsigned long AMBULANCE_GREEN_MS = 30000; // 30 seconds
+
+unsigned long lastAmbulanceCheck = 0;
+const unsigned long AMBULANCE_CHECK_INTERVAL_MS = 2000; // check every 2 s
+
+int lastAmbulanceValue = 0;          // for edge detection 0 -> 1
+
+// ================== HELPER: WIFI =====================
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+    if (millis() - startAttemptTime > 20000) { // 20s timeout
+      Serial.println("\nWiFi connect timeout, restarting...");
+      ESP.restart();
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =====================================================
+// Helper: read distance for one ultrasonic sensor
+// =====================================================
+float readDistanceCM(int index) {
+  digitalWrite(trigPins[index], LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPins[index], HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPins[index], LOW);
+
+  // timeout 30 ms (~5 m)
+  long duration = pulseIn(echoPins[index], HIGH, 30000UL);
+
+  if (duration == 0) {
+    // no echo
+    return 999.0;
+  }
+
+  float distanceCm = duration / 58.0;  // HC-SR04 formula
+  return distanceCm;
+}
+
+// =====================================================
+// Read all ultrasonic sensors
+// =====================================================
+void updateDistances() {
+  for (int i = 0; i < NUM_LANES; i++) {
+    distances[i] = readDistanceCM(i);
+  }
+}
+
+// =====================================================
+// Does lane have any vehicle (within some distance)?
+// =====================================================
+bool laneHasVehicle(int lane) {
+  float d = distances[lane];
+  return (d > 0 && d < VEHICLE_PRESENT_CM);
+}
+
+// =====================================================
+// Is lane high density? (very near vehicle)
+// =====================================================
+bool laneHighDensity(int lane) {
+  float d = distances[lane];
+  return (d > 0 && d < HIGH_DENSITY_CM);
+}
+
+// =====================================================
+// Find lane with high density (closest among YES)
+// Returns -1 if none.
+// =====================================================
+int findHighDensityLane() {
+  int bestLane = -1;
+  float bestDistance = 9999.0;
+
+  for (int i = 0; i < NUM_LANES; i++) {
+    if (laneHighDensity(i)) {
+      if (distances[i] < bestDistance) {
+        bestDistance = distances[i];
+        bestLane = i;
+      }
+    }
+  }
+  return bestLane;
+}
+
+// =====================================================
+// Choose next lane based on density (closest vehicle)
+// (used when no immediate high-density preemption)
+// =====================================================
+int chooseNextLane() {
+  int bestLane = -1;
+  float bestDistance = 9999.0;
+
+  // Look for lanes with vehicle present, pick smallest distance
+  for (int i = 0; i < NUM_LANES; i++) {
+    if (laneHasVehicle(i)) {
+      if (distances[i] < bestDistance) {
+        bestDistance = distances[i];
+        bestLane = i;
+      }
+    }
+  }
+
+  if (bestLane != -1) {
+    // At least one lane has vehicle; choose the closest one
+    return bestLane;
+  }
+
+  // If no vehicles, just cycle to next lane
+  return (currentLane + 1) % NUM_LANES;
+}
+
+// =====================================================
+// Compute green duration based on density for a lane
+// =====================================================
+unsigned long computeGreenDurationForLane(int lane) {
+  float d = distances[lane];
+
+  // If very dense (vehicle very near), give extra green
+  if (d > 0 && d < HIGH_DENSITY_CM) {
+    return GREEN_BASE_MS + GREEN_EXTRA_MS; // e.g., 30s total
+  }
+
+  // If some vehicles but not super dense, normal green
+  if (laneHasVehicle(lane)) {
+    return GREEN_BASE_MS; // e.g., 20s
+  }
+
+  // No vehicles, minimal green just to keep system rotating
+  return 8000; // 8s
+}
+
+// =====================================================
+// Update state machine (phase changes) with preemption
+// (skipped when ambulanceActive == true)
+// =====================================================
+void updateStateMachine() {
+  if (ambulanceActive) {
+    // During ambulance priority, normal logic paused
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Immediate priority on HIGH density
+  int denseLane = findHighDensityLane();
+  if (denseLane != -1 && denseLane != currentLane) {
+    currentLane = denseLane;
+    currentPhase = PHASE_GREEN;
+    currentGreenDuration = computeGreenDurationForLane(currentLane);
+    phaseStartTime = now;
+    return;
+  }
+
+  unsigned long elapsed = now - phaseStartTime;
+
+  switch (currentPhase) {
+    case PHASE_GREEN:
+      if (elapsed >= currentGreenDuration) {
+        currentPhase = PHASE_YELLOW;
+        phaseStartTime = now;
+      }
+      break;
+
+    case PHASE_YELLOW:
+      if (elapsed >= YELLOW_TIME_MS) {
+        int nextLane = chooseNextLane();
+        currentLane = nextLane;
+
+        currentGreenDuration = computeGreenDurationForLane(currentLane);
+        currentPhase = PHASE_GREEN;
+        phaseStartTime = now;
+      }
+      break;
+  }
+}
+
+// =====================================================
+// Drive LEDs according to current state
+// =====================================================
+void updateTrafficLights() {
+  // If ambulance active, force lane1 GREEN, others RED.
+  if (ambulanceActive) {
+    for (int i = 0; i < NUM_LANES; i++) {
+      if (i == 0) {
+        digitalWrite(greenPins[i], HIGH);
+        digitalWrite(yellowPins[i], LOW);
+        digitalWrite(redPins[i], LOW);
+      } else {
+        digitalWrite(greenPins[i], LOW);
+        digitalWrite(yellowPins[i], LOW);
+        digitalWrite(redPins[i], HIGH);
+      }
+    }
+    return;
+  }
+
+  // Normal behaviour
+  for (int i = 0; i < NUM_LANES; i++) {
+    if (i == currentLane) {
+      // Active lane
+      if (currentPhase == PHASE_GREEN) {
+        digitalWrite(greenPins[i], HIGH);
+        digitalWrite(yellowPins[i], LOW);
+        digitalWrite(redPins[i], LOW);
+      } else { // PHASE_YELLOW
+        digitalWrite(greenPins[i], LOW);
+        digitalWrite(yellowPins[i], HIGH);
+        digitalWrite(redPins[i], LOW);
+      }
+    } else {
+      // Inactive lanes: RED
+      digitalWrite(greenPins[i], LOW);
+      digitalWrite(yellowPins[i], LOW);
+      digitalWrite(redPins[i], HIGH);
+    }
+  }
+}
+
+// =====================================================
+// Update OLED screen
+// =====================================================
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  if (ambulanceActive) {
+    // Ambulance priority screen
+    unsigned long now = millis();
+    unsigned long elapsed = now - ambulanceStartTime;
+    unsigned long remainingMs = (elapsed >= AMBULANCE_GREEN_MS)
+                                  ? 0
+                                  : (AMBULANCE_GREEN_MS - elapsed);
+    unsigned long remainingSec = (remainingMs + 999) / 1000;
+
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("4-Way Traffic Ctrl");
+
+    display.setCursor(0, 16);
+    display.print("Ambulance detected");
+
+    display.setCursor(0, 28);
+    display.print("Lane: 1 (N)");
+
+    display.setCursor(0, 40);
+    display.print("Time left: ");
+    display.print(remainingSec);
+    display.print(" s");
+
+    display.display();
+    return;
+  }
+
+  // Normal screen
+  unsigned long now = millis();
+  unsigned long elapsed = now - phaseStartTime;
+  unsigned long remainingMs = 0;
+
+  if (currentPhase == PHASE_GREEN) {
+    if (elapsed >= currentGreenDuration) remainingMs = 0;
+    else remainingMs = currentGreenDuration - elapsed;
+  } else {
+    if (elapsed >= YELLOW_TIME_MS) remainingMs = 0;
+    else remainingMs = YELLOW_TIME_MS - elapsed;
+  }
+
+  unsigned long remainingSec = (remainingMs + 999) / 1000;
+  bool dense = laneHighDensity(currentLane);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("4-Way Traffic Ctrl");
+
+  display.setCursor(0, 16);
+  display.print("Lane: ");
+  display.print(currentLane + 1);
+
+  display.setCursor(0, 28);
+  display.print("Signal: ");
+  if (currentPhase == PHASE_GREEN) {
+    display.print("GREEN");
+  } else {
+    display.print("YELLOW");
+  }
+
+  display.setCursor(0, 40);
+  display.print("Next in: ");
+  display.print(remainingSec);
+  display.print(" s");
+
+  display.setCursor(0, 52);
+  display.print("Density: ");
+  display.print(dense ? "YES" : "NO");
+
+  display.display();
+}
+
+// =====================================================
+// Check Ambulance command from Firebase
+// /Traffic2/Ambulance = 1 -> activate priority (edge-trigger)
+// =====================================================
+void checkAmbulanceFromFirebase() {
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.getInt(&fbdo, AMBULANCE_PATH)) {
+    int val = fbdo.intData();
+
+    // Rising edge: 0 -> 1 and not already active
+    if (val == 1 && lastAmbulanceValue == 0 && !ambulanceActive) {
+      ambulanceActive = true;
+      ambulanceStartTime = millis();
+
+      // Force lane 1 (index 0) GREEN for 30s
+      currentLane = 0;
+      currentPhase = PHASE_GREEN;
+      currentGreenDuration = AMBULANCE_GREEN_MS;
+      phaseStartTime = ambulanceStartTime;
+
+      Serial.println("Ambulance priority ACTIVATED (Lane 1 for 30s)");
+    }
+
+    // Remember last value to detect edges
+    lastAmbulanceValue = val;
+  } else {
+    // Optional for debugging:
+    // Serial.print("Error reading Ambulance: ");
+    // Serial.println(fbdo.errorReason());
+  }
+}
+
+// =====================================================
+// Send current state + distances to Firebase
+// Node: /Traffic2 (we DO NOT touch Ambulance here)
+// =====================================================
+void sendToFirebase() {
+  if (!Firebase.ready()) return;
+
+  unsigned long now = millis();
+  unsigned long remainingMs = 0;
+
+  if (ambulanceActive) {
+    unsigned long ambElapsed = now - ambulanceStartTime;
+    remainingMs = (ambElapsed >= AMBULANCE_GREEN_MS)
+                    ? 0
+                    : (AMBULANCE_GREEN_MS - ambElapsed);
+  } else {
+    unsigned long elapsed = now - phaseStartTime;
+    if (currentPhase == PHASE_GREEN) {
+      if (elapsed >= currentGreenDuration) remainingMs = 0;
+      else remainingMs = currentGreenDuration - elapsed;
+    } else {
+      if (elapsed >= YELLOW_TIME_MS) remainingMs = 0;
+      else remainingMs = YELLOW_TIME_MS - elapsed;
+    }
+  }
+
+  unsigned long remainingSec = (remainingMs + 999) / 1000;
+  bool dense = laneHighDensity(currentLane);
+
+  String phaseStr   = (currentPhase == PHASE_GREEN) ? "GREEN" : "YELLOW";
+  String densityStr = dense ? "YES" : "NO";
+
+  FirebaseJson json;
+  // We DO NOT include "Ambulance" here, so it is controlled from Firebase side only.
+  json.set("ambulanceActive", ambulanceActive ? 1 : 0);
+  json.set("currentLane", currentLane + 1);       // 1..4
+  json.set("density", densityStr);
+  json.set("phase", phaseStr);
+  json.set("remainingSeconds", (int)remainingSec);
+
+  // Distances
+  json.set("distances/lane1", distances[0]);
+  json.set("distances/lane2", distances[1]);
+  json.set("distances/lane3", distances[2]);
+  json.set("distances/lane4", distances[3]);
+
+  // updateNode => keeps existing children like Ambulance
+  if (!Firebase.RTDB.updateNode(&fbdo, TRAFFIC_BASE_PATH, &json)) {
+    // Optional debug:
+    // Serial.print("Firebase updateNode failed: ");
+    // Serial.println(fbdo.errorReason());
+  } else {
+    Serial.println("Firebase updated: /Traffic2");
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Traffic light pins
+  for (int i = 0; i < NUM_LANES; i++) {
+    pinMode(redPins[i], OUTPUT);
+    pinMode(yellowPins[i], OUTPUT);
+    pinMode(greenPins[i], OUTPUT);
+
+    digitalWrite(redPins[i], LOW);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
+  }
+
+  // Ultrasonic pins
+  for (int i = 0; i < NUM_LANES; i++) {
+    pinMode(trigPins[i], OUTPUT);
+    pinMode(echoPins[i], INPUT);
+  }
+
+  // I2C + OLED
+  Wire.begin(21, 22); // SDA, SCL
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed!");
+    while (true) {
+      delay(100);
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Traffic Ctrl Init...");
+  display.display();
+
+  // WiFi
+  connectWiFi();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Optional: buffer sizes to reduce timeout issues
+  fbdo.setBSSLBufferSize(1024, 1024);
+  fbdo.setResponseSize(512);
+
+  Serial.println("Firebase initialized");
+
+  delay(2000);
+
+  // Initial distance read
+  updateDistances();
+
+  // Initialize state
+  currentLane = 0;
+  currentPhase = PHASE_GREEN;
+  currentGreenDuration = computeGreenDurationForLane(currentLane);
+  phaseStartTime = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  unsigned long now = millis();
+
+  // 1) Check ambulance command periodically (every 2s)
+  if (now - lastAmbulanceCheck >= AMBULANCE_CHECK_INTERVAL_MS) {
+    lastAmbulanceCheck = now;
+    checkAmbulanceFromFirebase();
+  }
+
+  // 2) If ambulance active, stop logic after 30s (but DO NOT touch Firebase Ambulance)
+  if (ambulanceActive) {
+    if (now - ambulanceStartTime >= AMBULANCE_GREEN_MS) {
+      ambulanceActive = false;
+      Serial.println("Ambulance priority ENDED, back to normal");
+
+      // Just fall back to normal logic; no write to /Traffic2/Ambulance
+      phaseStartTime = millis();
+      currentGreenDuration = computeGreenDurationForLane(currentLane);
+    }
+  }
+
+  // 3) Sensor update
+  updateDistances();
+
+  // 4) State machine (skips if ambulanceActive)
+  updateStateMachine();
+
+  // 5) LEDs
+  updateTrafficLights();
+
+  // 6) OLED
+  updateOLED();
+
+  // 7) Firebase logging
+  if (now - lastFirebaseUpdate >= FIREBASE_UPDATE_INTERVAL_MS) {
+    lastFirebaseUpdate = now;
+    sendToFirebase();
+  }
+
+  delay(100); // loop ~10 Hz
+}
