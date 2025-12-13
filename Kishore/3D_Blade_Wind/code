@@ -1,0 +1,124 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- OLED ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------------- VOLTAGE SETTINGS ----------------
+// NodeMCU A0 is usually scaled to 0–3.3V.
+// If your A0 is 0–1.0V, change to 1.0
+const float ADC_FULL_SCALE_VOLTS = 3.3;
+
+// Common 0–25V sensor module: Vout = Vin/5 => Vin = Vout * 5
+const float SENSOR_RATIO = 5.0;
+
+// Fine calibration
+const float CALIBRATION_GAIN = 1.00;
+
+// Smoothing filter
+const float EMA_ALPHA = 0.20;
+float vFiltered = 0.0;
+
+// ---------------- WIND STATUS ----------------
+const float WIND_LOW_MAX = 1.0;
+const float WIND_MED_MAX = 3.0;
+
+String windStatus(float v) {
+  if (v < WIND_LOW_MAX) return "Low";
+  if (v < WIND_MED_MAX) return "Medium";
+  return "High";
+}
+
+// ---------------- BATTERY STATUS (ESTIMATED) ----------------
+const float CHARGING_START_V = 1.2;
+const float FULL_CONFIRM_V   = 4.1;
+const unsigned long FULL_CONFIRM_MS = 8000;
+
+unsigned long fullStartMs = 0;
+bool isFull = false;
+
+String batteryStatusEstimated(float v) {
+  if (v < CHARGING_START_V) {
+    fullStartMs = 0;
+    isFull = false;
+    return "Idle";
+  }
+
+  if (v >= FULL_CONFIRM_V) {
+    if (fullStartMs == 0) fullStartMs = millis();
+    if (millis() - fullStartMs >= FULL_CONFIRM_MS) isFull = true;
+  } else {
+    fullStartMs = 0;
+    isFull = false;
+  }
+
+  return isFull ? "Full" : "Charging";
+}
+
+// ---------------- READ VOLTAGE ----------------
+float readGeneratedVoltage() {
+  int raw = analogRead(A0); // 0..1023
+  float vA0 = (raw / 1023.0) * ADC_FULL_SCALE_VOLTS;
+  float vIn = (vA0 * SENSOR_RATIO) * CALIBRATION_GAIN;
+
+  vFiltered = (EMA_ALPHA * vIn) + ((1.0 - EMA_ALPHA) * vFiltered);
+  return vFiltered;
+}
+
+// ---------------- OLED UI ----------------
+void drawOLED(float vGen, const String &batStatus, const String &wStatus) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Generated Voltage:");
+
+  display.setTextSize(2);
+  display.setCursor(0, 14);
+  display.print(vGen, 2);
+  display.print(" V");
+
+  display.setTextSize(1);
+  display.setCursor(0, 40);
+  display.print("Battery Status: ");
+  display.print(batStatus);
+
+  display.setCursor(0, 54);
+  display.print("Wind Status: ");
+  display.print(wStatus);
+
+  display.display();
+}
+
+void setup() {
+  Wire.begin(D2, D1); // SDA, SCL
+
+  // OLED address usually 0x3C (if not display, try 0x3D)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true) { delay(1000); }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Wind Turbine Monitor");
+  display.println("Starting...");
+  display.display();
+  delay(800);
+}
+
+void loop() {
+  float voltage = readGeneratedVoltage();
+  String bStat = batteryStatusEstimated(voltage);
+  String wStat = windStatus(voltage);
+
+  drawOLED(voltage, bStat, wStat);
+
+  delay(200);
+}
