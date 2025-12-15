@@ -1,0 +1,328 @@
+// ================= L293D(ROBOT) + Ultrasonic + Serial + Obstacle Avoid + Soil Cycle =================
+// Serial: F,B,L,R,S
+// Obstacle (<=20cm while forward): BACK 5s -> RIGHT 5s -> FORWARD
+// Every 30 sec: Stop robot -> DC motor forward -> soil check -> pump logic -> DC motor backward
+
+// ---------------- Ultrasonic ----------------
+#define TRIG_PIN 9
+#define ECHO_PIN 13
+
+// ---------------- Robot L293D #1 (wheel motors) ----------------
+#define ENA 5
+#define IN1 2
+#define IN2 3
+
+#define ENB 6
+#define IN3 4
+#define IN4 7
+
+// ---------------- Second L293D #2 (single DC motor) ----------------
+#define DC_EN   10
+#define DC_IN1  11
+#define DC_IN2  12
+
+// ---------------- Soil + Relay ----------------
+#define SOIL_PIN A0
+#define RELAY_PIN 8
+
+const bool RELAY_ACTIVE_LOW = true;
+const bool DRY_HIGH = true;
+const int  SOIL_DRY_THRESHOLD = 550;
+
+// ---------------- Settings ----------------
+const int OBSTACLE_CM = 20;
+
+const unsigned long AVOID_BACK_MS  = 5000;
+const unsigned long AVOID_RIGHT_MS = 5000;
+const unsigned long DIST_READ_MS   = 120;
+
+const int SPEED_FWD  = 200;
+const int SPEED_TURN = 200;
+
+// Soil cycle timing
+const unsigned long SOIL_CYCLE_INTERVAL_MS = 30000; // every 30 sec
+const unsigned long DC_FWD_MS   = 100;             // your current value
+const unsigned long DC_BWD_MS   = 100;             // your current value
+const unsigned long PUMP_ON_MS  = 10000;
+
+// Serial printing
+const unsigned long PRINT_DIST_MS = 300;
+unsigned long lastPrintDist = 0;
+
+// ---------------- Robot State ----------------
+enum Cmd { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
+
+// CHANGE #1: start with FORWARD by default
+Cmd manualCmd = FORWARD;
+
+enum AvoidState { AVOID_NONE, AVOID_BACK, AVOID_RIGHT };
+AvoidState avoidState = AVOID_NONE;
+unsigned long avoidStart = 0;
+
+unsigned long lastDistRead = 0;
+int distanceCm = 999;
+
+// ---------------- Soil Cycle State ----------------
+enum SoilState { SOIL_IDLE, SOIL_DC_FWD, SOIL_PUMP_WAIT, SOIL_DC_BWD };
+SoilState soilState = SOIL_IDLE;
+unsigned long soilStateStart = 0;
+unsigned long nextSoilCycleStart = 0;
+
+int soilRaw = 0;
+bool soilIsDry = false;
+
+// ================= Motor helpers (ROBOT) =================
+void setRobotSpeed(int leftSpd, int rightSpd) {
+  leftSpd  = constrain(leftSpd, 0, 255);
+  rightSpd = constrain(rightSpd, 0, 255);
+  analogWrite(ENA, leftSpd);
+  analogWrite(ENB, rightSpd);
+}
+
+void stopRobot() {
+  setRobotSpeed(0, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void robotForward() {
+  setRobotSpeed(SPEED_FWD, SPEED_FWD);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void robotBackward() {
+  setRobotSpeed(SPEED_FWD, SPEED_FWD);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void robotRightTurn() {
+  setRobotSpeed(SPEED_TURN, SPEED_TURN);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void robotLeftTurn() {
+  setRobotSpeed(SPEED_TURN, SPEED_TURN);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void applyCmd(Cmd c) {
+  switch (c) {
+    case FORWARD:  robotForward();  break;
+    case BACKWARD: robotBackward(); break;
+    case LEFT:     robotLeftTurn(); break;
+    case RIGHT:    robotRightTurn();break;
+    case STOP:
+    default:       stopRobot();     break;
+  }
+}
+
+// ================= DC motor helpers (L293D #2) =================
+void dcStop() {
+  analogWrite(DC_EN, 0);
+  digitalWrite(DC_IN1, LOW);
+  digitalWrite(DC_IN2, LOW);
+}
+
+void dcForward() {
+  analogWrite(DC_EN, 200);
+  digitalWrite(DC_IN1, HIGH);
+  digitalWrite(DC_IN2, LOW);
+}
+
+void dcBackward() {
+  analogWrite(DC_EN, 200);
+  digitalWrite(DC_IN1, LOW);
+  digitalWrite(DC_IN2, HIGH);
+}
+
+// ================= Relay helpers =================
+void relayOn()  { digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? LOW  : HIGH); }
+void relayOff() { digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW ); }
+
+// ================= Ultrasonic =================
+int readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long t = pulseIn(ECHO_PIN, HIGH, 25000UL);
+  if (t == 0) return 999;
+  return (int)(t * 0.0343 / 2.0);
+}
+
+// ================= Soil logic =================
+bool isSoilDryFromRaw(int raw) {
+  if (DRY_HIGH) return raw >= SOIL_DRY_THRESHOLD;
+  else          return raw <= SOIL_DRY_THRESHOLD;
+}
+
+// ================= Setup =================
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(DC_EN, OUTPUT);
+  pinMode(DC_IN1, OUTPUT);
+  pinMode(DC_IN2, OUTPUT);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  relayOff();
+
+  Serial.begin(9600);
+
+  dcStop();
+
+  // Soil cycle starts after 30 sec
+  nextSoilCycleStart = millis() + SOIL_CYCLE_INTERVAL_MS;
+
+  Serial.println("READY: Send F/B/L/R/S");
+  Serial.println("AUTO START: FORWARD");
+
+  // CHANGE #2: move forward immediately on power ON
+  avoidState = AVOID_NONE;
+  robotForward();
+}
+
+// ================= Loop =================
+void loop() {
+  unsigned long now = millis();
+
+  // Serial commands
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c >= 'a' && c <= 'z') c -= 32;
+
+    if      (c == 'F') { manualCmd = FORWARD;  Serial.println("CMD: F"); }
+    else if (c == 'B') { manualCmd = BACKWARD; Serial.println("CMD: B"); }
+    else if (c == 'L') { manualCmd = LEFT;     Serial.println("CMD: L"); }
+    else if (c == 'R') { manualCmd = RIGHT;    Serial.println("CMD: R"); }
+    else if (c == 'S') { manualCmd = STOP;     Serial.println("CMD: S"); }
+
+    if (c=='F' || c=='B' || c=='L' || c=='R' || c=='S') avoidState = AVOID_NONE;
+  }
+
+  // Start soil cycle every 30s
+  if (soilState == SOIL_IDLE && now >= nextSoilCycleStart) {
+    soilState = SOIL_DC_FWD;
+    soilStateStart = now;
+
+    stopRobot();
+    dcForward();
+    relayOff();
+
+    Serial.println("SOIL CYCLE: Robot STOP -> DC FORWARD");
+  }
+
+  // Soil cycle priority
+  if (soilState != SOIL_IDLE) {
+    stopRobot();
+
+    if (soilState == SOIL_DC_FWD) {
+      dcForward();
+      if (now - soilStateStart >= DC_FWD_MS) {
+        dcStop();
+
+        soilRaw = analogRead(SOIL_PIN);
+        soilIsDry = isSoilDryFromRaw(soilRaw);
+
+        Serial.print("SOIL RAW: ");
+        Serial.print(soilRaw);
+        Serial.print("  => ");
+        Serial.println(soilIsDry ? "DRY" : "WET");
+
+        if (soilIsDry) {
+          relayOn();
+          soilState = SOIL_PUMP_WAIT;
+          soilStateStart = now;
+          Serial.println("PUMP: ON for 10s");
+        } else {
+          relayOff();
+          soilState = SOIL_DC_BWD;
+          soilStateStart = now;
+          dcBackward();
+          Serial.println("PUMP: OFF (WET) -> DC BACKWARD");
+        }
+      }
+      return;
+    }
+
+    if (soilState == SOIL_PUMP_WAIT) {
+      relayOn();
+      if (now - soilStateStart >= PUMP_ON_MS) {
+        relayOff();
+        soilState = SOIL_DC_BWD;
+        soilStateStart = now;
+        dcBackward();
+        Serial.println("PUMP: OFF -> DC BACKWARD");
+      }
+      return;
+    }
+
+    if (soilState == SOIL_DC_BWD) {
+      dcBackward();
+      if (now - soilStateStart >= DC_BWD_MS) {
+        dcStop();
+        relayOff();
+        soilState = SOIL_IDLE;
+
+        nextSoilCycleStart = now + SOIL_CYCLE_INTERVAL_MS;
+        Serial.println("SOIL CYCLE DONE -> Robot control resumes");
+      }
+      return;
+    }
+  }
+
+  // Normal robot logic
+  if (now - lastDistRead >= DIST_READ_MS) {
+    lastDistRead = now;
+    distanceCm = readDistanceCm();
+  }
+
+  if (now - lastPrintDist >= PRINT_DIST_MS) {
+    lastPrintDist = now;
+    Serial.print("DIST: ");
+    Serial.print(distanceCm);
+    Serial.println(" cm");
+  }
+
+  // Obstacle avoid only while forward
+  if (avoidState == AVOID_NONE) {
+    if (manualCmd == FORWARD && distanceCm <= OBSTACLE_CM) {
+      avoidState = AVOID_BACK;
+      avoidStart = now;
+      Serial.println("OBSTACLE -> BACK 5s -> RIGHT 5s -> FORWARD");
+    }
+  }
+
+  if (avoidState == AVOID_BACK) {
+    robotBackward();
+    if (now - avoidStart >= AVOID_BACK_MS) {
+      avoidState = AVOID_RIGHT;
+      avoidStart = now;
+      Serial.println("AVOID: RIGHT 5s");
+    }
+    return;
+  }
+
+  if (avoidState == AVOID_RIGHT) {
+    robotRightTurn();
+    if (now - avoidStart >= AVOID_RIGHT_MS) {
+      avoidState = AVOID_NONE;
+      manualCmd = FORWARD;
+      robotForward();
+      Serial.println("AVOID DONE -> FORWARD");
+    }
+    return;
+  }
+
+  applyCmd(manualCmd);
+}
