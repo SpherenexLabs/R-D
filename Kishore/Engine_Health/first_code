@@ -1,0 +1,274 @@
+/************************************************************
+  ESP8266 (NodeMCU) + CD74HC4067 (16ch Analog MUX) + MPU6050 +
+  DHT11 + 3x Level Sensors (Water/Oil/Fuel) + 1x Voltage Sensor
+  -> Firebase RTDB structure:
+
+  Engine Health/
+    MPU/
+      X
+      Y
+      Z
+    Fuel
+    Oil
+    Water
+    Temp
+    Volt
+
+  Wiring (summary):
+  - MPU6050: VCC->3.3V, GND->GND, SDA->D2, SCL->D1
+  - DHT11:   VCC->3.3V, GND->GND, DATA->D4
+  - MUX: VCC->3.3V, GND->GND, EN->GND, SIG->A0
+         S0->D5, S1->D6, S2->D7, S3->D8
+         C0->Voltage OUT, C1->Water OUT, C2->Oil OUT, C3->Fuel OUT
+************************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#include <DHT.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// =====================
+// 1) FILL THESE 4 VALUES
+// =====================
+// WiFi
+#define WIFI_SSID     "engine"
+#define WIFI_PASSWORD "123456789"
+
+// Firebase
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===================== Pins =====================
+#define I2C_SDA D2
+#define I2C_SCL D1
+
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+
+#define MUX_S0 D5
+#define MUX_S1 D6
+#define MUX_S2 D7
+#define MUX_S3 D8
+#define ADC_PIN A0
+
+// ===================== MUX Channels =====================
+#define CH_VOLTAGE 0
+#define CH_WATER   1
+#define CH_OIL     2
+#define CH_FUEL    3
+
+// ===================== Calibration (ADJUST AFTER TEST) =====================
+// NodeMCU A0 typically reads 0..1023 and is scaled to ~0..3.3V on most dev boards.
+static const float ADC_MAX_V = 3.3f;
+
+// Voltage sensor modules commonly map 0..25V -> 0..3.3V (check your module).
+static const float VOLT_SENSOR_MAX_INPUT = 25.0f;
+
+// Level sensor calibration: set using Serial readings
+static int WATER_ADC_DRY   = 150;  // empty/low
+static int WATER_ADC_WET   = 850;  // full/high
+static int OIL_ADC_LOW     = 150;
+static int OIL_ADC_HIGH    = 850;
+static int FUEL_ADC_EMPTY  = 150;
+static int FUEL_ADC_FULL   = 850;
+
+// ===================== Timing =====================
+static const unsigned long SEND_EVERY_MS = 1000;
+
+// ===================== Firebase =====================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===================== Sensors =====================
+Adafruit_MPU6050 mpu;
+DHT dht(DHTPIN, DHTTYPE);
+
+// Firebase base path (exact with space)
+const String BASE = "/Engine Health";
+
+// ===================== Helpers =====================
+static float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static float mapPercent(int adc, int inMin, int inMax) {
+  if (inMax == inMin) return 0.0f;
+  float t = (float)(adc - inMin) / (float)(inMax - inMin);
+  t = clampf(t, 0.0f, 1.0f);
+  return t * 100.0f;
+}
+
+static void setMuxChannel(uint8_t ch) {
+  digitalWrite(MUX_S0, (ch & 0x01) ? HIGH : LOW);
+  digitalWrite(MUX_S1, (ch & 0x02) ? HIGH : LOW);
+  digitalWrite(MUX_S2, (ch & 0x04) ? HIGH : LOW);
+  digitalWrite(MUX_S3, (ch & 0x08) ? HIGH : LOW);
+  delayMicroseconds(80); // settle time
+}
+
+static int readMuxADC(uint8_t ch) {
+  setMuxChannel(ch);
+  long sum = 0;
+  const int N = 12; // averaging
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(ADC_PIN);
+    delay(2);
+  }
+  return (int)(sum / N);
+}
+
+static float adcToVolts(int adc) {
+  return ((float)adc / 1023.0f) * ADC_MAX_V;
+}
+
+static float estimateBatteryVoltage(int adc) {
+  float vOut = adcToVolts(adc);
+  return vOut * (VOLT_SENSOR_MAX_INPUT / ADC_MAX_V);
+}
+
+static void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    if (millis() - start > 15000) break;
+  }
+}
+
+static void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+
+  Firebase.begin(&config, &auth);
+}
+
+static bool readyToSend() {
+  return (WiFi.status() == WL_CONNECTED) && Firebase.ready();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // DHT
+  dht.begin();
+
+  // MUX select pins
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  // MPU6050 init
+  if (!mpu.begin()) {
+    Serial.println("ERROR: MPU6050 not found. Check SDA/SCL/VCC/GND.");
+    while (true) delay(1000);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // WiFi + Firebase
+  connectWiFi();
+  initFirebase();
+
+  Serial.println("OK: Engine Health Logger Started");
+}
+
+void loop() {
+  static unsigned long lastSend = 0;
+
+  // keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (millis() - lastSend < SEND_EVERY_MS) return;
+  lastSend = millis();
+
+  // ---------- Read MPU6050 ----------
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  // ---------- Read DHT11 Temperature ----------
+  float tempC = dht.readTemperature();
+  if (isnan(tempC)) tempC = -127.0f; // mark invalid
+
+  // ---------- Read MUX analog sensors ----------
+  int adcVolt  = readMuxADC(CH_VOLTAGE);
+  int adcWater = readMuxADC(CH_WATER);
+  int adcOil   = readMuxADC(CH_OIL);
+  int adcFuel  = readMuxADC(CH_FUEL);
+
+  float battV   = estimateBatteryVoltage(adcVolt);
+
+  float waterPct = mapPercent(adcWater, WATER_ADC_DRY,  WATER_ADC_WET);
+  float oilPct   = mapPercent(adcOil,   OIL_ADC_LOW,    OIL_ADC_HIGH);
+  float fuelPct  = mapPercent(adcFuel,  FUEL_ADC_EMPTY, FUEL_ADC_FULL);
+
+  // ---------- Serial Debug ----------
+  Serial.println("====================================");
+  Serial.print("MPU X: "); Serial.print(ax, 3);
+  Serial.print(" Y: "); Serial.print(ay, 3);
+  Serial.print(" Z: "); Serial.println(az, 3);
+
+  Serial.print("Temp(C): "); Serial.println(tempC);
+
+  Serial.print("Volt ADC: "); Serial.print(adcVolt);
+  Serial.print(" Battery(V): "); Serial.println(battV, 2);
+
+  Serial.print("Water ADC: "); Serial.print(adcWater);
+  Serial.print(" Water(%): "); Serial.println(waterPct, 1);
+
+  Serial.print("Oil ADC: "); Serial.print(adcOil);
+  Serial.print(" Oil(%): "); Serial.println(oilPct, 1);
+
+  Serial.print("Fuel ADC: "); Serial.print(adcFuel);
+  Serial.print(" Fuel(%): "); Serial.println(fuelPct, 1);
+
+  // ---------- Firebase Upload (exact nodes) ----------
+  if (readyToSend()) {
+    // MPU
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/MPU/X", ax);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/MPU/Y", ay);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/MPU/Z", az);
+
+    // Main nodes
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/Fuel", fuelPct);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/Oil",  oilPct);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/Water", waterPct);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/Temp", tempC);
+    Firebase.RTDB.setFloat(&fbdo, BASE + "/Volt", battV);
+  } else {
+    Serial.println("Firebase not ready (check WiFi/auth).");
+  }
+}
