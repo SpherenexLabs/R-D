@@ -1,0 +1,330 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===================== WiFi =====================
+#define WIFI_SSID     "engine"
+#define WIFI_PASSWORD "123456789"
+
+// ===================== Firebase =====================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ===================== Pins =====================
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+#define DHTPIN  16
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ADC1 pins
+#define PIN_VOLT  34
+#define PIN_WATER 35
+#define PIN_OIL   32
+#define PIN_FUEL  33
+
+// ===================== Voltage calibration =====================
+static const float ADC_MAX_COUNTS = 4095.0f;
+static const float ADC_REF_V = 3.3f;
+static const float VOLT_SENSOR_MAX_INPUT = 25.0f;
+
+// ===================== Level sensor behavior tuning =====================
+// Your sensors dry ~0 and wet ~ around 60 (touch-type). We'll adapt dynamically.
+static const int   LEVEL_DRY = 0;
+
+// If raw is below this -> treat as 0% (ignore tiny noise)
+static const int   LEVEL_WET_THRESHOLD = 5;
+
+// This controls how slow/fast % changes (0.1 slow, 0.3 medium, 0.6 fast)
+static const float EMA_ALPHA = 0.20f;
+
+// Auto-learn max raw value (to avoid fixed 60.5 giving instant 100)
+static int waterMaxLearn = 60;
+static int oilMaxLearn   = 60;
+static int fuelMaxLearn  = 60;
+
+// cap learning to prevent crazy jumps if noise/glitch
+static const int MAX_LEARN_CAP = 200;
+
+// ===================== Timers =====================
+static const uint32_t READ_MPU_MS   = 200;
+static const uint32_t READ_ADC_MS   = 250;   // faster realtime
+static const uint32_t READ_DHT_MS   = 2000;
+static const uint32_t UPLOAD_MS     = 1200;
+
+// ===================== Firebase =====================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===================== Sensors =====================
+Adafruit_MPU6050 mpu;
+bool mpuOk = false;
+
+// Firebase base node
+const String BASE = "/Engine_Health";
+
+// Cached values
+float ax=0, ay=0, az=0;
+float tempC = -127.0f;
+float battV = 0, waterPct = 0, oilPct = 0, fuelPct = 0;
+
+// ---------- Helpers ----------
+static float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+static float ema(float prev, float curr, float alpha) {
+  return alpha * curr + (1.0f - alpha) * prev;
+}
+
+static int readADCavg(int pin) {
+  long sum = 0;
+  const int N = 8;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(pin);
+    delay(2);
+  }
+  return (int)(sum / N);
+}
+
+static float adcToVolts(int adc) {
+  return ((float)adc / ADC_MAX_COUNTS) * ADC_REF_V;
+}
+
+static float estimateBatteryVoltage(int adc) {
+  float vOut = adcToVolts(adc);
+  return vOut * (VOLT_SENSOR_MAX_INPUT / ADC_REF_V);
+}
+
+// Convert raw (0..~60) to 0..100 with threshold, auto max learn, and clamp
+static float levelToPercent(int raw, int &maxLearn) {
+  raw = (raw < 0) ? 0 : raw;
+
+  // ignore tiny values (noise / tiny touch)
+  if (raw <= LEVEL_WET_THRESHOLD) return 0.0f;
+
+  // learn max slowly: if we ever see bigger raw, update maxLearn
+  if (raw > maxLearn) {
+    maxLearn = raw;
+    if (maxLearn > MAX_LEARN_CAP) maxLearn = MAX_LEARN_CAP;
+  }
+
+  // to prevent instant 100, enforce a minimum range
+  int effectiveMax = maxLearn;
+  if (effectiveMax < 30) effectiveMax = 30; // helps if your learned max stays small
+
+  float t = (float)(raw - LEVEL_WET_THRESHOLD) / (float)(effectiveMax - LEVEL_WET_THRESHOLD);
+  t = clampf(t, 0.0f, 1.0f);
+  return t * 100.0f;
+}
+
+// ---------- WiFi ----------
+static void connectWiFi() {
+  Serial.println();
+  Serial.println("ESP32 WiFi Connect");
+  Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to: ");
+  Serial.println(WIFI_SSID);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    Serial.print(" status=");
+    Serial.println((int)WiFi.status());
+
+    if (millis() - start > 25000) {
+      Serial.println("\nRetry WiFi...");
+      WiFi.disconnect(false);
+      delay(1000);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      start = millis();
+    }
+  }
+
+  Serial.println("\nWIFI CONNECTED");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+}
+
+// ---------- Firebase ----------
+static void initFirebase() {
+  Serial.println("Firebase Init...");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+  fbdo.setBSSLBufferSize(4096, 1024);
+
+  Firebase.begin(&config, &auth);
+  Serial.println("Firebase.begin done");
+}
+
+static bool waitFirebaseReady(uint32_t timeoutMs = 25000) {
+  Serial.println("Waiting Firebase token...");
+  uint32_t start = millis();
+  while (!Firebase.ready()) {
+    delay(250);
+    if (millis() - start > timeoutMs) {
+      Serial.print("Firebase token timeout. Reason: ");
+      Serial.println(fbdo.errorReason());
+      return false;
+    }
+  }
+  Serial.println("Firebase READY OK");
+  return true;
+}
+
+static void uploadAllOnce() {
+  if (!Firebase.ready()) return;
+
+  FirebaseJson json;
+  json.set("MPU/X", ax);
+  json.set("MPU/Y", ay);
+  json.set("MPU/Z", az);
+
+  json.set("Fuel", fuelPct);
+  json.set("Oil", oilPct);
+  json.set("Water", waterPct);
+
+  json.set("Temp", tempC);
+  json.set("Volt", battV);
+
+  if (!Firebase.RTDB.updateNode(&fbdo, BASE.c_str(), &json)) {
+    Serial.print("Firebase update FAIL | reason: ");
+    Serial.print(fbdo.errorReason());
+    Serial.print(" | http: ");
+    Serial.println(fbdo.httpCode());
+  } else {
+    Serial.println("Firebase updated OK");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ADC setup
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_VOLT,  ADC_11db);
+  analogSetPinAttenuation(PIN_WATER, ADC_11db);
+  analogSetPinAttenuation(PIN_OIL,   ADC_11db);
+  analogSetPinAttenuation(PIN_FUEL,  ADC_11db);
+
+  connectWiFi();
+  initFirebase();
+  waitFirebaseReady();
+
+  // Sensors
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  dht.begin();
+
+  Serial.println("MPU6050 init...");
+  mpuOk = mpu.begin();
+  if (!mpuOk) Serial.println("WARNING: MPU6050 not found.");
+  else Serial.println("MPU6050 OK");
+
+  Serial.println("OK: Engine Health Logger Started (ESP32)");
+}
+
+void loop() {
+  static uint32_t tMpu = 0, tAdc = 0, tDht = 0, tUp = 0;
+
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+  uint32_t now = millis();
+
+  // MPU
+  if (now - tMpu >= READ_MPU_MS) {
+    tMpu = now;
+    if (mpuOk) {
+      sensors_event_t a, g, tt;
+      mpu.getEvent(&a, &g, &tt);
+      ax = a.acceleration.x;
+      ay = a.acceleration.y;
+      az = a.acceleration.z;
+    } else {
+      ax = ay = az = 0;
+    }
+  }
+
+  // ADC sensors
+  if (now - tAdc >= READ_ADC_MS) {
+    tAdc = now;
+
+    int adcVolt  = readADCavg(PIN_VOLT);
+    int rawWater = readADCavg(PIN_WATER);
+    int rawOil   = readADCavg(PIN_OIL);
+    int rawFuel  = readADCavg(PIN_FUEL);
+
+    battV = estimateBatteryVoltage(adcVolt);
+
+    float w = levelToPercent(rawWater, waterMaxLearn);
+    float o = levelToPercent(rawOil,   oilMaxLearn);
+    float f = levelToPercent(rawFuel,  fuelMaxLearn);
+
+    // smooth + clamp
+    waterPct = clampf(ema(waterPct, w, EMA_ALPHA), 0.0f, 100.0f);
+    oilPct   = clampf(ema(oilPct,   o, EMA_ALPHA), 0.0f, 100.0f);
+    fuelPct  = clampf(ema(fuelPct,  f, EMA_ALPHA), 0.0f, 100.0f);
+
+    // Debug raw + learned max
+    Serial.print("RAW Water/Oil/Fuel: ");
+    Serial.print(rawWater); Serial.print("/");
+    Serial.print(rawOil);   Serial.print("/");
+    Serial.print(rawFuel);
+    Serial.print(" | MaxLearn: ");
+    Serial.print(waterMaxLearn); Serial.print("/");
+    Serial.print(oilMaxLearn);   Serial.print("/");
+    Serial.println(fuelMaxLearn);
+  }
+
+  // DHT
+  if (now - tDht >= READ_DHT_MS) {
+    tDht = now;
+    float t = dht.readTemperature();
+    if (!isnan(t)) tempC = t;
+  }
+
+  // Upload
+  if (now - tUp >= UPLOAD_MS) {
+    tUp = now;
+
+    Serial.println("====================================");
+    Serial.print("Temp(C): "); Serial.println(tempC);
+    Serial.print("Volt(V): "); Serial.println(battV, 2);
+    Serial.print("Water(%): "); Serial.println(waterPct, 1);
+    Serial.print("Oil(%): "); Serial.println(oilPct, 1);
+    Serial.print("Fuel(%): "); Serial.println(fuelPct, 1);
+
+    uploadAllOnce();
+  }
+}
