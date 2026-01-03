@@ -1,0 +1,270 @@
+/***************************************************
+  ESP8266 + Firebase RTDB + L293D (1 driver, 4 motors paired)
+  Direction: /Car1/direction -> "F","B","L","R","S"
+  Speed:     /Car1/Speed     -> 1..10
+
+  Telemetry (Voltage sensor):
+  /Car1/Voltage   (REAL)
+  /Car1/Battery   (REAL)
+  /Car1/Current   (computed from voltage only, always updates)
+****************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===================== WIFI =====================
+#define WIFI_SSID     "car"
+#define WIFI_PASSWORD "123456789"
+
+// ===================== FIREBASE =====================
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===================== STATE =====================
+String lastDir = "";
+int lastSpeed = -1;       // 1..10
+int currentPwm = 1023;    // 0..1023
+
+// ===================== L293D PINS =====================
+#define ENA D1  // PWM
+#define IN1 D2
+#define IN2 D3
+
+#define ENB D6  // PWM
+#define IN3 D7
+#define IN4 D8
+
+// ===================== VOLTAGE SENSOR =====================
+#define VOLTAGE_PIN A0
+const float ADC_REF = 3.3;
+const float DIVIDER_RATIO = 5.0;
+
+// ===================== BATTERY SETTINGS =====================
+float BATTERY_FULL_V  = 8.40;
+float BATTERY_EMPTY_V = 6.40;
+
+// ===================== SPEED CONFIG =====================
+const int PWM_MIN = 320;   // Speed=1 (slow but moving)
+const int PWM_MAX = 1023;  // Speed=10 (full speed)
+
+// ===================== CURRENT FROM VOLTAGE ONLY =====================
+// Current will always update from voltage using Ohm’s law: I = V / R
+// Tune this value to get the current level you want to display.
+const float LOAD_RESISTANCE_OHM = 6.2;   // change if needed
+
+// ===================== HELPERS =====================
+int clampInt(int x, int a, int b) {
+  if (x < a) return a;
+  if (x > b) return b;
+  return x;
+}
+
+float clampFloat(float x, float a, float b) {
+  if (x < a) return a;
+  if (x > b) return b;
+  return x;
+}
+
+float batteryPercentFromVoltage(float v) {
+  float pct = (v - BATTERY_EMPTY_V) * 100.0 / (BATTERY_FULL_V - BATTERY_EMPTY_V);
+  return clampFloat(pct, 0.0, 100.0);
+}
+
+float readBatteryVoltage() {
+  const int N = 20;
+  long sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(VOLTAGE_PIN);
+    delay(2);
+  }
+  float adc = (float)sum / (float)N;
+  float vout = (adc / 1023.0) * ADC_REF;
+  return vout * DIVIDER_RATIO;
+}
+
+// Map speed 1..10 -> PWM_MIN..PWM_MAX
+int speedToPwm(int speedLevel) {
+  speedLevel = clampInt(speedLevel, 1, 10);
+  int pwm = PWM_MIN + (speedLevel - 1) * (PWM_MAX - PWM_MIN) / 9;
+  return clampInt(pwm, PWM_MIN, PWM_MAX);
+}
+
+void applyPwm(int pwm) {
+  pwm = clampInt(pwm, 0, 1023);
+  analogWriteRange(1023);
+  analogWriteFreq(1000);
+  analogWrite(ENA, pwm);
+  analogWrite(ENB, pwm);
+}
+
+// ===================== MOTOR CONTROL =====================
+void stopAll() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void leftForward()  { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+void leftBackward() { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+void rightForward() { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+void rightBackward(){ digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+
+void forward()  { leftForward();  rightForward(); }
+void backward() { leftBackward(); rightBackward(); }
+void leftTurn() { leftBackward(); rightForward(); }
+void rightTurn(){ leftForward();  rightBackward(); }
+
+void applyDirection(const String &d) {
+  if (d == "F") forward();
+  else if (d == "B") backward();
+  else if (d == "L") leftTurn();
+  else if (d == "R") rightTurn();
+  else stopAll(); // S or unknown
+}
+
+// ===================== SETUP =====================
+void setupPins() {
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopAll();
+  applyPwm(PWM_MAX);
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi OK. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+
+  Serial.print("Connecting Firebase");
+  unsigned long t = millis();
+  while (!Firebase.ready() && millis() - t < 15000) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+}
+
+void ensureNodes() {
+  if (!Firebase.ready()) return;
+
+  if (!Firebase.RTDB.getString(&fbdo, "/Car1/direction"))
+    Firebase.RTDB.setString(&fbdo, "/Car1/direction", "S");
+
+  if (!Firebase.RTDB.getInt(&fbdo, "/Car1/Speed"))
+    Firebase.RTDB.setInt(&fbdo, "/Car1/Speed", 10);
+
+  if (!Firebase.RTDB.getFloat(&fbdo, "/Car1/Voltage"))
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Voltage", 0.0);
+
+  if (!Firebase.RTDB.getFloat(&fbdo, "/Car1/Current"))
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Current", 0.0);
+
+  if (!Firebase.RTDB.getFloat(&fbdo, "/Car1/Battery"))
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Battery", 0.0);
+}
+
+// ===================== LOOP =====================
+unsigned long lastTeleMs = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  setupPins();
+  setupWiFi();
+  setupFirebase();
+  ensureNodes();
+}
+
+void loop() {
+  if (!Firebase.ready()) {
+    delay(100);
+    return;
+  }
+
+  // 1) Direction
+  if (Firebase.RTDB.getString(&fbdo, "/Car1/direction")) {
+    String dir = fbdo.stringData();
+    dir.trim();
+    dir.toUpperCase();
+
+    if (dir != lastDir) {
+      lastDir = dir;
+      Serial.print("Direction: ");
+      Serial.println(dir);
+      applyDirection(dir);
+    }
+  }
+
+  // 2) Speed
+  if (Firebase.RTDB.getInt(&fbdo, "/Car1/Speed")) {
+    int spd = clampInt(fbdo.intData(), 1, 10);
+    if (spd != lastSpeed) {
+      lastSpeed = spd;
+      currentPwm = speedToPwm(spd);
+      applyPwm(currentPwm);
+
+      Serial.print("Speed: ");
+      Serial.print(spd);
+      Serial.print("  PWM: ");
+      Serial.println(currentPwm);
+    }
+  }
+
+  // 3) Telemetry every 1 second (always update, independent of direction)
+  if (millis() - lastTeleMs > 1000) {
+    lastTeleMs = millis();
+
+    float voltage = readBatteryVoltage();
+    float battery = batteryPercentFromVoltage(voltage);
+
+    // Current always derived from voltage
+    float current = voltage / LOAD_RESISTANCE_OHM;
+
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Voltage", voltage);
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Battery", battery);
+    Firebase.RTDB.setFloat(&fbdo, "/Car1/Current", current);
+
+    Serial.print("V="); Serial.print(voltage, 2);
+    Serial.print("  Bat="); Serial.print(battery, 0);
+    Serial.print("%  I="); Serial.println(current, 2);
+  }
+
+  delay(60);
+}
