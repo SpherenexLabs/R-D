@@ -1,0 +1,265 @@
+/************************************************************
+ * Pesticide Spray Robot
+ * ESP8266 + L298N + 3 Relay + HC-SR04 + 2 IR Sensors
+ *
+ * MODE:
+ *  M = Manual (STOP only on obstacle)
+ *  A = Auto   (Line follow + obstacle avoidance)
+ ************************************************************/
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* ================= WIFI ================= */
+#define WIFI_SSID     "spray"
+#define WIFI_PASSWORD "123456789"
+
+/* ================= FIREBASE ============= */
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* ================= PATHS ================ */
+String ROOT = "/Pesticide2";
+String PATH_MODE  = ROOT + "/Mode";
+String PATH_DIR   = ROOT + "/direction";
+String PATH_SPRAY = ROOT + "/Spray";
+String PATH_OBS   = ROOT + "/Obstacle";
+
+/* ================= MOTOR PINS =========== */
+#define IN1 D1
+#define IN2 D2
+#define IN3 D5
+#define IN4 D6
+
+/* ================= RELAY PINS =========== */
+#define RELAY1 D7
+#define RELAY2 D0
+#define RELAY3 D4
+#define RELAY_ACTIVE_LOW true
+
+/* ================= ULTRASONIC =========== */
+#define TRIG_PIN D3
+#define ECHO_PIN D8
+#define OBSTACLE_DIST 40.0
+
+/* ================= IR SENSORS =========== */
+#define IR_LEFT  3   // RX
+#define IR_RIGHT 1   // TX
+#define LINE_DETECT LOW
+
+/* ================= TIMING =============== */
+unsigned long lastFirebase = 0;
+unsigned long lastObstacle = 0;
+
+/* ================= STATE ================ */
+String mode = "M";
+String currentDir = "S";
+bool manualStop = true;
+bool obstacle = false;
+
+/* AUTO AVOID STATE */
+enum {IDLE, STOP1, BACK, TURN} avoidState = IDLE;
+unsigned long avoidStart = 0;
+bool turnRight = true;
+int lastSpray = 0;
+
+/* ================= MOTOR FUNCTIONS ====== */
+void stopMotors() {
+  digitalWrite(IN1,LOW); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,LOW);
+}
+void forward() {
+  digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
+}
+void backward() {
+  digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);
+}
+void left() {
+  digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
+}
+void right() {
+  digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);
+}
+
+/* ================= RELAY ================ */
+void relay(int pin, bool on) {
+  digitalWrite(pin, RELAY_ACTIVE_LOW ? !on : on);
+}
+
+/* ================= ULTRASONIC ============ */
+float distanceCM() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long d = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (d == 0) return -1;
+  return d * 0.034 / 2;
+}
+
+/* ================= FIREBASE READS ======= */
+void readMode() {
+  if (Firebase.RTDB.getString(&fbdo, PATH_MODE)) {
+    mode = fbdo.stringData();
+    mode.toUpperCase();
+  }
+}
+
+void readDirection() {
+  if (Firebase.RTDB.getString(&fbdo, PATH_DIR)) {
+    currentDir = fbdo.stringData();
+    currentDir.toUpperCase();
+    manualStop = (currentDir == "S");
+  }
+}
+
+void readSpray() {
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_SPRAY)) return;
+  lastSpray = fbdo.intData();
+
+  relay(RELAY1,false);
+  relay(RELAY2,false);
+  relay(RELAY3,false);
+
+  if (lastSpray == 1) relay(RELAY1,true);
+  if (lastSpray == 2) relay(RELAY2,true);
+  if (lastSpray == 3) relay(RELAY3,true);
+}
+
+/* ================= MANUAL OBSTACLE ====== */
+void obstacleManual() {
+  float d = distanceCM();
+  if (d > 0 && d < OBSTACLE_DIST) {
+    stopMotors();
+    Firebase.RTDB.setInt(&fbdo, PATH_OBS, 1);
+    Firebase.RTDB.setString(&fbdo, PATH_DIR, "S");
+    manualStop = true;
+  } else {
+    Firebase.RTDB.setInt(&fbdo, PATH_OBS, 0);
+  }
+}
+
+/* ================= AUTO LINE FOLLOW ===== */
+String lineDirection() {
+  bool L = digitalRead(IR_LEFT)  == LINE_DETECT;
+  bool R = digitalRead(IR_RIGHT) == LINE_DETECT;
+  if (L && R) return "F";
+  if (L && !R) return "L";
+  if (!L && R) return "R";
+  return "S";
+}
+
+/* ================= AUTO OBSTACLE ========= */
+void obstacleAuto() {
+  float d = distanceCM();
+  bool obs = (d > 0 && d < OBSTACLE_DIST);
+
+  Firebase.RTDB.setInt(&fbdo, PATH_OBS, obs ? 1 : 0);
+
+  if (obs && avoidState == IDLE) {
+    avoidState = STOP1;
+    avoidStart = millis();
+    relay(RELAY1,false); relay(RELAY2,false); relay(RELAY3,false);
+  }
+
+  if (avoidState == STOP1) {
+    stopMotors();
+    if (millis() - avoidStart > 200) {
+      avoidState = BACK; avoidStart = millis();
+    }
+  }
+  else if (avoidState == BACK) {
+    backward();
+    if (millis() - avoidStart > 500) {
+      avoidState = TURN; avoidStart = millis();
+      turnRight = !turnRight;
+    }
+  }
+  else if (avoidState == TURN) {
+    turnRight ? right() : left();
+    if (millis() - avoidStart > 400) {
+      avoidState = IDLE;
+      if (lastSpray == 1) relay(RELAY1,true);
+      if (lastSpray == 2) relay(RELAY2,true);
+      if (lastSpray == 3) relay(RELAY3,true);
+    }
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+
+  pinMode(RELAY1,OUTPUT); pinMode(RELAY2,OUTPUT); pinMode(RELAY3,OUTPUT);
+  pinMode(TRIG_PIN,OUTPUT); pinMode(ECHO_PIN,INPUT);
+  pinMode(IR_LEFT,INPUT); pinMode(IR_RIGHT,INPUT);
+
+  stopMotors();
+  relay(RELAY1,false); relay(RELAY2,false); relay(RELAY3,false);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(300);
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Firebase.RTDB.setString(&fbdo, PATH_MODE, "M");
+  Firebase.RTDB.setString(&fbdo, PATH_DIR, "S");
+  Firebase.RTDB.setInt(&fbdo, PATH_SPRAY, 0);
+  Firebase.RTDB.setInt(&fbdo, PATH_OBS, 0);
+}
+
+/* ================= LOOP ================== */
+void loop() {
+  unsigned long now = millis();
+
+  if (Firebase.ready() && now - lastFirebase > 250) {
+    lastFirebase = now;
+    readMode();
+    readSpray();
+    if (mode == "M") readDirection();
+  }
+
+  if (now - lastObstacle > 120) {
+    lastObstacle = now;
+    if (mode == "A") obstacleAuto();
+    else obstacleManual();
+  }
+
+  if (mode == "M") {
+    if (manualStop) stopMotors();
+    else if (currentDir == "F") forward();
+    else if (currentDir == "B") backward();
+    else if (currentDir == "L") left();
+    else if (currentDir == "R") right();
+    else stopMotors();
+  } 
+  else if (mode == "A" && avoidState == IDLE) {
+    String d = lineDirection();
+    if (d == "F") forward();
+    else if (d == "L") left();
+    else if (d == "R") right();
+    else stopMotors();
+  }
+
+  delay(5);
+}
