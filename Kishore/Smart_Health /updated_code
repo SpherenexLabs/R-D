@@ -1,0 +1,393 @@
+/****************************************************
+  ESP32 + Firebase RTDB + MPU6050 + DHT11 + OLED + MAX30102
+  HR & SpO2 are FAKE every 30 seconds
+
+  MAX30102:
+    - Only LED ON for demo (not used for calculation)
+
+  OLED Boot:
+    1) 3 sec: SSID/PASS
+    2) 2 sec: Smart Health Monitor
+    3) Normal display
+
+  Firebase Path:
+    /Smart_Health/HR
+    /Smart_Health/Spo2
+    /Smart_Health/Temp
+    /Smart_Health/Hum
+    /Smart_Health/Mpu
+    /Smart_Health/Fall
+****************************************************/
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <math.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#include <DHT.h>
+
+#include "MAX30105.h"
+
+// ---------- WIFI ----------
+#define WIFI_SSID       "smart"
+#define WIFI_PASSWORD   "123456789"
+
+// ---------- FIREBASE ----------
+#define API_KEY         "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL    "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ---------- I2C (ESP32 default) ----------
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// ---------- DHT ----------
+#define DHTPIN  4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- MPU ----------
+Adafruit_MPU6050 mpu;
+
+// ---------- MAX30102 ----------
+MAX30105 particleSensor;
+
+// ---------- Fake HR / SpO2 ----------
+float hrValue   = 72;
+float spo2Value = 98;
+
+// ---------- MPU / Fall ----------
+float angleX = 0.0;
+float prevAngleX = 0.0;
+int fallFlag = 0;
+
+// ---------- DHT values ----------
+float tempC = NAN;
+float hum   = NAN;
+
+// ---------- Firebase ----------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+String basePath = "/Smart_Health";
+
+// ---------- Timers ----------
+unsigned long lastSensor1sMs = 0;
+const unsigned long SENSOR_1S_INTERVAL_MS = 1000;
+
+unsigned long lastHr30sMs = 0;
+const unsigned long HR_30S_INTERVAL_MS = 30000;
+
+unsigned long lastUiMs = 0;
+const unsigned long UI_INTERVAL_MS = 250;
+
+// ---------- MPU stuck recovery ----------
+int mpuZeroCount = 0;
+const int MPU_ZERO_LIMIT = 8;
+
+// ---------------------- Boot Screens ----------------------
+void oledBootShowWiFi() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println("WiFi Details");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  display.setCursor(0, 16);
+  display.print("SSID: ");
+  display.println(WIFI_SSID);
+
+  display.setCursor(0, 28);
+  display.print("PASS: ");
+  display.println(WIFI_PASSWORD);
+
+  display.setCursor(0, 48);
+  display.println("Connecting...");
+
+  display.display();
+}
+
+void oledBootShowTitle() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(0, 10);
+  display.println("Smart");
+
+  display.setTextSize(1);
+  display.setCursor(0, 36);
+  display.println("Health Monitor");
+
+  display.display();
+}
+
+// ---------------------- Compute Angle ----------------------
+float computeAngleX(float ax, float ay, float az) {
+  return atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+}
+
+// ---------------------- OLED Normal Screen ----------------------
+void oledShow(float hr, float spo2, float t, float h, float ax, int fall) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("HR   : "); display.print(hr, 0); display.println(" bpm");
+
+  display.setCursor(0, 12);
+  display.print("SpO2 : "); display.print(spo2, 0); display.println(" %");
+
+  display.setCursor(0, 24);
+  display.print("Temp : ");
+  if (isnan(t)) display.println("--.- C");
+  else { display.print(t, 1); display.println(" C"); }
+
+  display.setCursor(0, 36);
+  display.print("Hum  : ");
+  if (isnan(h)) display.println("--.- %");
+  else { display.print(h, 1); display.println(" %"); }
+
+  display.setCursor(0, 48);
+  display.print("MPU X: "); display.print(ax, 1); display.println(" deg");
+
+  display.setCursor(0, 56);
+  display.print("Fall : "); display.print(fall);
+
+  display.display();
+}
+
+// ---------------------- Serial Print ----------------------
+void serialShow(float hr, float spo2, float t, float h, float ax, int fall) {
+  Serial.print("HR: "); Serial.print(hr, 0); Serial.print(" bpm | ");
+  Serial.print("SpO2: "); Serial.print(spo2, 0); Serial.print(" % | ");
+  Serial.print("Temp: "); if (isnan(t)) Serial.print("NaN"); else Serial.print(t, 1);
+  Serial.print(" C | Hum: "); if (isnan(h)) Serial.print("NaN"); else Serial.print(h, 1);
+  Serial.print(" % | MPU_X: "); Serial.print(ax, 1);
+  Serial.print(" deg | Fall: "); Serial.println(fall);
+}
+
+// ---------------------- MPU Recovery ----------------------
+bool reinitMpu() {
+  Serial.println("MPU RECOVERY: restarting I2C + MPU...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  delay(50);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU RECOVERY FAILED");
+    return false;
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("MPU RECOVERY OK");
+  mpuZeroCount = 0;
+  return true;
+}
+
+bool readMpuAngleX(float &outAngleX) {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  bool allZero = (a.acceleration.x == 0.0f &&
+                  a.acceleration.y == 0.0f &&
+                  a.acceleration.z == 0.0f);
+
+  if (allZero) {
+    mpuZeroCount++;
+    if (mpuZeroCount >= MPU_ZERO_LIMIT) reinitMpu();
+    return false;
+  } else {
+    mpuZeroCount = 0;
+  }
+
+  outAngleX = computeAngleX(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  return true;
+}
+
+// ---------------------- DHT Read ----------------------
+void readDht() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) tempC = t;
+  if (!isnan(h)) hum = h;
+}
+
+// ---------------------- Fake HR/SPO2 ----------------------
+void updateFakeHrSpo2() {
+  hrValue = (float)random(68, 81);
+
+  if (hrValue <= 72)      spo2Value = (float)random(98, 101);
+  else if (hrValue <= 76) spo2Value = (float)random(96, 100);
+  else                    spo2Value = (float)random(94, 99);
+}
+
+// ---------------------- MAX30102 LED ON ONLY ----------------------
+void max30102TurnOnLedOnly() {
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not detected. Check wiring/I2C.");
+    return;
+  }
+
+  particleSensor.setup(); // default
+  // Increase if you want brighter (0x1F low, 0x7F medium, 0xFF high)
+  particleSensor.setPulseAmplitudeRed(0x7F);
+  particleSensor.setPulseAmplitudeIR(0x7F);
+
+  Serial.println("MAX30102 LED ON (demo).");
+}
+
+// ---------------------- Firebase Write ----------------------
+void firebaseWrite_1s() {
+  if (!Firebase.ready()) return;
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/Temp", tempC);
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/Hum",  hum);
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/Mpu",  angleX);
+  Firebase.RTDB.setInt(&fbdo,   basePath + "/Fall", fallFlag);
+}
+
+void firebaseWrite_30s() {
+  if (!Firebase.ready()) return;
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/HR",   hrValue);
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/Spo2", spo2Value);
+}
+
+// ===================== MUST HAVE setup() =====================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  randomSeed(esp_random());
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found at 0x3C.");
+    while (true) delay(1000);
+  }
+
+  oledBootShowWiFi();
+  delay(3000);
+
+  oledBootShowTitle();
+  delay(2000);
+
+  dht.begin();
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not detected.");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("MPU6050 Not Found!");
+    display.println("Check Wiring");
+    display.display();
+    while (true) delay(1000);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // MAX30102 LED on (demo)
+  max30102TurnOnLedOnly();
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("WiFi IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Init values
+  readDht();
+
+  float ax;
+  if (readMpuAngleX(ax)) {
+    angleX = ax;
+    prevAngleX = ax;
+  } else {
+    angleX = 0;
+    prevAngleX = 0;
+  }
+  fallFlag = 0;
+
+  updateFakeHrSpo2();
+  firebaseWrite_30s();
+
+  oledShow(hrValue, spo2Value, tempC, hum, angleX, fallFlag);
+}
+
+// ===================== MUST HAVE loop() =====================
+void loop() {
+  unsigned long now = millis();
+
+  // Real sensors every 1 sec
+  if (now - lastSensor1sMs >= SENSOR_1S_INTERVAL_MS) {
+    lastSensor1sMs = now;
+
+    readDht();
+
+    float currentAngleX;
+    if (readMpuAngleX(currentAngleX)) {
+      angleX = currentAngleX;
+      float diff = fabs(angleX - prevAngleX);
+      fallFlag = (diff > 10.0f) ? 1 : 0;
+      prevAngleX = angleX;
+    }
+
+    firebaseWrite_1s();
+  }
+
+  // Fake HR/SPO2 every 30 sec
+  if (now - lastHr30sMs >= HR_30S_INTERVAL_MS) {
+    lastHr30sMs = now;
+    updateFakeHrSpo2();
+    firebaseWrite_30s();
+  }
+
+  // UI refresh
+  if (now - lastUiMs >= UI_INTERVAL_MS) {
+    lastUiMs = now;
+    serialShow(hrValue, spo2Value, tempC, hum, angleX, fallFlag);
+    oledShow(hrValue, spo2Value, tempC, hum, angleX, fallFlag);
+  }
+
+  delay(10);
+}
