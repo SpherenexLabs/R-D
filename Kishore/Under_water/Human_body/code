@@ -1,0 +1,318 @@
+/****************************************************
+  ESP32 + Firebase RTDB + L293D + 6 Push Buttons (Latch)
+  + Fake MPU Random Values (every 2 sec)
+
+  FAST RESPONSE VERSION:
+   - Motor runs immediately when button is released (short press)
+   - Long press (>=2s) any button -> STOP
+   - Firebase write happens only when value changes (non-spam)
+   - No continuous Firebase read (avoids delay)
+
+  Firebase:
+    /Human_Body/Button  -> 0..6
+
+  MPU (FAKE):
+    /Human_Body/MPU/Online  -> 1
+    /Human_Body/MPU/Ax
+    /Human_Body/MPU/Ay
+    /Human_Body/MPU/Az
+****************************************************/
+
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* ================= WIFI ================= */
+#define WIFI_SSID     "human"
+#define WIFI_PASSWORD "123456789"
+
+/* ================= FIREBASE ============= */
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+/* ================= L293D PINS (ESP32) ================= */
+#define ENA 25
+#define ENB 26
+#define IN1 27
+#define IN2 14
+#define IN3 16   // safe
+#define IN4 17   // safe
+
+/* ================= BUTTON PINS (ESP32) =================
+   Wiring: GPIO <-> Button <-> GND  (INPUT_PULLUP)
+*/
+#define BTN1 32
+#define BTN2 33
+#define BTN3 18
+#define BTN4 19
+#define BTN5 23
+#define BTN6 5
+
+/* ================= FIREBASE PATHS ================= */
+String PATH_BTN    = "/Human_Body/Button";
+String PATH_MPU_ON = "/Human_Body/MPU/Online";
+
+/* Firebase */
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* ================= Timing ================= */
+const unsigned long DEBOUNCE_MS  = 35;
+const unsigned long LONGPRESS_MS = 2000;
+const unsigned long MPU_FAKE_MS  = 2000;
+
+/* ================= State ================= */
+int latchedBtn = 0;
+int lastWrittenBtn = -999;     // last button value successfully written to Firebase
+unsigned long lastWriteTryMs = 0;
+
+unsigned long tFakeMpu = 0;
+
+/* -------- Motor helpers -------- */
+void motorAStop()     { digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW); }
+void motorAForward()  { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
+void motorABackward() { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+
+void motorBStop()     { digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW); }
+void motorBForward()  { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+void motorBBackward() { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+
+void allStop() { motorAStop(); motorBStop(); }
+
+void applyButtonToMotors(int b) {
+  switch (b) {
+    case 1: motorAForward();  motorBStop();     break;
+    case 2: motorABackward(); motorBStop();     break;
+    case 3: motorAStop();     motorBForward();  break;
+    case 4: motorAStop();     motorBBackward(); break;
+    case 5: motorABackward(); motorBForward();  break; // Left pivot
+    case 6: motorAForward();  motorBBackward(); break; // Right pivot
+    default: allStop();                         break;
+  }
+}
+
+/* -------- WiFi connect -------- */
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+    if (millis() - start > 20000) {
+      Serial.println("\nWiFi failed, restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+/* -------- Write Button to Firebase (retry-safe) -------- */
+void writeButtonToFirebase(int val) {
+  // Throttle retry attempts to avoid blocking too much
+  unsigned long now = millis();
+  if (now - lastWriteTryMs < 80) return;
+  lastWriteTryMs = now;
+
+  if (!Firebase.ready()) return;
+
+  if (Firebase.RTDB.setInt(&fbdo, PATH_BTN.c_str(), val)) {
+    lastWrittenBtn = val;
+    Serial.print("Firebase Button updated = ");
+    Serial.println(val);
+  } else {
+    Serial.print("Firebase Button write failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+/* -------- Fake MPU Random Update (creates node) -------- */
+float randFloat(float minV, float maxV) {
+  long r = random(0, 10001);
+  float t = (float)r / 10000.0f;
+  return minV + (maxV - minV) * t;
+}
+
+void writeFakeMpuEvery2Sec() {
+  if (millis() - tFakeMpu < MPU_FAKE_MS) return;
+  tFakeMpu = millis();
+
+  if (!Firebase.ready()) return;
+
+  float ax = randFloat(-2.0, 2.0);
+  float ay = randFloat(-2.0, 2.0);
+  float az = randFloat(8.5, 10.5);
+
+  FirebaseJson json;
+  json.set("Ax", ax);
+  json.set("Ay", ay);
+  json.set("Az", az);
+
+  if (Firebase.RTDB.updateNode(&fbdo, "/Human_Body/MPU", &json)) {
+    Serial.print("MPU -> Ax: "); Serial.print(ax);
+    Serial.print(" Ay: "); Serial.print(ay);
+    Serial.print(" Az: "); Serial.println(az);
+  } else {
+    Serial.print("MPU update failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+}
+
+/* -------- Button latch logic (non-blocking, fast) -------- */
+struct BtnTrack {
+  int pin;
+  int id;
+  bool lastRaw;
+  bool stable;
+  unsigned long lastChange;
+  unsigned long pressStart;
+  bool longFired;
+};
+
+BtnTrack btns[6] = {
+  {BTN1, 1, true, true, 0, 0, false},
+  {BTN2, 2, true, true, 0, 0, false},
+  {BTN3, 3, true, true, 0, 0, false},
+  {BTN4, 4, true, true, 0, 0, false},
+  {BTN5, 5, true, true, 0, 0, false},
+  {BTN6, 6, true, true, 0, 0, false},
+};
+
+void scanButtonsFast() {
+  unsigned long now = millis();
+
+  for (int i = 0; i < 6; i++) {
+    BtnTrack &b = btns[i];
+
+    bool rawPressed = (digitalRead(b.pin) == LOW); // pressed = LOW
+    if (rawPressed != b.lastRaw) {
+      b.lastRaw = rawPressed;
+      b.lastChange = now;
+    }
+
+    // Debounce
+    if (now - b.lastChange >= DEBOUNCE_MS) {
+      if (b.stable != rawPressed) {
+        b.stable = rawPressed;
+
+        if (b.stable) { // pressed
+          b.pressStart = now;
+          b.longFired = false;
+        } else { // released
+          // short press latch (if not long press)
+          if (!b.longFired) {
+            latchedBtn = b.id;
+
+            // IMMEDIATE motor action (NO DELAY)
+            applyButtonToMotors(latchedBtn);
+
+            // Request Firebase update
+            if (latchedBtn != lastWrittenBtn) {
+              writeButtonToFirebase(latchedBtn);
+            }
+          }
+          b.longFired = false;
+        }
+      }
+
+      // Long press stop
+      if (b.stable && !b.longFired && (now - b.pressStart >= LONGPRESS_MS)) {
+        b.longFired = true;
+        latchedBtn = 0;
+
+        // IMMEDIATE motor stop
+        applyButtonToMotors(0);
+
+        if (0 != lastWrittenBtn) writeButtonToFirebase(0);
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  randomSeed((uint32_t)esp_random());
+
+  // Motor pins
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  digitalWrite(ENA, HIGH);
+  digitalWrite(ENB, HIGH);
+  allStop();
+
+  // Buttons
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
+  pinMode(BTN3, INPUT_PULLUP);
+  pinMode(BTN4, INPUT_PULLUP);
+  pinMode(BTN5, INPUT_PULLUP);
+  pinMode(BTN6, INPUT_PULLUP);
+
+  // WiFi
+  connectWiFi();
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(2048);
+  Firebase.begin(&config, &auth);
+
+  Serial.println("Firebase started.");
+
+  // Force create MPU node
+  if (Firebase.RTDB.setInt(&fbdo, PATH_MPU_ON.c_str(), 1)) {
+    Serial.println("MPU node created.");
+  } else {
+    Serial.print("MPU create failed: ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  // Start with STOP
+  latchedBtn = 0;
+  applyButtonToMotors(0);
+  writeButtonToFirebase(0);
+
+  tFakeMpu = millis();
+}
+
+void loop() {
+  // Keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    connectWiFi();
+  }
+
+  // Scan buttons continuously (FAST)
+  scanButtonsFast();
+
+  // If Firebase write failed earlier, retry occasionally
+  if (latchedBtn != lastWrittenBtn) {
+    writeButtonToFirebase(latchedBtn);
+  }
+
+  // Fake MPU update every 2 sec
+  writeFakeMpuEvery2Sec();
+
+  // No big delay (keep responsiveness)
+  delay(1);
+}
