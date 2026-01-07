@@ -1,0 +1,220 @@
+/****************************************************
+  ESP8266 (NodeMCU) + Firebase RTDB + OLED + Buzzer
+  AUTH: Email & Password
+  AUTO NODE CREATION
+****************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================= WIFI =================
+#define WIFI_SSID       "driver"
+#define WIFI_PASSWORD   "123456789"
+
+// ================= FIREBASE =================
+#define API_KEY         "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL    "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL      "spherenexgpt@gmail.com"
+#define USER_PASSWORD   "Spherenex@123"
+
+// ================= OLED =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= BUZZER =================
+#define BUZZER_PIN D5  // GPIO14
+
+// ================= FIREBASE OBJECTS =================
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+String PATH_DISPLAY = "/Drowsiness/Display";
+String PATH_ALERT   = "/Drowsiness/Alert";
+
+// ================= BUZZER LOGIC =================
+bool buzzerActive = false;
+unsigned long buzzerStart = 0;
+unsigned long lastToggle = 0;
+bool buzzerState = false;
+
+void startBuzzer5Sec() {
+  buzzerActive = true;
+  buzzerStart = millis();
+  lastToggle = 0;
+  buzzerState = false;
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void updateBuzzer() {
+  if (!buzzerActive) return;
+
+  unsigned long now = millis();
+  if (now - buzzerStart >= 5000) {
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    return;
+  }
+
+  if (now - lastToggle >= 200) {
+    lastToggle = now;
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+  }
+}
+
+// ================= OLED HELPERS =================
+void oledBootScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 8);
+  display.println("WiFi Details");
+
+  display.setCursor(0, 24);
+  display.print("SSID: ");
+  display.println(WIFI_SSID);
+
+  display.setCursor(0, 40);
+  display.print("PASS: ");
+  display.println(WIFI_PASSWORD);
+
+  display.display();
+}
+
+void oledDriverStatus(String line1 = "", String line2 = "") {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Heading
+  display.setCursor(0, 0);
+  display.println("Driver Status");
+
+  // Divider
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  // Content
+  display.setCursor(0, 20);
+  display.println(line1);
+
+  if (line2.length()) {
+    display.setCursor(0, 36);
+    display.println(line2);
+  }
+
+  display.display();
+}
+
+void oledBlankStatus() {
+  oledDriverStatus("", "");
+}
+
+// ================= WIFI =================
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+}
+
+// ================= FIREBASE NODE CREATION =================
+void createFirebaseNodes() {
+  Serial.println("Waiting for Firebase auth...");
+  while (!Firebase.ready()) {
+    delay(200);
+  }
+  Serial.println("Firebase authenticated");
+
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_DISPLAY)) {
+    Firebase.RTDB.setInt(&fbdo, PATH_DISPLAY, 0);
+  }
+
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_ALERT)) {
+    Firebase.RTDB.setInt(&fbdo, PATH_ALERT, 0);
+  }
+}
+
+// ================= SETUP =================
+int lastDisplay = -1;
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin(D2, D1);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  // 🔹 BOOT SCREEN (3 seconds)
+  oledBootScreen();
+  delay(3000);
+
+  connectWiFi();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+
+  createFirebaseNodes();
+
+  oledDriverStatus("Normal");
+}
+
+// ================= LOOP =================
+void loop() {
+  updateBuzzer();
+
+  if (!Firebase.ready()) return;
+
+  int displayVal;
+  if (!Firebase.RTDB.getInt(&fbdo, PATH_DISPLAY)) return;
+
+  displayVal = fbdo.intData();
+  if (displayVal == lastDisplay) return;
+  lastDisplay = displayVal;
+
+  if (displayVal == 0) {
+    Firebase.RTDB.setInt(&fbdo, PATH_ALERT, 0);
+    oledDriverStatus("Normal");
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  } 
+  else {
+    Firebase.RTDB.setInt(&fbdo, PATH_ALERT, 1);
+
+    if (displayVal == 1)
+      oledDriverStatus("your yawn", "take Fresh air");
+    else if (displayVal == 2)
+      oledDriverStatus("your eyes closed", "Wake Up");
+    else if (displayVal == 3)
+      oledDriverStatus("your Head Dropped", "Be Active");
+    else
+      oledBlankStatus();
+
+    startBuzzer5Sec();
+  }
+
+  delay(300);
+}
