@@ -1,0 +1,365 @@
+/****************************************************
+  ESP8266 (NodeMCU) + Firebase RTDB + 2 IR + Servo + OLED + RC522 RFID
+
+  Payment_Status rule (UPDATED):
+    - Whenever Servo becomes "1" (RFID or Dashboard) -> Payment_Status = "Payment Done"
+    - After auto-close (10 sec) -> Payment_Status = "Pending"
+    - Unauthorized card -> "Not Authorized"
+****************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <EEPROM.h>
+
+/* ================= WIFI ================= */
+#define WIFI_SSID     "toll"
+#define WIFI_PASSWORD "123456789"
+
+/* ================= FIREBASE ============= */
+#define API_KEY       "AIzaSyAXHnvNZkb00PXbG5JidbD4PbRgf7l6Lgg"
+#define DATABASE_URL  "https://v2v-communication-d46c6-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+/* ================= PINS ================= */
+#define IR1_PIN   D3
+#define IR2_PIN   3     // RX = GPIO3
+#define SERVO_PIN D4
+#define RFID_SS   D8
+#define RFID_RST  D0
+
+/* ================= OLED ================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+Servo gateServo;
+MFRC522 mfrc522(RFID_SS, RFID_RST);
+
+/* ================= FIREBASE OBJS ======== */
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* ================= PATHS ================= */
+const String PATH_IR1   = "/Smart_Toll/IR_1";
+const String PATH_IR2   = "/Smart_Toll/IR_2";
+const String PATH_SERVO = "/Smart_Toll/Servo";
+const String PATH_VOLT  = "/Smart_Toll/Voltage";
+const String PATH_RUPEE = "/Smart_Toll/Rupees";
+const String PATH_PAY   = "/Smart_Toll/Payment_Status";
+const String PATH_RFID  = "/Smart_Toll/Rfid";
+
+/* ================= IR LOGIC ============== */
+const int IR_DETECTED_LEVEL = LOW;
+
+/* ================= TIMERS =============== */
+unsigned long tIR   = 0;
+unsigned long tRead = 0;
+unsigned long tRFID = 0;
+
+const unsigned long IR_UPDATE_MS = 250;
+const unsigned long READ_FB_MS   = 400;
+const unsigned long RFID_MS      = 150;
+
+/* ================= LAST VALUES ========== */
+String lastIR1 = "";
+String lastIR2 = "";
+String lastServo = "0";
+String lastRfid  = "0";
+
+/* ================= DISPLAY VALUES ======= */
+String vVoltage = "--";
+String vRupees  = "--";
+String vPayment = "--";
+String vServo   = "--";
+String vRfid    = "--";
+
+/* ================= EEPROM UID =========== */
+const int EEPROM_SIZE = 64;
+const int EEPROM_ADDR = 0;
+String registeredUID = "";
+
+/* ================= UNIVERSAL AUTO CLOSE =========== */
+const unsigned long SERVO_OPEN_MS = 10000;
+bool gateIsOpen = false;
+unsigned long gateCloseAt = 0;
+bool waitingForServoZero = false;
+
+/* ================= RFID ANTI-REPEAT ===== */
+String lastSeenUID = "";
+unsigned long lastSeenUIDAt = 0;
+const unsigned long UID_COOLDOWN_MS = 2000;
+
+/* ================= HELPERS ============== */
+void oledShow() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);  display.print("Voltage: "); display.println(vVoltage);
+  display.setCursor(0, 12); display.print("Rupees : "); display.println(vRupees);
+  display.setCursor(0, 24); display.print("Servo  : "); display.println(vServo);
+  display.setCursor(0, 36); display.print("Payment: "); display.println(vPayment);
+  display.setCursor(0, 48); display.print("Rfid   : "); display.println(vRfid);
+
+  display.display();
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) delay(300);
+}
+
+void firebaseInit() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+  Firebase.begin(&config, &auth);
+}
+
+bool fbSetString(const String &path, const String &val) {
+  bool ok = Firebase.RTDB.setString(&fbdo, path, val);
+  if (!ok) {
+    Serial.print("SET FAIL "); Serial.print(path);
+    Serial.print(" -> "); Serial.println(fbdo.errorReason());
+  }
+  return ok;
+}
+bool fbSetInt(const String &path, int val) {
+  bool ok = Firebase.RTDB.setInt(&fbdo, path, val);
+  if (!ok) {
+    Serial.print("SET FAIL "); Serial.print(path);
+    Serial.print(" -> "); Serial.println(fbdo.errorReason());
+  }
+  return ok;
+}
+
+String fbGetAnyAsString(const String &path, const String &fallback) {
+  if (Firebase.RTDB.get(&fbdo, path)) {
+    if (fbdo.dataType() == "string") return fbdo.stringData();
+    if (fbdo.dataType() == "int")    return String(fbdo.intData());
+    if (fbdo.dataType() == "float")  return String(fbdo.floatData(), 3);
+    if (fbdo.dataType() == "double") return String(fbdo.doubleData(), 3);
+    if (fbdo.dataType() == "boolean")return fbdo.boolData() ? "1" : "0";
+  }
+  return fallback;
+}
+
+String irValue(int pin) {
+  return (digitalRead(pin) == IR_DETECTED_LEVEL) ? "1" : "0";
+}
+
+void applyServo(const String &servoVal) {
+  gateServo.write(servoVal == "1" ? 90 : 0);
+}
+
+/* EEPROM */
+void saveUIDToEEPROM(const String &uid) {
+  int len = uid.length();
+  if (len <= 0 || len > 30) return;
+  EEPROM.write(EEPROM_ADDR, (byte)len);
+  for (int i = 0; i < len; i++) EEPROM.write(EEPROM_ADDR + 1 + i, uid[i]);
+  EEPROM.commit();
+}
+String loadUIDFromEEPROM() {
+  int len = EEPROM.read(EEPROM_ADDR);
+  if (len <= 0 || len > 30) return "";
+  String uid = "";
+  for (int i = 0; i < len; i++) uid += char(EEPROM.read(EEPROM_ADDR + 1 + i));
+  return uid;
+}
+
+/* RFID */
+String readUID() {
+  if (!mfrc522.PICC_IsNewCardPresent()) return "";
+  if (!mfrc522.PICC_ReadCardSerial()) return "";
+  String uid = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    byte b = mfrc522.uid.uidByte[i];
+    if (b < 0x10) uid += "0";
+    uid += String(b, HEX);
+  }
+  uid.toUpperCase();
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+  return uid;
+}
+
+void createDefaultNodesOnce() {
+  fbSetString(PATH_IR1, "0");
+  fbSetString(PATH_IR2, "0");
+  fbSetString(PATH_SERVO, "0");
+  fbSetString(PATH_VOLT, "0.00");
+  fbSetInt(PATH_RUPEE, 0);
+  fbSetString(PATH_PAY, "Pending");
+  fbSetString(PATH_RFID, "0");
+}
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+  registeredUID = loadUIDFromEEPROM();
+
+  pinMode(IR1_PIN, INPUT);
+  pinMode(IR2_PIN, INPUT);
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(0);
+
+  Wire.begin(D2, D1);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.display();
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  connectWiFi();
+  firebaseInit();
+
+  if (Firebase.ready()) createDefaultNodesOnce();
+
+  vVoltage = "0.00";
+  vRupees  = "0";
+  vPayment = (registeredUID.length() == 0) ? "Tap card to reg" : "Pending";
+  vServo   = "0";
+  vRfid    = "0";
+  oledShow();
+}
+
+void loop() {
+  if (!Firebase.ready()) { delay(200); return; }
+  unsigned long now = millis();
+
+  // 0) AUTO CLOSE after 10 sec -> force Servo=0, Rfid=0, Payment=Pending
+  if (gateIsOpen && gateCloseAt != 0 && now >= gateCloseAt) {
+    gateIsOpen = false;
+    gateCloseAt = 0;
+
+    applyServo("0");
+    fbSetString(PATH_SERVO, "0");
+    lastServo = "0";
+
+    fbSetString(PATH_RFID, "0");
+    lastRfid = "0";
+    vRfid = "0";
+
+    fbSetString(PATH_PAY, "Pending");
+    vPayment = "Pending";
+
+    waitingForServoZero = true;
+  }
+
+  // 1) IR update
+  if (now - tIR >= IR_UPDATE_MS) {
+    tIR = now;
+    String curIR1 = irValue(IR1_PIN);
+    String curIR2 = irValue(IR2_PIN);
+    if (curIR1 != lastIR1) { fbSetString(PATH_IR1, curIR1); lastIR1 = curIR1; }
+    if (curIR2 != lastIR2) { fbSetString(PATH_IR2, curIR2); lastIR2 = curIR2; }
+  }
+
+  // 2) RFID scan
+  if (now - tRFID >= RFID_MS) {
+    tRFID = now;
+    String uid = readUID();
+    if (uid.length() > 0) {
+      if (!(uid == lastSeenUID && (now - lastSeenUIDAt) < UID_COOLDOWN_MS)) {
+        lastSeenUID = uid;
+        lastSeenUIDAt = now;
+
+        if (registeredUID.length() == 0) {
+          registeredUID = uid;
+          saveUIDToEEPROM(uid);
+        }
+
+        if (uid == registeredUID) {
+          fbSetString(PATH_RFID, "1");
+          fbSetString(PATH_SERVO, "1");
+          fbSetString(PATH_PAY, "Payment Done");
+
+          lastRfid = "1";
+          vPayment = "Payment Done";
+
+          applyServo("1");
+          lastServo = "1";
+          gateIsOpen = true;
+          gateCloseAt = now + SERVO_OPEN_MS;
+
+          waitingForServoZero = false;
+        } else {
+          fbSetString(PATH_RFID, "0");
+          fbSetString(PATH_SERVO, "0");
+          fbSetString(PATH_PAY, "Not Authorized");
+
+          lastRfid = "0";
+          vPayment = "Not Authorized";
+
+          applyServo("0");
+          lastServo = "0";
+          gateIsOpen = false;
+          gateCloseAt = 0;
+
+          waitingForServoZero = false;
+        }
+      }
+    }
+  }
+
+  // 3) Firebase read + Servo universal
+  if (now - tRead >= READ_FB_MS) {
+    tRead = now;
+
+    vRfid    = fbGetAnyAsString(PATH_RFID, vRfid);
+    vVoltage = fbGetAnyAsString(PATH_VOLT, vVoltage);
+    vRupees  = fbGetAnyAsString(PATH_RUPEE, vRupees);
+    vPayment = fbGetAnyAsString(PATH_PAY, vPayment);
+
+    String servoVal = fbGetAnyAsString(PATH_SERVO, lastServo);
+
+    if (waitingForServoZero) {
+      if (servoVal == "0") waitingForServoZero = false;
+      else servoVal = "0";
+    }
+
+    if (servoVal == "1") {
+      if (!gateIsOpen) {
+        applyServo("1");
+        lastServo = "1";
+        gateIsOpen = true;
+        gateCloseAt = now + SERVO_OPEN_MS;
+
+        // ✅ CHANGE: even manual open -> Payment Done
+        fbSetString(PATH_PAY, "Payment Done");
+        vPayment = "Payment Done";
+      }
+    } else {
+      applyServo("0");
+      lastServo = "0";
+      gateIsOpen = false;
+      gateCloseAt = 0;
+    }
+
+    vServo = lastServo;
+    oledShow();
+  }
+}
+
