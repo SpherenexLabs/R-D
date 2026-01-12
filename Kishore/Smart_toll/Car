@@ -1,0 +1,249 @@
+// ESP32 Line Follower (serial F/S) + OLED display for Voltage and Rupees
+// Serial inputs:
+//  - 'F' -> start line-follow
+//  - 'S' -> stop (exit line-follow)
+//  - "V4.50" + newline -> sets Voltage to 4.50 shown on OLED
+//  - "R50"   + newline -> sets Rupees to 50 shown on OLED
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===== Motor pins (unchanged) =====
+const int IN1 = 18;
+const int IN2 = 19;
+const int IN3 = 16;
+const int IN4 = 17;
+
+// ===== IR pins (unchanged) =====
+const int IR_LEFT_PIN  = 33;
+const int IR_RIGHT_PIN = 32;
+const int LINE_DETECTED_STATE = LOW; // change if your IR logic is inverted
+
+// ===== OLED config =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===== Serial buffer for value commands =====
+const int SERIAL_BUF_SIZE = 48;
+char serialBuf[SERIAL_BUF_SIZE];
+int bufIndex = 0;
+
+// ===== State variables =====
+bool lineFollowEnabled = false;
+unsigned long lastOledUpdate = 0;
+const unsigned long OLED_UPDATE_INTERVAL = 250; // ms
+
+// Values shown on OLED
+float voltageValue = 0.0;
+long rupeesValue = 0;
+
+// Debug print interval
+unsigned long lastPrint = 0;
+const unsigned long PRINT_INTERVAL = 200;
+
+// Forward declarations
+void processSerialBuffer();
+void updateOLED();
+void debugPrint(const char *action, int leftRead, int rightRead);
+
+// ---------------- setup ----------------
+void setup() {
+  Serial.begin(115200);
+
+  // Motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  // IR pins
+  pinMode(IR_LEFT_PIN, INPUT);
+  pinMode(IR_RIGHT_PIN, INPUT);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1) delay(10);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Initial OLED contents
+  display.setCursor(0, 0);
+  display.println("Waiting for data...");
+  display.display();
+
+  // Empty buffer
+  bufIndex = 0;
+  serialBuf[0] = '\0';
+
+  Serial.println("Ready. Send 'F' to start line-follow, 'S' to stop.");
+  Serial.println("Send lines like 'V4.50' and 'R50' (terminate with newline).");
+}
+
+// ---------------- loop ----------------
+void loop() {
+  // ---- handle serial incoming (non-blocking) ----
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    // Immediate single-char commands (no newline needed)
+    if ((c == 'F' || c == 'f') && bufIndex == 0) {
+      lineFollowEnabled = true;
+      Serial.println("LINE FOLLOW MODE: ON");
+      continue;
+    } else if ((c == 'S' || c == 's') && bufIndex == 0) {
+      lineFollowEnabled = false;
+      stopMotors();
+      Serial.println("STOPPED");
+      continue;
+    }
+
+    // Buffer characters until newline or CR
+    if (c == '\n' || c == '\r') {
+      if (bufIndex > 0) {
+        serialBuf[bufIndex] = '\0';
+        processSerialBuffer();
+        bufIndex = 0;
+        serialBuf[0] = '\0';
+      }
+      // else ignore stray newline
+    } else {
+      // append to buffer (guard overflow)
+      if (bufIndex < SERIAL_BUF_SIZE - 1) {
+        serialBuf[bufIndex++] = c;
+      } else {
+        // overflow -> reset buffer
+        bufIndex = 0;
+        serialBuf[0] = '\0';
+        Serial.println("Serial buffer overflow, input ignored");
+      }
+    }
+  }
+
+  // ---- line follow logic (only when enabled) ----
+  if (lineFollowEnabled) {
+    int leftState  = digitalRead(IR_LEFT_PIN);
+    int rightState = digitalRead(IR_RIGHT_PIN);
+
+    bool leftOnLine  = (leftState  == LINE_DETECTED_STATE);
+    bool rightOnLine = (rightState == LINE_DETECTED_STATE);
+
+    if (leftOnLine && rightOnLine) {
+      forward();
+      debugPrint("Forward", leftState, rightState);
+    } else if (leftOnLine && !rightOnLine) {
+      turnLeft();
+      debugPrint("Turn Left", leftState, rightState);
+    } else if (!leftOnLine && rightOnLine) {
+      turnRight();
+      debugPrint("Turn Right", leftState, rightState);
+    } else {
+      stopMotors();
+      debugPrint("Searching / Stop", leftState, rightState);
+    }
+  }
+
+  // ---- OLED update periodically ----
+  unsigned long now = millis();
+  if (now - lastOledUpdate >= OLED_UPDATE_INTERVAL) {
+    lastOledUpdate = now;
+    updateOLED();
+  }
+
+  delay(10); // small yield
+}
+
+// ---------------- serial buffer processing ----------------
+void processSerialBuffer() {
+  // serialBuf contains a line like "V4.50" or "R50" or other
+  if (bufIndex <= 0) return;
+
+  char cmd = serialBuf[0];
+  if (cmd == 'V' || cmd == 'v') {
+    // parse float after 'V'
+    float val = atof(&serialBuf[1]); // atof handles decimals
+    voltageValue = val;
+    Serial.print("Voltage set to: ");
+    Serial.println(voltageValue, 2);
+  } else if (cmd == 'R' || cmd == 'r') {
+    long val = atol(&serialBuf[1]);
+    rupeesValue = val;
+    Serial.print("Rupees set to: ");
+    Serial.println(rupeesValue);
+  } else {
+    Serial.print("Unknown serial line: ");
+    Serial.println(serialBuf);
+  }
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextSize(2);
+
+  display.setCursor(0, 0);
+  display.print("V:");
+  display.print(voltageValue, 2);
+
+  display.setCursor(0, 32);
+  display.print("R:");
+  display.print(rupeesValue);
+
+  display.display();
+}
+
+
+
+// ---------------- debug print (rate-limited) ----------------
+void debugPrint(const char *action, int leftRead, int rightRead) {
+  unsigned long now = millis();
+  if (now - lastPrint >= PRINT_INTERVAL) {
+    Serial.print(action);
+    Serial.print("  |  L:");
+    Serial.print(leftRead);
+    Serial.print(" R:");
+    Serial.println(rightRead);
+    lastPrint = now;
+  }
+}
+
+// ---------------- Motor helpers (same as yours) ----------------
+void forward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void backward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, HIGH);  // left motor reverse
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);   // right motor forward
+  digitalWrite(IN4, HIGH);
+}
+
+void turnRight() {
+  digitalWrite(IN1, LOW);  // left motor forward
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); // right motor reverse
+  digitalWrite(IN4, LOW);
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
