@@ -1,0 +1,161 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+
+// ------------------ WIFI ------------------
+#define WIFI_SSID     "nose"
+#define WIFI_PASSWORD "123456789"
+
+// ------------------ FIREBASE ------------------
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com/"
+
+// Email/password auth
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+// ------------------ SENSORS ------------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+// Analog pins
+#define GAS_AO_PIN   34
+#define SOUND_AO_PIN 35
+
+// ---------------- THRESHOLDS ----------------
+int GAS_THRESHOLD   = 3200;
+int SOUND_THRESHOLD = 2400;
+
+// ------------------ OBJECTS ------------------
+DHT dht(DHTPIN, DHTTYPE);
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+const char* BASE_PATH = "/E_Nose_Detect";
+
+// ------------------ WIFI CONNECT ------------------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(200);
+
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi Connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi FAILED. Restarting...");
+    delay(2000);
+    ESP.restart();
+  }
+}
+
+// ------------------ FIREBASE INIT ------------------
+void initFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(2048);
+
+  Firebase.begin(&config, &auth);
+
+  Serial.print("Connecting Firebase");
+  unsigned long start = millis();
+  while (!Firebase.ready() && millis() - start < 15000) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+
+  if (Firebase.ready()) {
+    Serial.println("Firebase Ready!");
+  } else {
+    Serial.println("Firebase not ready. Restarting...");
+    Serial.print("Reason: ");
+    Serial.println(fbdo.errorReason());
+    delay(2000);
+    ESP.restart();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  analogReadResolution(12); // 0..4095
+  dht.begin();
+
+  connectWiFi();
+  initFirebase();
+
+  Serial.println("Started: Continuous upload to Firebase (no interval, no delay).");
+  Serial.print("Path: ");
+  Serial.println(BASE_PATH);
+}
+
+void loop() {
+  // keep wifi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected -> reconnecting...");
+    connectWiFi();
+  }
+
+  // Read sensors
+  int gasRaw   = analogRead(GAS_AO_PIN);
+  int soundRaw = analogRead(SOUND_AO_PIN);
+
+  int Gas   = (gasRaw   >= GAS_THRESHOLD)   ? 1 : 0;
+  int Sound = (soundRaw >= SOUND_THRESHOLD) ? 1 : 0;
+
+  float hum  = dht.readHumidity();
+  float temp = dht.readTemperature();
+
+  // Prepare JSON
+  FirebaseJson json;
+  json.set("Gas", Gas);
+  json.set("Sound", Sound);
+  json.set("gas_raw", gasRaw);
+  json.set("sound_raw", soundRaw);
+
+  if (isnan(temp) || isnan(hum)) {
+    json.set("temperature", -1);
+    json.set("humidity", -1);
+  } else {
+    json.set("temperature", temp);
+    json.set("humidity", hum);
+  }
+
+  json.set("timestamp_ms", (int)millis());
+
+  // Upload continuously (as fast as network allows)
+  if (Firebase.ready()) {
+    bool ok = Firebase.RTDB.setJSON(&fbdo, BASE_PATH, &json);
+
+    // Print only on error (to keep loop fast)
+    if (!ok) {
+      Serial.print("Firebase upload FAILED: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  // IMPORTANT: yield CPU to avoid watchdog reset (NOT a sensor delay)
+  vTaskDelay(1);
+}
