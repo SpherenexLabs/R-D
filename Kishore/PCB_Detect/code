@@ -1,0 +1,227 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* WIFI */
+#define WIFI_SSID     "pcb"
+#define WIFI_PASSWORD "123456789"
+
+/* FIREBASE */
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+const String ROOT = "PCB_Detect";
+
+/* PINS */
+#define IR_PIN D5
+#define A_IN1  D1
+#define A_IN2  D2
+#define B_IN3  D6
+#define B_IN4  D7
+#define BUZZER_PIN D0  // active buzzer
+
+bool IR_DETECTED_IS_LOW = true;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long pollMs = 50;
+unsigned long lastPoll = 0;
+
+int lastIR = -1;
+bool inspectionActive = false;
+bool hadFirstInspection = false;
+
+// buzzer
+bool buzzerActive = false;
+unsigned long buzzerStart = 0;
+const unsigned long BUZZ_MS = 5000;
+
+// running mode
+int currentMode = 1; // 1=forward, 2=backward
+
+// direction control (fix for “not updating”)
+String desiredDir = "F";
+unsigned long lastDirWrite = 0;
+const unsigned long DIR_REASSERT_MS = 1000; // every 1 sec force update
+
+/* MOTOR */
+void stopMotor() {
+  digitalWrite(A_IN1, LOW); digitalWrite(A_IN2, LOW);
+  digitalWrite(B_IN3, LOW); digitalWrite(B_IN4, LOW);
+}
+void forwardMotor() {
+  digitalWrite(A_IN1, HIGH); digitalWrite(A_IN2, LOW);
+  digitalWrite(B_IN3, HIGH); digitalWrite(B_IN4, LOW);
+}
+void backwardMotor() {
+  digitalWrite(A_IN1, LOW); digitalWrite(A_IN2, HIGH);
+  digitalWrite(B_IN3, LOW); digitalWrite(B_IN4, HIGH);
+}
+
+/* BUZZER */
+void startBuzzer5s() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  buzzerActive = true;
+  buzzerStart = millis();
+}
+void updateBuzzer() {
+  if (buzzerActive && (millis() - buzzerStart >= BUZZ_MS)) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerActive = false;
+  }
+}
+
+/* Direction writer:
+   - writes immediately when desiredDir changes
+   - also re-writes every 1 second (fixes dashboard changes / missed writes)
+*/
+void setDesiredDir(const String &dir) {
+  if (desiredDir != dir) {
+    desiredDir = dir;
+    lastDirWrite = 0; // force immediate write next call
+  }
+}
+void pushDirectionToFirebase() {
+  if (millis() - lastDirWrite >= DIR_REASSERT_MS || lastDirWrite == 0) {
+    Firebase.RTDB.setString(&fbdo, ROOT + "/direction", desiredDir);
+    lastDirWrite = millis();
+  }
+}
+
+/* Apply mode */
+void applyMode(int mode) {
+  if (mode == 2) {
+    currentMode = 2;
+    setDesiredDir("B");
+    backwardMotor();
+  } else {
+    currentMode = 1;
+    setDesiredDir("F");
+    forwardMotor();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IR_PIN, INPUT);
+  pinMode(A_IN1, OUTPUT); pinMode(A_IN2, OUTPUT);
+  pinMode(B_IN3, OUTPUT); pinMode(B_IN4, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  stopMotor();
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) delay(200);
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  while (!Firebase.ready()) delay(100);
+
+  // Startup state: always forward
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/IR", 0);
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/PCB", 0);
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/capture", 0);
+
+  applyMode(1);               // motor forward
+  pushDirectionToFirebase();  // direction = F
+
+  Serial.println("POWER ON -> FORWARD");
+}
+
+void loop() {
+  if (!Firebase.ready()) return;
+
+  updateBuzzer();
+
+  if (millis() - lastPoll < pollMs) return;
+  lastPoll = millis();
+
+  // keep direction synced (this is what fixes “not updating”)
+  pushDirectionToFirebase();
+
+  // -------- IR READ --------
+  int raw = digitalRead(IR_PIN);
+  int irVal = IR_DETECTED_IS_LOW ? (raw == LOW) : (raw == HIGH);
+
+  if (irVal != lastIR) {
+    lastIR = irVal;
+    Firebase.RTDB.setInt(&fbdo, ROOT + "/IR", irVal);
+  }
+
+  // -------- START INSPECTION WHEN IR=1 --------
+  if (irVal == 1 && !inspectionActive) {
+    inspectionActive = true;
+
+    stopMotor();
+    setDesiredDir("S");
+    Firebase.RTDB.setInt(&fbdo, ROOT + "/capture", 1);
+
+    Serial.println("IR=1 -> STOP -> capture=1");
+  }
+
+  // -------- INSPECTION MODE --------
+  if (inspectionActive) {
+    stopMotor();
+    setDesiredDir("S");
+
+    int capture = 1;
+    if (Firebase.RTDB.getInt(&fbdo, ROOT + "/capture")) {
+      capture = fbdo.intData();
+    }
+
+    if (capture == 0) {
+      int pcb = 0;
+      if (Firebase.RTDB.getInt(&fbdo, ROOT + "/PCB")) {
+        pcb = fbdo.intData();
+      }
+
+      if (pcb == 1) {
+        applyMode(1);
+        Serial.println("capture=0, PCB=1 -> FORWARD");
+      } else if (pcb == 2) {
+        applyMode(2);
+        startBuzzer5s();
+        Serial.println("capture=0, PCB=2 -> BACKWARD + BUZZ 5s");
+      } else {
+        stopMotor();
+        setDesiredDir("S");
+        Serial.println("capture=0, PCB invalid -> STOP");
+      }
+
+      hadFirstInspection = true;
+
+      // end inspection after IR becomes 0 again
+      if (irVal == 0) {
+        inspectionActive = false;
+        Serial.println("Inspection finished -> Ready for next PCB");
+      }
+    }
+
+    return;
+  }
+
+  // -------- NORMAL RUNNING --------
+  // Before first inspection: always forward
+  if (!hadFirstInspection) {
+    applyMode(1);
+    return;
+  }
+
+  // After first inspection: keep last decided mode
+  if (currentMode == 2) backwardMotor();
+  else forwardMotor();
+}
