@@ -1,0 +1,269 @@
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* WIFI */
+#define WIFI_SSID     "helmet"
+#define WIFI_PASSWORD "123456789"
+
+/* FIREBASE */
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+const String ROOT = "Smart_Helmet1";
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// DHT11
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Ultrasonic
+#define TRIG_PIN D5
+#define ECHO_PIN D6
+float DETECT_CM = 10.0;
+
+// Relay settings
+bool RELAY_ACTIVE_LOW = true;
+#define RELAY1_PIN D0
+
+// Buzzer
+#define BUZZER_PIN D8
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Faster update
+unsigned long lastUpdateMs = 0;
+const unsigned long UPDATE_MS = 250; // 250ms = fast + stable
+
+// buzzer timing
+bool buzzerRunning = false;
+unsigned long buzzerStartMs = 0;
+const unsigned long BUZZER_ON_MS = 10000;
+
+// For 3 sec OLED SSID/PASS
+unsigned long bootMs = 0;
+
+void setRelay(int pin, bool on) {
+  if (RELAY_ACTIVE_LOW) digitalWrite(pin, on ? LOW : HIGH);
+  else digitalWrite(pin, on ? HIGH : LOW);
+}
+
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  if (duration == 0) return 9999.0;
+  return (float)duration / 58.0f;
+}
+
+void oledShowBoot() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("WiFi Details");
+
+  display.setCursor(0, 18);
+  display.print("SSID: ");
+  display.print(WIFI_SSID);
+
+  display.setCursor(0, 34);
+  display.print("PASS: ");
+  display.print(WIFI_PASSWORD);
+
+  display.display();
+}
+
+void oledShowData(float t, float h, int relayVal, int fanVal, int ultraVal) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Smart Helmet 1");
+
+  display.setCursor(0, 14);
+  display.print("Temp: "); display.print(t, 1); display.print(" C");
+
+  display.setCursor(0, 24);
+  display.print("Hum : "); display.print(h, 0); display.print(" %");
+
+  display.setCursor(0, 34);
+  display.print("Relay: "); display.print(relayVal);
+
+  display.setCursor(70, 34);
+  display.print("Fan:"); display.print(fanVal);
+
+  display.setCursor(0, 44);
+  display.print("Ultra: "); display.print(ultraVal);
+
+  display.display();
+}
+
+// Write only when value changes (faster + less lag)
+void firebaseSetFloatIfChanged(const String &path, float &lastVal, float newVal, float eps = 0.05f) {
+  if (fabs(newVal - lastVal) >= eps) {
+    Firebase.RTDB.setFloat(&fbdo, path, newVal);
+    lastVal = newVal;
+  }
+}
+
+void firebaseSetIntIfChanged(const String &path, int &lastVal, int newVal) {
+  if (newVal != lastVal) {
+    Firebase.RTDB.setInt(&fbdo, path, newVal);
+    lastVal = newVal;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Force relay OFF
+  setRelay(RELAY1_PIN, false);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  dht.begin();
+
+  Wire.begin(D2, D1);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  bootMs = millis();
+  oledShowBoot(); // show SSID & PASS for first 3 sec
+
+  // WiFi connect
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+
+  // Firebase connect
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(2048);
+  Firebase.begin(&config, &auth);
+
+  while (!Firebase.ready()) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println("\nFirebase ready");
+
+  // Initialize values (optional)
+  Firebase.RTDB.setFloat(&fbdo, ROOT + "/Temp", 0.0);
+  Firebase.RTDB.setFloat(&fbdo, ROOT + "/Hum", 0.0);
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/Relay", 0);
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/Fan", 0);
+  Firebase.RTDB.setInt(&fbdo, ROOT + "/Ultra", 0);
+}
+
+void loop() {
+  // Stop buzzer after 10 sec
+  if (buzzerRunning && (millis() - buzzerStartMs >= BUZZER_ON_MS)) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerRunning = false;
+  }
+
+  if (!Firebase.ready()) return;
+
+  // Show SSID/PASS only for first 3 sec
+  if (millis() - bootMs < 3000) {
+    // keep showing boot screen, no need to update here
+    return;
+  }
+
+  // Fast update cycle
+  if (millis() - lastUpdateMs < UPDATE_MS) return;
+  lastUpdateMs = millis();
+
+  // Read DHT (DHT11 should not be read extremely fast; keep last values)
+  static unsigned long lastDhtMs = 0;
+  static float t = 0.0, h = 0.0;
+
+  if (millis() - lastDhtMs >= 1200) { // DHT11 safe interval ~1s
+    lastDhtMs = millis();
+    float nh = dht.readHumidity();
+    float nt = dht.readTemperature();
+
+    if (!isnan(nt)) t = nt;
+    if (!isnan(nh)) h = nh;
+  }
+
+  // Ultrasonic (can read fast)
+  float dist = readDistanceCM();
+  bool detected = (dist <= DETECT_CM);
+
+  // Relay condition
+  int relayVal = 0, fanVal = 0;
+  if (t > 30.0) {
+    setRelay(RELAY1_PIN, true);
+    relayVal = 1;
+    fanVal = 1;
+  } else {
+    setRelay(RELAY1_PIN, false);
+    relayVal = 0;
+    fanVal = 0;
+  }
+
+  // Ultrasonic + buzzer
+  int ultraVal;
+  if (detected) {
+    ultraVal = 1;
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerRunning = false;
+  } else {
+    ultraVal = 0;
+    if (!buzzerRunning) {
+      buzzerRunning = true;
+      buzzerStartMs = millis();
+      digitalWrite(BUZZER_PIN, HIGH);
+    }
+  }
+
+  // Firebase update (only if changed => more immediate feel)
+  static float lastT = -9999, lastH = -9999;
+  static int lastRelay = -1, lastFan = -1, lastUltra = -1;
+
+  firebaseSetFloatIfChanged(ROOT + "/Temp", lastT, t, 0.05f);
+  firebaseSetFloatIfChanged(ROOT + "/Hum",  lastH, h, 1.0f);     // hum changes slowly
+  firebaseSetIntIfChanged(ROOT + "/Relay", lastRelay, relayVal);
+  firebaseSetIntIfChanged(ROOT + "/Fan",   lastFan, fanVal);
+  firebaseSetIntIfChanged(ROOT + "/Ultra", lastUltra, ultraVal);
+
+  // OLED update (fast)
+  oledShowData(t, h, relayVal, fanVal, ultraVal);
+}
