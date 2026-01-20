@@ -1,0 +1,374 @@
+/****************************************************
+  ESP8266 (NodeMCU) + Firebase RTDB + OLED
+  Sensors:
+   - DHT11 -> Temp & Hum
+   - Water level sensor (AO) -> Oil
+   - MPU6050 (0x68) -> Vibration (shake detection + intensity type)
+
+  Firebase:
+    /Twin-Based/Temp
+    /Twin-Based/Hum
+    /Twin-Based/Oil
+    /Twin-Based/Vibration      (0/1)
+    /Twin-Based/VibType        ("LOW","MEDIUM","HIGH")
+
+  OLED Requirement:
+   - While connecting WiFi: show SSID + PASSWORD on OLED
+   - After WiFi connected: show sensor values only
+   - Remove "FB:" and "OLED:" from display
+   - Remove VibLevel from OLED
+   - Show: Vib_st: LOW/MEDIUM/HIGH
+****************************************************/
+
+#include <ESP8266WiFi.h>
+#include <Wire.h>
+#include <DHT.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* WIFI */
+#define WIFI_SSID     "twin"
+#define WIFI_PASSWORD "123456789"
+
+/* FIREBASE */
+#define API_KEY      "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+const char* ROOT = "Twin-Based";
+
+/* DHT11 */
+#define DHTPIN  D4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/* Water Sensor */
+#define WATER_PIN A0
+
+/* MPU6050 */
+#define MPU_ADDR 0x68
+
+/* OLED */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+uint8_t OLED_ADDR = 0x3C; // auto-detect 0x3C/0x3D
+
+/* Firebase */
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* Timers */
+unsigned long tDHT  = 0;
+unsigned long tFB   = 0;
+unsigned long tMPU  = 0;
+unsigned long tOLED = 0;
+
+const unsigned long DHT_MS  = 1500;
+const unsigned long FB_MS   = 400;
+const unsigned long MPU_MS  = 50;
+const unsigned long OLED_MS = 250;
+
+/* Values */
+float tempC = -1;
+float humP  = -1;
+int oilPercent = 0;
+
+/* Vibration outputs */
+int vibration = 0;          // 0/1
+String vibType = "LOW";     // LOW/MEDIUM/HIGH
+
+/* Vibration latch */
+unsigned long vibUntilMs = 0;
+const unsigned long VIB_LATCH_MS = 1000;
+
+/* Shake tuning (for ON/OFF) */
+float lastMag = 1.0;
+const float MAG_BAND_HIGH = 1.30;
+const float MAG_BAND_LOW  = 0.70;
+const float DELTA_THRESH  = 0.18;
+
+/* Intensity smoothing (for VibType only) */
+float vibEma = 0.0;                 // smoothed delta
+const float VIB_EMA_ALPHA = 0.15;   // 0.10..0.25
+// VibType thresholds (tune if needed)
+const float EMA_LOW_TH  = 0.08;     // below this => LOW
+const float EMA_MED_TH  = 0.20;     // below this => MEDIUM, above => HIGH
+
+/* ---------- MPU helpers ---------- */
+bool mpuWriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission(true) == 0);
+}
+
+bool readMPUAccel(int16_t &ax, int16_t &ay, int16_t &az) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  Wire.requestFrom(MPU_ADDR, (uint8_t)6, (uint8_t)true);
+  if (Wire.available() < 6) return false;
+
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+  return true;
+}
+
+inline float toG(int16_t a) {
+  return (float)a / 16384.0;
+}
+
+/* ---------- OLED init (auto 0x3C/0x3D) ---------- */
+bool initOLED() {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    OLED_ADDR = 0x3C;
+    return true;
+  }
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    OLED_ADDR = 0x3D;
+    return true;
+  }
+  return false;
+}
+
+/* Show WiFi credentials until connected */
+void drawWiFiConnecting() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  display.println("Connecting WiFi...");
+  display.println();
+
+  display.print("SSID: ");
+  display.println(WIFI_SSID);
+
+  display.print("PASS: ");
+  display.println(WIFI_PASSWORD);
+
+  display.println();
+  display.print("Status: ");
+  display.println("WAIT");
+
+  display.display();
+}
+
+/* Normal sensor screen (NO FB / NO OLED lines) */
+void drawSensorsOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+
+  display.println("Twin-Based Monitor");
+
+  display.print("Temp: ");
+  if (tempC < 0) display.println("NA");
+  else { display.print(tempC, 1); display.println(" C"); }
+
+  display.print("Hum : ");
+  if (humP < 0) display.println("NA");
+  else { display.print(humP, 0); display.println(" %"); }
+
+  display.print("Oil : ");
+  display.print(oilPercent);
+  display.println(" %");
+
+  display.print("Vib : ");
+  display.println(vibration ? "ON" : "OFF");
+
+  display.print("Vib_st: ");
+  display.println(vibType);
+
+  display.display();
+}
+
+/* ---------- WiFi + Firebase ---------- */
+void connectWiFiWithOLED() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long lastDraw = 0;
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    Serial.print(".");
+
+    unsigned long now = millis();
+    if (now - lastDraw >= 600) {
+      lastDraw = now;
+      drawWiFiConnecting();
+    }
+  }
+
+  Serial.println("\nWiFi Connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("WiFi Connected");
+  display.println(WIFI_SSID);
+  display.println();
+  display.println(WiFi.localIP());
+  display.display();
+
+  delay(800);
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+
+  Firebase.begin(&config, &auth);
+
+  Serial.print("Signing in Firebase");
+  while (!Firebase.ready()) {
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println("\nFirebase Ready");
+}
+
+/* ---------- MPU init ---------- */
+void setupMPU() {
+  mpuWriteReg(0x6B, 0x00);
+  delay(20);
+  mpuWriteReg(0x1C, 0x00);
+  Serial.println("MPU6050 init OK (0x68)");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // I2C for MPU + OLED
+  Wire.begin(D2, D1); // SDA=D2, SCL=D1
+
+  dht.begin();
+  setupMPU();
+
+  bool oledOK = initOLED();
+  if (oledOK) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Starting...");
+    display.display();
+    Serial.print("OLED OK at 0x");
+    Serial.println(OLED_ADDR, HEX);
+  } else {
+    Serial.println("OLED NOT FOUND (0x3C/0x3D)");
+  }
+
+  connectWiFiWithOLED();
+  setupFirebase();
+
+  Serial.println("System Started");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  /* ---- Oil ---- */
+  int waterRaw = analogRead(WATER_PIN);
+  oilPercent = map(waterRaw, 0, 1023, 0, 100);
+  oilPercent = constrain(oilPercent, 0, 100);
+
+  /* ---- MPU (shake detect + VibType) ---- */
+  if (now - tMPU >= MPU_MS) {
+    tMPU = now;
+
+    int16_t ax, ay, az;
+    if (readMPUAccel(ax, ay, az)) {
+      float x = toG(ax), y = toG(ay), z = toG(az);
+      float mag = sqrt(x*x + y*y + z*z);
+      float delta = fabs(mag - lastMag);
+
+      // ON/OFF shake detect
+      bool shakeA = (mag > MAG_BAND_HIGH || mag < MAG_BAND_LOW);
+      bool shakeB = (delta > DELTA_THRESH);
+      if (shakeA || shakeB) vibUntilMs = now + VIB_LATCH_MS;
+
+      // Smooth delta to decide VibType
+      vibEma = vibEma * (1.0 - VIB_EMA_ALPHA) + delta * VIB_EMA_ALPHA;
+
+      if (vibEma < EMA_LOW_TH) vibType = "LOW";
+      else if (vibEma < EMA_MED_TH) vibType = "MEDIUM";
+      else vibType = "HIGH";
+
+      lastMag = mag;
+    }
+  }
+
+  vibration = (now < vibUntilMs) ? 1 : 0;
+
+  /* ---- DHT ---- */
+  if (now - tDHT >= DHT_MS) {
+    tDHT = now;
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    tempC = isnan(t) ? -1 : t;
+    humP  = isnan(h) ? -1 : h;
+
+    Serial.print("Temp:");
+    Serial.print(tempC);
+    Serial.print(" Hum:");
+    Serial.print(humP);
+    Serial.print(" Oil:");
+    Serial.print(oilPercent);
+    Serial.print(" Vib:");
+    Serial.print(vibration);
+    Serial.print(" Vib_st:");
+    Serial.println(vibType);
+  }
+
+  /* ---- Firebase (NO VibLevel) ---- */
+  if (now - tFB >= FB_MS) {
+    tFB = now;
+
+    FirebaseJson json;
+    json.set("Temp", tempC);
+    json.set("Hum", humP);
+    json.set("Oil", oilPercent);
+    json.set("Vibration", vibration);
+    json.set("VibType", vibType);
+
+    String path = String("/") + ROOT;
+    bool ok = Firebase.RTDB.updateNode(&fbdo, path.c_str(), &json);
+
+    if (!ok) {
+      Serial.print("FB FAIL: ");
+      Serial.println(fbdo.errorReason());
+    }
+  }
+
+  /* ---- OLED (sensor values only) ---- */
+  if (now - tOLED >= OLED_MS) {
+    tOLED = now;
+    drawSensorsOLED();
+  }
+}
