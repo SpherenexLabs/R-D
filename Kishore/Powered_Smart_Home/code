@@ -1,0 +1,509 @@
+/****************************************************
+  ESP32 + RC522 + Firebase RTDB
+  + Un_auth flag
+  + DCT voltage sensor (analog) for 2S Li-ion battery
+  + Voltage calibration
+  + Estimated current & power (since no current sensor)
+
+  Firebase nodes:
+    Powered_Smart_Home/
+      Cards/1, Cards/2
+      Relay, Rfid, Servo
+      Un_auth
+      Volt, Curr, Powe, Batt
+
+  IMPORTANT:
+  - Real current needs a current sensor (ACS712 / INA219).
+  - Here current is ESTIMATED using load resistance.
+****************************************************/
+
+#include <WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+/* WIFI */
+#define WIFI_SSID     "home"
+#define WIFI_PASSWORD "123456789"
+
+/* FIREBASE */
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+const String ROOT = "Powered_Smart_Home";
+inline String P(const String &sub) { return "/" + ROOT + sub; }
+
+/************ PINS ************/
+// RC522 (SPI)
+#define SS_PIN   5
+#define RST_PIN  27
+#define SCK_PIN  18
+#define MISO_PIN 19
+#define MOSI_PIN 23
+
+// Servos
+#define SERVO1_PIN 13
+#define SERVO2_PIN 12
+
+// Relay (LOW trigger)
+#define RELAY1_PIN 26
+#define RELAY2_PIN 25
+
+// Buzzer
+#define BUZZER_PIN 33
+
+// Voltage Sensor (DCT analog output) -> ESP32 ADC pin
+#define VOLT_ADC_PIN 34
+
+/************ VOLT SENSOR SETTINGS ************/
+// Start with 5.0 for DCT 0–25V module (usually Vin/5 at OUT)
+#define VOLT_DIV_RATIO 5.0f
+
+// ADC reference conversion
+#define ADC_VREF 3.3f
+#define ADC_MAX  4095.0f
+
+// ----- CALIBRATION (MUST SET THESE ONCE) -----
+// Example: multimeter says 8.00V, your code shows 6.80V
+// Put those values here:
+const float REAL_BAT_V     = 8.00f;  // multimeter real voltage
+const float MEASURED_BAT_V = 6.80f;  // what ESP32 currently reads
+// Calibration factor:
+const float VOLT_CAL = (MEASURED_BAT_V > 0.01f) ? (REAL_BAT_V / MEASURED_BAT_V) : 1.0f;
+
+/************ POWER LOGGING ************/
+const unsigned long POWER_LOG_MS = 1000;
+unsigned long lastPowerLogMs = 0;
+
+// 2S Li-ion realistic min/max
+// Full: 8.4V, Empty practical: 6.0V (3.0V/cell) or 6.4V (3.2V/cell)
+// If you want higher % at 6.8V, use 6.0 as MIN:
+const float BATT_V_MIN = 0.0;
+const float BATT_V_MAX = 8.4;
+
+// Estimated current enabled (since you asked Curr & Powe)
+#define USE_ESTIMATED_CURRENT 2
+
+// Set your approximate load resistance in ohms (must not be 0)
+// If you don’t know, start with 10.0, then adjust.
+const float LOAD_RESISTANCE_OHMS = 10.0f;
+
+/************ OBJECTS ************/
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+Servo servo1, servo2;
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/************ UID STORAGE ************/
+String uidCard1 = "";
+String uidCard2 = "";
+
+/************ SERVO LOCK ************/
+bool actionBusy = false;
+unsigned long actionStartMs = 0;
+int activeServo = 0;
+const unsigned long SERVO_OPEN_MS = 10000;
+
+/************ BUZZER ************/
+bool buzzerActive = false;
+unsigned long buzzerStartMs = 0;
+unsigned long buzzerLastToggleMs = 0;
+const unsigned long BUZZER_TOTAL_MS = 5000;
+const unsigned long BUZZER_TOGGLE_MS = 200;
+bool buzzerState = false;
+
+/************ RELAY POLLING ************/
+int lastRelayCmd = -999;
+unsigned long lastRelayPollMs = 0;
+const unsigned long RELAY_POLL_MS = 600;
+
+/************ WIFI ************/
+bool connectWiFi(uint32_t timeoutMs = 25000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true, true);
+  delay(300);
+
+  Serial.print("Connecting WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+    return true;
+  }
+  Serial.println("WiFi FAILED");
+  return false;
+}
+
+/************ HELPERS ************/
+String uidToString(MFRC522::Uid *uid) {
+  String s = "";
+  for (byte i = 0; i < uid->size; i++) {
+    if (uid->uidByte[i] < 0x10) s += "0";
+    s += String(uid->uidByte[i], HEX);
+  }
+  s.toUpperCase();
+  return s;
+}
+
+int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+int voltageToBatteryPct(float v) {
+  if (v <= BATT_V_MIN) return 0;
+  if (v >= BATT_V_MAX) return 100;
+  float pct = (v - BATT_V_MIN) * 100.0f / (BATT_V_MAX - BATT_V_MIN);
+  return clampInt((int)(pct + 0.5f), 0, 100);
+}
+
+/************ BUZZER ************/
+void buzzerStart() {
+  buzzerActive = true;
+  buzzerStartMs = millis();
+  buzzerLastToggleMs = millis();
+  buzzerState = false;
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void buzzerUpdate() {
+  if (!buzzerActive) return;
+  unsigned long now = millis();
+
+  if (now - buzzerStartMs >= BUZZER_TOTAL_MS) {
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    if (Firebase.ready()) Firebase.RTDB.setInt(&fbdo, P("/Un_auth"), 0);
+    return;
+  }
+
+  if (now - buzzerLastToggleMs >= BUZZER_TOGGLE_MS) {
+    buzzerLastToggleMs = now;
+    buzzerState = !buzzerState;
+    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+  }
+}
+
+/************ FIREBASE ************/
+bool waitFirebaseReady(uint32_t timeoutMs = 30000) {
+  uint32_t t0 = millis();
+  while (!Firebase.ready()) {
+    if (millis() - t0 > timeoutMs) return false;
+    delay(50);
+  }
+  return true;
+}
+
+bool fbSetInt(const String &path, int v) {
+  if (!Firebase.ready()) return false;
+  return Firebase.RTDB.setInt(&fbdo, path, v);
+}
+bool fbSetFloat(const String &path, float v) {
+  if (!Firebase.ready()) return false;
+  return Firebase.RTDB.setFloat(&fbdo, path, v);
+}
+bool fbSetString(const String &path, const String &v) {
+  if (!Firebase.ready()) return false;
+  return Firebase.RTDB.setString(&fbdo, path, v);
+}
+bool fbGetStringSafe(const String &path, String &out) {
+  out = "";
+  if (!Firebase.ready()) return false;
+  if (!Firebase.RTDB.getString(&fbdo, path)) return false;
+  out = fbdo.stringData();
+  return true;
+}
+bool fbGetIntSafe(const String &path, int &out) {
+  if (!Firebase.ready()) return false;
+  if (!Firebase.RTDB.getInt(&fbdo, path)) return false;
+  out = fbdo.intData();
+  return true;
+}
+
+/************ INIT TREE (DO NOT OVERWRITE CARDS) ************/
+void ensureFirebaseTree() {
+  if (!Firebase.RTDB.pathExisted(&fbdo, "/" + ROOT)) {
+    FirebaseJson json;
+    json.set("Rfid", 0);
+    json.set("Servo", 0);
+    json.set("Relay", 0);
+    json.set("Un_auth", 0);
+    json.set("Volt", 0);
+    json.set("Curr", 0);
+    json.set("Powe", 0);
+    json.set("Batt", 0);
+    json.set("Cards/1", "");
+    json.set("Cards/2", "");
+    Firebase.RTDB.setJSON(&fbdo, "/" + ROOT, &json);
+    return;
+  }
+
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Rfid")))    fbSetInt(P("/Rfid"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Servo")))   fbSetInt(P("/Servo"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Relay")))   fbSetInt(P("/Relay"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Un_auth"))) fbSetInt(P("/Un_auth"), 0);
+
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Volt"))) fbSetFloat(P("/Volt"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Curr"))) fbSetFloat(P("/Curr"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Powe"))) fbSetFloat(P("/Powe"), 0);
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Batt"))) fbSetInt(P("/Batt"), 0);
+
+  if (!Firebase.RTDB.pathExisted(&fbdo, P("/Cards"))) {
+    FirebaseJson cards;
+    cards.set("1", "");
+    cards.set("2", "");
+    Firebase.RTDB.setJSON(&fbdo, P("/Cards"), &cards);
+  } else {
+    if (!Firebase.RTDB.pathExisted(&fbdo, P("/Cards/1"))) fbSetString(P("/Cards/1"), "");
+    if (!Firebase.RTDB.pathExisted(&fbdo, P("/Cards/2"))) fbSetString(P("/Cards/2"), "");
+  }
+}
+
+void loadCardsFromFirebase() {
+  String c1, c2;
+  fbGetStringSafe(P("/Cards/1"), c1);
+  fbGetStringSafe(P("/Cards/2"), c2);
+  c1.trim(); c2.trim();
+  uidCard1 = c1;
+  uidCard2 = c2;
+
+  Serial.println("Loaded Cards:");
+  Serial.print("Card1 UID: "); Serial.println(uidCard1);
+  Serial.print("Card2 UID: "); Serial.println(uidCard2);
+  if (uidCard1.length() == 0 || uidCard2.length() == 0) {
+    Serial.println("Enrollment mode: Tap Card1 then Card2.");
+  }
+}
+
+/************ SERVO ACTION (LOCK) ************/
+void startAction(int whichServo) {
+  activeServo = whichServo;
+  actionBusy = true;
+  actionStartMs = millis();
+  if (whichServo == 1) servo1.write(90);
+  else servo2.write(90);
+}
+
+void stopActionAndReset() {
+  if (activeServo == 1) servo1.write(0);
+  else if (activeServo == 2) servo2.write(0);
+
+  fbSetInt(P("/Rfid"), 0);
+  fbSetInt(P("/Servo"), 0);
+
+  activeServo = 0;
+  actionBusy = false;
+}
+
+void actionUpdate() {
+  if (!actionBusy) return;
+  if (millis() - actionStartMs >= SERVO_OPEN_MS) stopActionAndReset();
+}
+
+/************ RFID LOGIC ************/
+void enrollIfNeeded(const String &scannedUid) {
+  if (uidCard1.length() == 0) {
+    uidCard1 = scannedUid;
+    fbSetString(P("/Cards/1"), uidCard1);
+    Serial.print("Enrolled Card1 UID: "); Serial.println(uidCard1);
+    return;
+  }
+  if (uidCard2.length() == 0) {
+    if (scannedUid == uidCard1) {
+      fbSetInt(P("/Un_auth"), 1);
+      buzzerStart();
+      return;
+    }
+    uidCard2 = scannedUid;
+    fbSetString(P("/Cards/2"), uidCard2);
+    Serial.print("Enrolled Card2 UID: "); Serial.println(uidCard2);
+    return;
+  }
+}
+
+void handleAuthorized(int cardNo) {
+  if (actionBusy) return;
+
+  fbSetInt(P("/Un_auth"), 0);
+
+  if (cardNo == 1) {
+    startAction(1);
+    fbSetInt(P("/Rfid"), 1);
+    fbSetInt(P("/Servo"), 1);
+  } else {
+    startAction(2);
+    fbSetInt(P("/Rfid"), 2);
+    fbSetInt(P("/Servo"), 2);
+  }
+}
+
+/************ RELAY ************/
+void relayApply(int cmd) {
+  // LOW-trigger relay
+  if (cmd == 1) {
+    digitalWrite(RELAY1_PIN, LOW);
+    digitalWrite(RELAY2_PIN, HIGH);
+  } else if (cmd == 2) {
+    digitalWrite(RELAY1_PIN, HIGH);
+    digitalWrite(RELAY2_PIN, LOW);
+  } else {
+    digitalWrite(RELAY1_PIN, HIGH);
+    digitalWrite(RELAY2_PIN, HIGH);
+  }
+}
+
+void relayPoll() {
+  if (millis() - lastRelayPollMs < RELAY_POLL_MS) return;
+  lastRelayPollMs = millis();
+
+  int cmd;
+  if (fbGetIntSafe(P("/Relay"), cmd)) {
+    if (cmd != lastRelayCmd) {
+      lastRelayCmd = cmd;
+      relayApply(cmd);
+    }
+  }
+}
+
+/************ VOLTAGE + EST CURRENT + POWER ************/
+float readBatteryVoltage() {
+  const int N = 25;
+  uint32_t sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(VOLT_ADC_PIN);
+    delay(2);
+  }
+  float raw = (float)sum / (float)N;
+
+  float vOut = (raw / ADC_MAX) * ADC_VREF;   // sensor output
+  float vBat = vOut * VOLT_DIV_RATIO;        // divider back-calc
+  vBat *= VOLT_CAL;                          // calibration
+
+  return vBat;
+}
+
+void powerLogUpdate() {
+  if (!Firebase.ready()) return;
+  unsigned long now = millis();
+  if (now - lastPowerLogMs < POWER_LOG_MS) return;
+  lastPowerLogMs = now;
+
+  float vBat = readBatteryVoltage();
+  int battPct = voltageToBatteryPct(vBat);
+
+  float currentA = 0.0f;
+  float powerW = 0.0f;
+
+#if USE_ESTIMATED_CURRENT
+  // Estimated current using load resistance
+  if (LOAD_RESISTANCE_OHMS > 0.1f) {
+    currentA = vBat / LOAD_RESISTANCE_OHMS;
+    powerW = vBat * currentA;
+  }
+#endif
+
+  fbSetFloat(P("/Volt"), vBat);
+  fbSetFloat(P("/Curr"), currentA);
+  fbSetFloat(P("/Powe"), powerW);
+  fbSetInt(P("/Batt"), battPct);
+
+  Serial.print("Volt="); Serial.print(vBat, 2);
+  Serial.print(" Curr="); Serial.print(currentA, 3);
+  Serial.print(" Powe="); Serial.print(powerW, 2);
+  Serial.print(" Batt="); Serial.println(battPct);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(RELAY1_PIN, HIGH);
+  digitalWrite(RELAY2_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(VOLT_ADC_PIN, ADC_11db);
+
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+  servo1.write(0);
+  servo2.write(0);
+
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  mfrc522.PCD_Init();
+
+  if (!connectWiFi()) while (true) delay(1000);
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(8192);
+
+  if (!waitFirebaseReady(30000)) while (true) delay(1000);
+
+  ensureFirebaseTree();
+  loadCardsFromFirebase();
+  fbSetInt(P("/Un_auth"), 0);
+}
+
+void loop() {
+  actionUpdate();
+  buzzerUpdate();
+  relayPoll();
+  powerLogUpdate();
+
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
+  String scanned = uidToString(&mfrc522.uid);
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+
+  if (actionBusy) return;
+
+  if (uidCard1.length() == 0 || uidCard2.length() == 0) {
+    enrollIfNeeded(scanned);
+    return;
+  }
+
+  if (scanned == uidCard1) {
+    handleAuthorized(1);
+  } else if (scanned == uidCard2) {
+    handleAuthorized(2);
+  } else {
+    fbSetInt(P("/Un_auth"), 1);
+    buzzerStart();
+  }
+}
