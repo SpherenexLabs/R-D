@@ -1,0 +1,133 @@
+/*
+  Arduino UNO + L293D + HC-SR04
+  Behavior:
+    - Always move forward
+    - If obstacle detected (distance <= THRESHOLD_CM):
+        Backward 2 seconds
+        Turn right 5 seconds
+        Forward again
+*/
+
+#define TRIG_PIN 9
+#define ECHO_PIN 10
+
+// L293D pins
+#define ENA 5   // Enable for Motor A (PWM)
+#define IN1 2
+#define IN2 3
+
+#define ENB 6   // Enable for Motor B (PWM)
+#define IN3 4
+#define IN4 7
+
+// Settings
+const int THRESHOLD_CM = 20;  // obstacle distance threshold
+const int SPEED_FWD = 150;    // 0-255
+const int SPEED_TURN = 180;   // 0-255
+const int SPEED_BACK = 160;   // 0-255
+
+long readDistanceCM() {
+  // Trigger ultrasonic pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo time (timeout 30ms ~ 5m)
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  // If timeout, treat as "no obstacle nearby"
+  if (duration == 0) return 999;
+
+  // Convert to cm: speed of sound ~ 0.0343 cm/us
+  long distance = (duration * 343L) / 20000L; // duration*0.0343/2 (scaled integer)
+  return distance;
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void forward(int spd) {
+  // Both motors forward
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, spd);
+  analogWrite(ENB, spd);
+}
+
+void backward(int spd) {
+  // Both motors backward
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, spd);
+  analogWrite(ENB, spd);
+}
+
+void turnRight(int spd) {
+  // Right turn:
+  // Left motor forward, Right motor backward (spin turn)
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);   // Left forward
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);  // Right backward
+
+  analogWrite(ENA, spd);
+  analogWrite(ENB, spd);
+}
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+
+  Serial.begin(9600);
+  delay(500);
+}
+
+void loop() {
+  long d = readDistanceCM();
+  Serial.print("Distance: ");
+  Serial.print(d);
+  Serial.println(" cm");
+
+  if (d <= THRESHOLD_CM) {
+    // Obstacle routine
+    stopMotors();
+    delay(150);
+
+    backward(SPEED_BACK);
+    delay(2000);
+
+    stopMotors();
+    delay(150);
+
+    turnRight(SPEED_TURN);
+    delay(5000);
+
+    stopMotors();
+    delay(150);
+
+    // Continue forward
+    forward(SPEED_FWD);
+  } else {
+    // Default: always forward
+    forward(SPEED_FWD);
+  }
+
+  delay(60); // small loop delay for stability
+}
