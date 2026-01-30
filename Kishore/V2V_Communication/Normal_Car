@@ -1,0 +1,402 @@
+/****************************************************
+  VEHICLE 2 = NORMAL (ESP32)
+  FAST Firebase + OLED
+  Voltage: from divider + calibration (2S battery)
+  Current: estimated ONLY from Voltage (no sensor) + noise + smoothing
+
+  Priority logic:
+    1) If ROOT/Collision == 1 => STOP
+    2) Else if vehicle2/override == "YIELD_RIGHT"
+         -> Turn RIGHT for 3 seconds -> STOP -> set override="STOPPED"
+    3) Else follow ROOT/direction (F/S) with line following
+****************************************************/
+
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* WIFI */
+#define WIFI_SSID     "v2v"
+#define WIFI_PASSWORD "123456789"
+
+/* FIREBASE */
+#define API_KEY       "AIzaSyB9ererNsNonAzH0zQo_GS79XPOyCoMxr4"
+#define DATABASE_URL  "https://waterdtection-default-rtdb.firebaseio.com/"
+#define USER_EMAIL    "spherenexgpt@gmail.com"
+#define USER_PASSWORD "Spherenex@123"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+/* PATHS */
+String ROOT = "V2V_Communication";
+String V1   = ROOT + "/vehicle1";
+String V2   = ROOT + "/vehicle2";
+
+/* MOTOR */
+const int IN1 = 18, IN2 = 19, IN3 = 16, IN4 = 17;
+
+/* IR */
+const int IR_LEFT_PIN  = 33;
+const int IR_RIGHT_PIN = 32;
+const int LINE_DETECTED_STATE = LOW;
+
+/* ULTRASONIC (HC-SR04)
+   U1=Front, U2=Left, U3=Right
+*/
+#define U1_TRIG 25
+#define U1_ECHO 26
+#define U2_TRIG 27
+#define U2_ECHO 14
+#define U3_TRIG 12
+#define U3_ECHO 13
+
+/* VOLTAGE */
+#define VOLTAGE_PIN 34  // ADC input from divider
+
+/* OLED */
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+/* STATE */
+bool lineFollowEnabled = false;
+
+/* ---------- SPEED TIMERS ---------- */
+unsigned long lastSensorMs = 0;
+unsigned long lastOledMs   = 0;
+unsigned long lastFbMs     = 0;
+unsigned long lastCtrlMs   = 0;
+
+const unsigned long SENSOR_INTERVAL_MS = 60;
+const unsigned long OLED_INTERVAL_MS   = 120;
+const unsigned long FB_INTERVAL_MS     = 140;
+const unsigned long CTRL_INTERVAL_MS   = 150;
+
+/* Cached values */
+long u1 = 999, u2 = 999, u3 = 999;
+float volt = 0.0, curr = 0.0;
+int collision = 0;
+String overrideCmd = "NONE";
+
+/* =========================================================
+   VOLTAGE DIVIDER SETTINGS (same as your vehicle1)
+========================================================= */
+const float R1 = 100000.0;
+const float R2 = 47000.0;
+const float DIV_GAIN = (R1 + R2) / R2;
+
+// Keep same calibration you already tuned
+float V_CAL = 3.00;
+
+// ADC averaging
+const int ADC_SAMPLES = 25;
+
+/* =========================================================
+   CURRENT FROM VOLTAGE ONLY (NO SENSOR)
+========================================================= */
+float currentFiltered = 0.0;
+
+const float R_LOAD_OHMS = 5.0;
+const float NOISE_PCT   = 0.10;
+const float CURR_ALPHA  = 0.25;
+
+const float I_MIN = 0.05;
+const float I_MAX = 3.50;
+
+/* ========== Yield Logic ========== */
+enum Mode { MODE_FOLLOW, MODE_YIELD_RIGHT, MODE_STOPPED };
+Mode mode = MODE_FOLLOW;
+
+unsigned long yieldStartMs = 0;
+const unsigned long YIELD_DURATION_MS = 3000;
+
+/* ---------------- Motor helpers ---------------- */
+void forward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void turnLeft() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+void turnRight() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+/* ---------------- OLED helpers ---------------- */
+void oledMsg(const String &l1, const String &l2 = "", const String &l3 = "") {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(l1);
+  if (l2.length()) display.println(l2);
+  if (l3.length()) display.println(l3);
+  display.display();
+}
+
+/* ---------------- HC-SR04 read ---------------- */
+long readUltrasonicCM(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long us = pulseIn(echo, HIGH, 25000);
+  if (us == 0) return 999;
+  return us / 58;
+}
+
+/* ---------------- Battery Voltage ---------------- */
+float readBatteryVoltage() {
+  uint32_t sum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    sum += analogRead(VOLTAGE_PIN);
+    delayMicroseconds(250);
+  }
+  float rawAvg = sum / (float)ADC_SAMPLES;
+  float vAdc = (rawAvg / 4095.0) * 3.3;
+  float vBat = vAdc * DIV_GAIN * V_CAL;
+  return vBat;
+}
+
+/* ---------------- Current estimated from Voltage ONLY ---------------- */
+float estimateCurrentFromVoltage(float v) {
+  float baseI = v / R_LOAD_OHMS;
+  float r = random(-1000, 1000) / 1000.0;
+  float i = baseI + (baseI * NOISE_PCT * r);
+
+  if (i < I_MIN) i = I_MIN;
+  if (i > I_MAX) i = I_MAX;
+
+  currentFiltered = (CURR_ALPHA * i) + ((1.0 - CURR_ALPHA) * currentFiltered);
+  return currentFiltered;
+}
+
+/* ---------------- Root init ---------------- */
+void ensureNodesOnce() {
+  Firebase.RTDB.getString(&fbdo, ROOT + "/direction");
+  if (fbdo.dataType() == "null") Firebase.RTDB.setString(&fbdo, ROOT + "/direction", "S");
+
+  Firebase.RTDB.getInt(&fbdo, ROOT + "/Collision");
+  if (fbdo.dataType() == "null") Firebase.RTDB.setInt(&fbdo, ROOT + "/Collision", 0);
+
+  Firebase.RTDB.getString(&fbdo, V2 + "/override");
+  if (fbdo.dataType() == "null") Firebase.RTDB.setString(&fbdo, V2 + "/override", "NONE");
+}
+
+/* ---------------- Read direction ---------------- */
+void readRootDirectionFast() {
+  if (Firebase.RTDB.getString(&fbdo, ROOT + "/direction")) {
+    String d = fbdo.stringData();
+    lineFollowEnabled = (d == "F");
+  } else {
+    lineFollowEnabled = false;
+  }
+}
+
+/* ---------------- Line follow ---------------- */
+void lineFollow() {
+  int L = digitalRead(IR_LEFT_PIN);
+  int R = digitalRead(IR_RIGHT_PIN);
+
+  bool leftOn  = (L == LINE_DETECTED_STATE);
+  bool rightOn = (R == LINE_DETECTED_STATE);
+
+  if (leftOn && rightOn) forward();
+  else if (leftOn && !rightOn) turnLeft();
+  else if (!leftOn && rightOn) turnRight();
+  else stopMotors();
+}
+
+/* ---------------- OLED ---------------- */
+void showOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+
+  display.print("NORMAL V2 Dir:");
+  display.println(lineFollowEnabled ? "F" : "S");
+
+  display.print("V:"); display.print(volt, 2);
+  display.print(" I:"); display.println(curr, 2);
+
+  display.print("U1F:"); display.println(u1);
+  display.print("U2L:"); display.println(u2);
+  display.print("U3R:"); display.println(u3);
+
+  display.print("Collision:"); display.println(collision);
+  display.print("Override:");  display.println(overrideCmd);
+
+  display.print("Mode:");
+  if (mode == MODE_FOLLOW) display.println("FOLLOW");
+  else if (mode == MODE_YIELD_RIGHT) display.println("YIELD");
+  else display.println("STOP");
+
+  display.display();
+}
+
+/* ---------------- Firebase fast upload (ONE JSON) ---------------- */
+void uploadVehicle2Fast() {
+  FirebaseJson js;
+  js.set("Voltage", volt);
+  js.set("Current", curr);
+  js.set("U1", (int)u1);
+  js.set("U2", (int)u2);
+  js.set("U3", (int)u3);
+
+  Firebase.RTDB.updateNode(&fbdo, V2, &js);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Better ADC range for battery divider
+  analogSetPinAttenuation(VOLTAGE_PIN, ADC_11db);
+
+  // Seed random (for current noise)
+  randomSeed(esp_random());
+
+  // Motor
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  stopMotors();
+
+  // IR
+  pinMode(IR_LEFT_PIN, INPUT);
+  pinMode(IR_RIGHT_PIN, INPUT);
+
+  // Ultrasonic
+  pinMode(U1_TRIG, OUTPUT); pinMode(U1_ECHO, INPUT);
+  pinMode(U2_TRIG, OUTPUT); pinMode(U2_ECHO, INPUT);
+  pinMode(U3_TRIG, OUTPUT); pinMode(U3_ECHO, INPUT);
+
+  // OLED
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (1) delay(10);
+  }
+  oledMsg("BOOT OK", "OLED: 0x3C");
+
+  // WiFi
+  oledMsg("WIFI Connecting...", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    if (millis() - t0 > 15000) {
+      oledMsg("WIFI FAILED", "Check SSID/PASS");
+      delay(2000);
+      ESP.restart();
+    }
+  }
+  oledMsg("WIFI OK", WiFi.localIP().toString());
+
+  // Firebase
+  oledMsg("Firebase Init...");
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  t0 = millis();
+  while (!Firebase.ready()) {
+    delay(200);
+    if (millis() - t0 > 20000) {
+      oledMsg("Firebase FAILED", "Auth/URL check");
+      delay(2000);
+      ESP.restart();
+    }
+  }
+
+  oledMsg("Firebase OK", "Init nodes...");
+  ensureNodesOnce();
+  oledMsg("READY", "Fast mode ON");
+}
+
+void loop() {
+  if (!Firebase.ready()) return;
+
+  unsigned long now = millis();
+
+  // ---- Control reads (direction + collision + override) ----
+  if (now - lastCtrlMs >= CTRL_INTERVAL_MS) {
+    lastCtrlMs = now;
+
+    readRootDirectionFast();
+
+    if (Firebase.RTDB.getInt(&fbdo, ROOT + "/Collision")) collision = fbdo.intData();
+    else collision = 0;
+
+    if (Firebase.RTDB.getString(&fbdo, V2 + "/override")) overrideCmd = fbdo.stringData();
+    else overrideCmd = "NONE";
+  }
+
+  // ---- Sensor reads ----
+  if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
+    lastSensorMs = now;
+
+    u1 = readUltrasonicCM(U1_TRIG, U1_ECHO);
+    u2 = readUltrasonicCM(U2_TRIG, U2_ECHO);
+    u3 = readUltrasonicCM(U3_TRIG, U3_ECHO);
+
+    volt = readBatteryVoltage();
+    curr = estimateCurrentFromVoltage(volt);
+  }
+
+  // ---- Priority driving ----
+  // 1) Collision -> STOP
+  if (collision == 1) {
+    mode = MODE_STOPPED;
+    stopMotors();
+  } else {
+    // 2) override -> YIELD_RIGHT (3 sec) then STOP and mark STOPPED
+    if (overrideCmd == "YIELD_RIGHT" && mode != MODE_YIELD_RIGHT) {
+      mode = MODE_YIELD_RIGHT;
+      yieldStartMs = now;
+    }
+
+    if (mode == MODE_YIELD_RIGHT) {
+      turnRight();
+      if (now - yieldStartMs >= YIELD_DURATION_MS) {
+        stopMotors();
+        mode = MODE_STOPPED;
+        lineFollowEnabled = false;
+
+        // mark override done (so it won't repeat)
+        Firebase.RTDB.setString(&fbdo, V2 + "/override", "STOPPED");
+      }
+    } else {
+      // 3) normal line follow based on direction
+      mode = MODE_FOLLOW;
+      if (lineFollowEnabled) lineFollow();
+      else stopMotors();
+    }
+  }
+
+  // ---- Firebase upload ----
+  if (now - lastFbMs >= FB_INTERVAL_MS) {
+    lastFbMs = now;
+    uploadVehicle2Fast();
+  }
+
+  // ---- OLED ----
+  if (now - lastOledMs >= OLED_INTERVAL_MS) {
+    lastOledMs = now;
+    showOLED();
+  }
+}
